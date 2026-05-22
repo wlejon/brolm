@@ -93,6 +93,7 @@ target_sources(brolm PRIVATE
     src/qwen_generate.cpp
     src/clip_image.cpp
     src/clip_score.cpp
+    src/alignment_adapter.cpp
 )
 
 # --- Install / export ---
