@@ -47,3 +47,7 @@ ctest --test-dir build -C Release
 bromath and brotensor are resolved as standalone sibling repos at `../bromath`
 and `../brotensor`, with a `third_party/` submodule fallback — the pattern
 documented in `bro/docs/multi-repo-workflow.md`.
+
+## License
+
+[MIT](LICENSE)
