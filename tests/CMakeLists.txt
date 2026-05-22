@@ -1,0 +1,12 @@
+function(brolm_add_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name} PRIVATE brolm)
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+brolm_add_test(brolm_test_smoke test_smoke.cpp)
