@@ -31,6 +31,10 @@ its default text encoders.
 | `brolm/clip_image.h` | CLIP ViT-L/14 vision encoder |
 | `brolm/clip_score.h` | CLIP image/text similarity scoring |
 | `brolm/t5.h` | T5-XXL encoder (encoder-only) |
+| `brolm/qwen_tokenizer.h` | Qwen3 byte-level BPE tokenizer |
+| `brolm/qwen.h` | Qwen3 decoder LLM — GQA, QK-norm, RoPE, SwiGLU, KV-cache |
+| `brolm/qwen_generate.h` | Sampling (greedy / temperature / top-k / top-p) + autoregressive generation |
+| `brolm/alignment_adapter.h` | Trainable adapter: LLM hidden states → diffusion-conditioning tensors |
 
 ## Build
 
