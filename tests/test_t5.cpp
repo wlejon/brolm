@@ -18,6 +18,8 @@
 
 #include "test_compute.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -196,6 +198,55 @@ int main() {
         bt::sync_all();
         out_vals2 = bdtest::bd_download(out);
         CHECK(out_vals1 == out_vals2);
+    }
+
+    // ── Padding-mask regression test ──────────────────────────────────────
+    // Masking the pad token must make a padded sequence's real-token outputs
+    // match the same tokens encoded without padding. Without the mask the pad
+    // tokens leak into self-attention and corrupt those rows.
+    {
+        auto file = st::File::open(path.string());
+        t5::TextEncoder enc(cfg);
+        enc.load_weights(file, "");
+
+        // Use a high vocab id as the pad token: in this fixture the token
+        // embedding grows with the id (fp16_seq), so a high-id pad has a
+        // large embedding — leaking it into attention measurably corrupts
+        // the real-token rows, which is what makes the mask observable.
+        const int pad = 16;
+        std::vector<int32_t> ref_ids    = {1, 2, 3, 4};
+        std::vector<int32_t> padded_ids = {1, 2, 3, 4, pad, pad, pad};
+        const int real = 4;
+
+        bt::Tensor ref, masked, unmasked;
+        enc.forward(ref_ids.data(),    real, ref);
+        enc.forward(padded_ids.data(), 7,    masked,   /*pad_id=*/pad);
+        enc.forward(padded_ids.data(), 7,    unmasked, /*pad_id=*/-1);
+        bt::sync_all();
+
+        std::vector<float> vref = bdtest::bd_download(ref);
+        std::vector<float> vmsk = bdtest::bd_download(masked);
+        std::vector<float> vunm = bdtest::bd_download(unmasked);
+
+        // Real-token rows: the masked padded run must reproduce the unpadded
+        // reference — the mask makes the 3 trailing pad tokens invisible.
+        const std::size_t real_n = static_cast<std::size_t>(real) * D;
+        float max_msk_vs_ref = 0.0f;
+        for (std::size_t i = 0; i < real_n; ++i) {
+            max_msk_vs_ref =
+                std::max(max_msk_vs_ref, std::fabs(vmsk[i] - vref[i]));
+        }
+        // All rows: masking must visibly change the result vs. not masking —
+        // it drops the pad keys and gates the padded query rows. If the
+        // d_mask wiring regressed, masked and unmasked would be identical.
+        const std::size_t all_n = static_cast<std::size_t>(7) * D;
+        float max_msk_vs_unm = 0.0f;
+        for (std::size_t i = 0; i < all_n; ++i) {
+            max_msk_vs_unm =
+                std::max(max_msk_vs_unm, std::fabs(vmsk[i] - vunm[i]));
+        }
+        CHECK(max_msk_vs_ref < 0.05f);
+        CHECK(max_msk_vs_unm > 1.0e-3f);
     }
 
     std::error_code ec;

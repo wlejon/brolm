@@ -313,13 +313,33 @@ void TextEncoder::rebuild_position_bias_(int L) {
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
-void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out) {
+void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out,
+                          int pad_id) {
     if (!ids) fail("forward: ids pointer is null");
     if (L <= 0) fail("forward: L must be positive");
     if (token_embed_.size() == 0) fail("forward: weights not loaded");
     if (rel_attn_bias_.empty()) fail("forward: position bias table not loaded");
 
     const int H = cfg_.num_heads;
+
+    // Optional padding mask. When pad_id >= 0, positions holding the pad
+    // token are excluded from self-attention — HF passes the equivalent as
+    // attention_mask. brotensor's d_mask is a length-L FP32 device buffer
+    // (1 = attend, 0 = ignore) that gates both keys and padded query rows.
+    const float* d_mask = nullptr;
+    if (pad_id >= 0) {
+        std::vector<float> mask(static_cast<std::size_t>(L));
+        int valid = 0;
+        for (int i = 0; i < L; ++i) {
+            const bool keep = ids[i] != pad_id;
+            mask[static_cast<std::size_t>(i)] = keep ? 1.0f : 0.0f;
+            valid += keep ? 1 : 0;
+        }
+        if (valid == 0) fail("forward: every token equals pad_id");
+        attn_mask_ =
+            bt::Tensor::from_host(mask.data(), L, 1).to(bt::default_device());
+        d_mask = static_cast<const float*>(attn_mask_.data);
+    }
 
     // T5-XXL's residual stream grows monotonically across its 24 pre-norm
     // blocks and overflows FP16 (±65504) after roughly a dozen layers — the
@@ -351,11 +371,11 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out) {
                 B.Wk_q.W_int8, B.Wk_q.scales,
                 B.Wv_q.W_int8, B.Wv_q.scales,
                 B.Wo_q.W_int8, B.Wo_q.scales,
-                /*d_mask=*/nullptr, &pos_bias_, H, /*scale=*/1.0f, attn_);
+                d_mask, &pos_bias_, H, /*scale=*/1.0f, attn_);
         } else {
             bt::self_attention_bias_forward(
                 n_, B.Wq, B.Wk, B.Wv, B.Wo,
-                /*d_mask=*/nullptr, &pos_bias_, H, /*scale=*/1.0f, attn_);
+                d_mask, &pos_bias_, H, /*scale=*/1.0f, attn_);
         }
         bt::add_inplace(x_, attn_);
         if (clamp_residual) bt::clamp(x_, -kFp16Clamp, kFp16Clamp);

@@ -104,9 +104,20 @@ public:
     // Forward over a length-L int32 token-id sequence (host pointer).
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
     //   out: (L, d_model) Tensor at the compute dtype, resized as needed.
+    //   pad_id: when >= 0, positions whose id equals pad_id are treated as
+    //           padding and masked out of self-attention — every query
+    //           ignores them as keys, the same effect as the attention_mask
+    //           HF's T5 encoder applies. Pass the tokenizer's pad_id() when
+    //           feeding a padded sequence from Tokenizer::encode(). The
+    //           default (-1) disables masking: all L positions attend to one
+    //           another, which is correct only for an unpadded sequence
+    //           (e.g. the output of Tokenizer::tokenize()). Output rows at
+    //           padded positions are not meaningful and should be ignored by
+    //           the caller.
     // brotensor::init() must have been called once before any forward.
     // The caller is responsible for sync_all() before reading `out` to host.
-    void forward(const int32_t* ids, int L, brotensor::Tensor& out);
+    void forward(const int32_t* ids, int L, brotensor::Tensor& out,
+                 int pad_id = -1);
 
     const T5Config& config() const { return cfg_; }
 
@@ -171,6 +182,7 @@ private:
 
     // Per-call scratch (kept alive across calls to avoid realloc).
     brotensor::Tensor ids_dev_;
+    brotensor::Tensor attn_mask_;  // (L,1) FP32 pad mask; empty when pad_id<0
     brotensor::Tensor x_;        // residual stream
     brotensor::Tensor n_;        // rms-norm output
     brotensor::Tensor attn_;     // attention sub-layer output

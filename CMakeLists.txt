@@ -96,42 +96,29 @@ target_sources(brolm PRIVATE
     src/alignment_adapter.cpp
 )
 
-# --- Install / export ---
+# --- Install ---
 #
 # Off by default: brolm is consumed as a sibling repo via the same
 # add_subdirectory pattern bro uses for its other libraries, not via
 # find_package.
-option(BROLM_INSTALL "Generate install targets for brolm" OFF)
+#
+# When enabled, this installs only the static library and the public headers.
+# It deliberately generates no CMake package config (brolmConfig.cmake): brolm
+# links bromath/brotensor as EXCLUDE_FROM_ALL add_subdirectory targets that are
+# not themselves installed or exported. An install(EXPORT) set that references
+# them fails generation outright ("target brolm ... requires target brotensor
+# that is not in any export set"), and a package config would in turn have to
+# find_dependency() those siblings, neither of which ships an installed config.
+# Consume brolm with add_subdirectory(), not find_package().
+option(BROLM_INSTALL "Install the brolm static library and public headers" OFF)
 if(BROLM_INSTALL)
     include(GNUInstallDirs)
-    include(CMakePackageConfigHelpers)
-
     install(TARGETS brolm
-        EXPORT brolmTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-
-    install(EXPORT brolmTargets
-        FILE brolmTargets.cmake
-        NAMESPACE brolm::
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/brolm
-    )
-
-    set(_cfg_in "${CMAKE_CURRENT_BINARY_DIR}/brolmConfig.cmake.in")
-    file(WRITE "${_cfg_in}"
-        "@PACKAGE_INIT@\n"
-        "include(\"\${CMAKE_CURRENT_LIST_DIR}/brolmTargets.cmake\")\n"
-    )
-    configure_package_config_file("${_cfg_in}"
-        "${CMAKE_CURRENT_BINARY_DIR}/brolmConfig.cmake"
-        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/brolm
-    )
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/brolmConfig.cmake"
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/brolm
-    )
 endif()
 
 # --- Tests ---
