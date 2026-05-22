@@ -90,6 +90,7 @@ target_sources(brolm PRIVATE
     src/clip.cpp
     src/t5.cpp
     src/qwen.cpp
+    src/qwen_generate.cpp
     src/clip_image.cpp
     src/clip_score.cpp
 )
