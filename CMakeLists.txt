@@ -89,6 +89,7 @@ target_sources(brolm PRIVATE
     src/qwen_tokenizer.cpp
     src/clip.cpp
     src/t5.cpp
+    src/qwen.cpp
     src/clip_image.cpp
     src/clip_score.cpp
 )
