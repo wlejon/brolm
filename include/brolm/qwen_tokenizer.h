@@ -70,6 +70,17 @@ public:
     std::size_t vocab_count() const { return vocab_.size(); }
     std::size_t merge_count() const { return merge_ranks_.size(); }
 
+    // Register `token` as an atomic special with the given `id`. Updates the
+    // forward / inverse special-token maps used by encode() and decode(); the
+    // token does NOT need to exist in vocab.json (Qwen3.5 carries its
+    // multimodal / control specials only in tokenizer_config.json's
+    // added_tokens_decoder, with ids above max(vocab.json)). Re-registering
+    // the same string with a different id overwrites the previous binding.
+    // Recognises "<|endoftext|>", "<|im_start|>", and "<|im_end|>" and
+    // updates the cached endoftext_id_ / im_start_id_ / im_end_id_ so the
+    // matching accessors return the new ids.
+    void register_special_token(const std::string& token, int32_t id);
+
     // Key special-token ids, or -1 if absent from the vocab.
     // Convention: eos_id() is <|im_end|> (the ChatML turn terminator Qwen3
     // generates to end an assistant turn); endoftext_id() is <|endoftext|>.

@@ -454,6 +454,21 @@ Tokenizer Tokenizer::load(const std::string& vocab_json_path,
     return t;
 }
 
+void Tokenizer::register_special_token(const std::string& token, int32_t id) {
+    // Drop any previous binding (forward and inverse) before re-inserting,
+    // so re-registration is well-defined.
+    auto prev = special_tokens_.find(token);
+    if (prev != special_tokens_.end()) {
+        special_ids_.erase(prev->second);
+        special_tokens_.erase(prev);
+    }
+    special_tokens_.emplace(token, id);
+    special_ids_.emplace(id, token);
+    if (token == "<|endoftext|>") endoftext_id_ = id;
+    else if (token == "<|im_start|>") im_start_id_ = id;
+    else if (token == "<|im_end|>")   im_end_id_   = id;
+}
+
 void Tokenizer::encode_piece_(std::string_view piece,
                               std::vector<int32_t>& out) const {
     if (piece.empty()) return;

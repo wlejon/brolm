@@ -94,6 +94,8 @@ target_sources(brolm PRIVATE
     src/clip_image.cpp
     src/clip_score.cpp
     src/alignment_adapter.cpp
+    src/qwen35_config.cpp
+    src/qwen35_tokenizer.cpp
 )
 
 # --- Install ---
