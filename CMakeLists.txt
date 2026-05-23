@@ -96,6 +96,7 @@ target_sources(brolm PRIVATE
     src/alignment_adapter.cpp
     src/qwen35_config.cpp
     src/qwen35_tokenizer.cpp
+    src/qwen35_preprocessor.cpp
 )
 
 # --- Install ---
