@@ -417,9 +417,16 @@ void TextModel::load_weights_impl_(
             // name and copy its bytes through upload_compute. Shapes use
             // safetensors view->shape directly via upload_compute (no shape
             // check) to stay robust to future config drift.)
-            auto load_any = [&](const std::string& key, bt::Tensor& dst) {
+            // Force-upload every linear-attn tensor as FP32 regardless of the
+            // pipeline compute dtype. The Gated DeltaNet recurrence
+            // (gated_delta_rule_step) and causal_conv1d_update kernels are
+            // FP32-only on both CPU and CUDA, so the entire linear-attn block
+            // runs FP32 — the forward casts norm_ to FP32 on entry and casts
+            // the residual back to compute_dtype before adding to h_. Loading
+            // these weights at compute_dtype (FP16 on GPU) would force a
+            // per-step dtype mismatch in every kernel of the block.
+            auto load_fp32 = [&](const std::string& key, bt::Tensor& dst) {
                 const auto& v = need(shards, key);
-                // Infer rows/cols from the view shape. 1-D and 2-D supported.
                 int rows = 0, cols = 1;
                 if (v.shape.size() == 1) {
                     rows = static_cast<int>(v.shape[0]);
@@ -427,26 +434,41 @@ void TextModel::load_weights_impl_(
                     rows = static_cast<int>(v.shape[0]);
                     cols = static_cast<int>(v.shape[1]);
                 } else if (v.shape.size() == 3) {
-                    // e.g. conv1d.weight (channels, in_per_group, kernel).
-                    // Flatten into (channels, in_per_group*kernel) — Stage 3b
-                    // will reshape as needed.
                     rows = static_cast<int>(v.shape[0]);
                     cols = static_cast<int>(v.shape[1]) *
                            static_cast<int>(v.shape[2]);
                 } else {
-                    fail("linear_attn tensor has unsupported rank: " + key);
+                    fail("linear_attn '" + key + "': unsupported rank");
                 }
-                upload_compute_checked(v, rows, cols, dst, key);
+                const std::size_t n =
+                    static_cast<std::size_t>(rows) * cols;
+                std::vector<float> tmp(n);
+                if (v.dtype == st::Dtype::F32) {
+                    std::memcpy(tmp.data(), v.data, n * sizeof(float));
+                } else if (v.dtype == st::Dtype::F16) {
+                    const uint16_t* src =
+                        reinterpret_cast<const uint16_t*>(v.data);
+                    for (std::size_t i = 0; i < n; ++i)
+                        tmp[i] = bt::fp16_bits_to_fp32(src[i]);
+                } else if (v.dtype == st::Dtype::BF16) {
+                    const uint16_t* src =
+                        reinterpret_cast<const uint16_t*>(v.data);
+                    for (std::size_t i = 0; i < n; ++i)
+                        tmp[i] = bt::bf16_bits_to_fp32(src[i]);
+                } else {
+                    fail("linear_attn '" + key + "': unsupported dtype");
+                }
+                dst = bt::Tensor::from_host(tmp.data(), rows, cols);
             };
-            load_any(lp + "A_log",          L.lin.A_log);
-            load_any(lp + "conv1d.weight",  L.lin.conv1d);
-            load_any(lp + "dt_bias",        L.lin.dt_bias);
-            load_any(lp + "in_proj_a.weight",   L.lin.in_proj_a);
-            load_any(lp + "in_proj_b.weight",   L.lin.in_proj_b);
-            load_any(lp + "in_proj_qkv.weight", L.lin.in_proj_qkv);
-            load_any(lp + "in_proj_z.weight",   L.lin.in_proj_z);
-            load_any(lp + "norm.weight",        L.lin.norm);
-            load_any(lp + "out_proj.weight",    L.lin.out_proj);
+            load_fp32(lp + "A_log",             L.lin.A_log);
+            load_fp32(lp + "conv1d.weight",     L.lin.conv1d);
+            load_fp32(lp + "dt_bias",           L.lin.dt_bias);
+            load_fp32(lp + "in_proj_a.weight",  L.lin.in_proj_a);
+            load_fp32(lp + "in_proj_b.weight",  L.lin.in_proj_b);
+            load_fp32(lp + "in_proj_qkv.weight", L.lin.in_proj_qkv);
+            load_fp32(lp + "in_proj_z.weight",  L.lin.in_proj_z);
+            load_fp32(lp + "norm.weight",       L.lin.norm);
+            load_fp32(lp + "out_proj.weight",   L.lin.out_proj);
         }
     }
 
@@ -784,8 +806,20 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 fail("forward: linear-attn state must be FP32");
             }
 
+            // The Gated DeltaNet kernels (causal_conv1d_update,
+            // gated_delta_rule_step, the per-head RMSNormGated) are FP32-only.
+            // The weights for this block are uploaded as FP32 at load time;
+            // here we cast the FP16 activation input to FP32 on entry so every
+            // matmul in the block produces FP32 directly, and cast the
+            // out_proj result back to compute_dtype before the residual add.
+            const bt::Tensor* lin_x = &norm_;
+            if (norm_.dtype != bt::Dtype::FP32) {
+                bt::cast(norm_, lin_x_fp32_, bt::Dtype::FP32);
+                lin_x = &lin_x_fp32_;
+            }
+
             // 1) in_proj_qkv -> (L, qkv_ch)
-            detail::linear_batched(layer.lin.in_proj_qkv, nullptr, norm_, lin_qkv_);
+            detail::linear_batched(layer.lin.in_proj_qkv, nullptr, *lin_x, lin_qkv_);
 
             // 2) Depthwise causal conv1d with state, then SiLU (HF activation).
             //    brotensor's causal_conv1d_update lays X out as (N, C * L_step)
@@ -833,43 +867,23 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             }
 
             // 4) z = in_proj_z @ x  (T, H*D_v)
-            detail::linear_batched(layer.lin.in_proj_z, nullptr, norm_, lin_z_);
+            detail::linear_batched(layer.lin.in_proj_z, nullptr, *lin_x, lin_z_);
 
-            // 5) a_raw = in_proj_a @ x + dt_bias    (T, H), FP32 required by the
-            //    recurrence op. We compute at compute_dtype then convert to FP32.
-            bt::Tensor a_tmp, b_tmp;
-            detail::linear_batched(layer.lin.in_proj_a, nullptr, norm_, a_tmp);
-            detail::linear_batched(layer.lin.in_proj_b, nullptr, norm_, b_tmp);
-            std::vector<float> a_host = download_fp32(a_tmp);
-            std::vector<float> b_host = download_fp32(b_tmp);
-            std::vector<float> dt_host = download_fp32(layer.lin.dt_bias);
-            if (static_cast<int>(dt_host.size()) != lin_h) {
-                fail("forward: dt_bias size mismatch");
-            }
-            // Add dt_bias per row (the bias is broadcast across the T axis;
-            // brotensor's op does softplus internally so we hand it the SUM).
-            for (int r = 0; r < L; ++r) {
-                for (int h = 0; h < lin_h; ++h) {
-                    a_host[static_cast<std::size_t>(r) * lin_h + h] +=
-                        dt_host[static_cast<std::size_t>(h)];
-                }
-            }
-            lin_a_raw_ = bt::Tensor::from_host_on(bt::default_device(),
-                                                  a_host.data(), L, lin_h);
-            lin_beta_  = bt::Tensor::from_host_on(bt::default_device(),
-                                                  b_host.data(), L, lin_h);
+            // 5) a_raw = in_proj_a @ x + dt_bias    (T, H). dt_bias is the
+            //    linear's bias; brotensor's FP32 batched linear broadcasts
+            //    (out, 1) over the row axis. Output is already FP32 since W
+            //    and *lin_x are FP32; brotensor's recurrence op does softplus
+            //    internally so we hand it the SUM.
+            detail::linear_batched(layer.lin.in_proj_a, &layer.lin.dt_bias,
+                                   *lin_x, lin_a_raw_);
+            detail::linear_batched(layer.lin.in_proj_b, nullptr,
+                                   *lin_x, lin_beta_);
 
-            // 6) log_A as (num_heads, 1) FP32 (forces conversion if loaded
-            //    at FP16 on a GPU build; on CPU it's already FP32).
-            if (layer.lin.A_log.dtype != bt::Dtype::FP32) {
-                std::vector<float> la = download_fp32(layer.lin.A_log);
-                lin_log_A_ = bt::Tensor::from_host_on(bt::default_device(),
-                                                     la.data(), lin_h, 1);
-            } else {
-                lin_log_A_ = layer.lin.A_log;
-                lin_log_A_.rows = lin_h;
-                lin_log_A_.cols = 1;
-            }
+            // 6) log_A as (num_heads, 1) FP32 — weight is already FP32, just
+            //    rewrite the shape for the recurrence op.
+            lin_log_A_ = layer.lin.A_log;
+            lin_log_A_.rows = lin_h;
+            lin_log_A_.cols = 1;
 
             // 7) Pre-recurrence q/k transforms that HF folds into its
             //    `chunk_gated_delta_rule` / `recurrent_gated_delta_rule` kernels
@@ -907,9 +921,16 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             bt::silu_forward(lin_z_, lin_zsilu_);
             bt::mul_inplace(lin_O_norm_, lin_zsilu_);
 
-            // 10) out_proj back to hidden, residual add.
+            // 10) out_proj back to hidden, residual add. proj_ is FP32 here
+            //     (FP32 weight × FP32 input); cast back to compute_dtype so it
+            //     can be added to the FP16 residual stream on GPU builds.
             detail::linear_batched(layer.lin.out_proj, nullptr, lin_O_norm_, proj_);
-            bt::add_inplace(h_, proj_);
+            const bt::Tensor* proj_to_add = &proj_;
+            if (proj_.dtype != h_.dtype) {
+                bt::cast(proj_, lin_proj_cast_, h_.dtype);
+                proj_to_add = &lin_proj_cast_;
+            }
+            bt::add_inplace(h_, *proj_to_add);
             (void)n_kv;
         }
 

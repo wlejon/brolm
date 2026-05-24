@@ -259,6 +259,8 @@ private:
     brotensor::Tensor lin_O_;          // (T, num_heads*value_head_dim) recurrence out
     brotensor::Tensor lin_O_norm_;     // per-head RMSNormed O
     brotensor::Tensor lin_log_A_;      // (num_heads, 1) FP32 — cached per layer view
+    brotensor::Tensor lin_x_fp32_;     // FP32 cast of norm_ for the linear-attn block
+    brotensor::Tensor lin_proj_cast_;  // compute-dtype cast of FP32 out_proj output
 };
 
 }  // namespace brolm::qwen35
