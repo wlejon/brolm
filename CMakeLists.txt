@@ -133,3 +133,9 @@ if(BROLM_TESTS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# --- Tools (ad-hoc drivers, not run by ctest) ---
+option(BROLM_TOOLS "Build brolm ad-hoc tool drivers" ON)
+if(BROLM_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    add_subdirectory(tools)
+endif()
