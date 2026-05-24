@@ -90,41 +90,97 @@ std::vector<float> download_fp32(const bt::Tensor& t) {
     return t.to_host_vector();
 }
 
+// HF M-RoPE interleaves three position streams (t,h,w) at the pair-index level.
+// `apply_interleaved_mrope` (modeling_qwen3_5.py) overwrites the T-axis freq
+// vector with H-axis values at slice(1, d_h*3, 3) and W-axis values at
+// slice(2, d_w*3, 3); the remaining indices stay T. Concretely, with
+// mrope_section=[d_t,d_h,d_w] and rotary_dim/2=d_t+d_h+d_w:
+//   axis owner of HF pair-index j is:
+//     'H' if j in {1, 4, 7, ..., 1 + 3*(d_h-1)}
+//     'W' if j in {2, 5, 8, ..., 2 + 3*(d_w-1)}
+//     'T' otherwise
+// inv_freq[j] (from the global rotary_dim/2 schedule) is always used at HF
+// pair-index j, regardless of axis ownership.
+//
+// brotensor's `rope_apply_mrope` assumes the chunked-axis layout: T owns the
+// FIRST d_t pairs, H the next d_h, W the last d_w. To reconcile, we permute
+// q_proj/k_proj rows (and q_norm/k_norm gains) at load time so that HF's
+// scattered-by-axis ordering becomes brotensor's chunked ordering. The same
+// permutation, plus the original rotate_half->pair conversion, is folded into
+// a single row-index map below; `build_axis_tables` consumes the matching
+// inv_freq index list per axis so that frequencies stay aligned.
+//
+// Returns, for each axis A in (T,H,W), the list of HF pair-indices owned by A
+// in ascending pair-index order. Sum of sizes == rotary_dim/2.
+struct MRopePairing {
+    std::vector<int> t_pairs, h_pairs, w_pairs;
+};
+
+MRopePairing mrope_pairing(int d_t, int d_h, int d_w) {
+    const int half = d_t + d_h + d_w;
+    std::vector<char> owner(static_cast<std::size_t>(half), 'T');
+    for (int k = 0; k < d_h; ++k) owner[static_cast<std::size_t>(1 + 3*k)] = 'H';
+    for (int k = 0; k < d_w; ++k) owner[static_cast<std::size_t>(2 + 3*k)] = 'W';
+    MRopePairing p;
+    for (int j = 0; j < half; ++j) {
+        switch (owner[static_cast<std::size_t>(j)]) {
+            case 'T': p.t_pairs.push_back(j); break;
+            case 'H': p.h_pairs.push_back(j); break;
+            case 'W': p.w_pairs.push_back(j); break;
+        }
+    }
+    return p;
+}
+
+// Build the brolm-dim -> HF-dim permutation for the rotary subrange of one
+// head. For brolm pair b in [0, half), the source HF pair is
+//   T_pairs[b]                              if b in [0, d_t)
+//   H_pairs[b - d_t]                        if b in [d_t, d_t+d_h)
+//   W_pairs[b - d_t - d_h]                  if b in [d_t+d_h, half)
+// The HF dim for pair p slot s in {0,1} is `p + s*half` (rotate_half layout).
+std::vector<int> rotary_row_perm(int rotary_dim, int d_t, int d_h, int d_w) {
+    const int half = rotary_dim / 2;
+    MRopePairing P = mrope_pairing(d_t, d_h, d_w);
+    std::vector<int> hf_pair_for_brolm;
+    hf_pair_for_brolm.reserve(static_cast<std::size_t>(half));
+    hf_pair_for_brolm.insert(hf_pair_for_brolm.end(), P.t_pairs.begin(), P.t_pairs.end());
+    hf_pair_for_brolm.insert(hf_pair_for_brolm.end(), P.h_pairs.begin(), P.h_pairs.end());
+    hf_pair_for_brolm.insert(hf_pair_for_brolm.end(), P.w_pairs.begin(), P.w_pairs.end());
+    std::vector<int> brolm_to_hf(static_cast<std::size_t>(rotary_dim));
+    for (int b = 0; b < half; ++b) {
+        const int hp = hf_pair_for_brolm[static_cast<std::size_t>(b)];
+        brolm_to_hf[static_cast<std::size_t>(2*b)]     = hp;
+        brolm_to_hf[static_cast<std::size_t>(2*b + 1)] = hp + half;
+    }
+    return brolm_to_hf;
+}
+
 // Permute the first `rotary_dim` rows within each head's `head_dim` row block
-// from HF rotate_half order into brotensor's interleaved-pair order. Rows
-// `[rotary_dim, head_dim)` are pass-through (copied verbatim).
-//
-// HF dim i (i in [0, rotary_dim/2)) pairs with HF dim i + rotary_dim/2.
-// brotensor wants:
-//   interleaved index 2i   <- HF index i
-//   interleaved index 2i+1 <- HF index i + rotary_dim/2
-//
+// from HF rotate_half order into brotensor's chunked-axis interleaved-pair
+// order. Rows [rotary_dim, head_dim) are pass-through.
 // src/dst are (num_heads*head_dim, cols) host buffers.
 std::vector<float> permute_rotary_rows(const std::vector<float>& src,
                                        int num_heads, int head_dim,
-                                       int rotary_dim, int cols) {
-    const int half = rotary_dim / 2;
+                                       int rotary_dim, int cols,
+                                       int d_t, int d_h, int d_w) {
+    std::vector<int> brolm_to_hf = rotary_row_perm(rotary_dim, d_t, d_h, d_w);
     std::vector<float> dst(src.size());
+    const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(float);
     for (int h = 0; h < num_heads; ++h) {
         const std::size_t base =
             static_cast<std::size_t>(h) * head_dim *
             static_cast<std::size_t>(cols);
-        // Rotated subrange [0, rotary_dim): interleave halves.
-        for (int i = 0; i < half; ++i) {
-            const std::size_t d0 = base + static_cast<std::size_t>(2 * i) * cols;
-            const std::size_t d1 = base + static_cast<std::size_t>(2 * i + 1) * cols;
-            const std::size_t s0 = base + static_cast<std::size_t>(i) * cols;
-            const std::size_t s1 = base + static_cast<std::size_t>(i + half) * cols;
-            std::memcpy(&dst[d0], &src[s0],
-                        static_cast<std::size_t>(cols) * sizeof(float));
-            std::memcpy(&dst[d1], &src[s1],
-                        static_cast<std::size_t>(cols) * sizeof(float));
+        // Rotated subrange [0, rotary_dim): dst[b] <- src[brolm_to_hf[b]].
+        for (int b = 0; b < rotary_dim; ++b) {
+            const std::size_t doff = base + static_cast<std::size_t>(b) * cols;
+            const std::size_t soff = base +
+                static_cast<std::size_t>(brolm_to_hf[static_cast<std::size_t>(b)]) * cols;
+            std::memcpy(&dst[doff], &src[soff], row_bytes);
         }
         // Pass-through tail [rotary_dim, head_dim): copy as is.
         for (int r = rotary_dim; r < head_dim; ++r) {
             const std::size_t off = base + static_cast<std::size_t>(r) * cols;
-            std::memcpy(&dst[off], &src[off],
-                        static_cast<std::size_t>(cols) * sizeof(float));
+            std::memcpy(&dst[off], &src[off], row_bytes);
         }
     }
     return dst;
@@ -161,12 +217,15 @@ void split_q_gate_rows(const std::vector<float>& src,
     }
 }
 
-// Build a per-axis sin/cos table (max_pos+1, d) using base rope_theta and the
-// inv_freq schedule used by Qwen3.5: freqs_i = pos / theta^(2i / rotary_dim)
-// for i in [0, d). brotensor's rope_apply_mrope expects (max_pos_a, d_a)
-// FP32 tables, one cos and one sin per axis, indexed by the per-row pos.
+// Build a per-axis sin/cos table (max_pos+1, d_axis) using base rope_theta and
+// a list of GLOBAL inv_freq indices (one per axis slot). The HF schedule is
+// inv_freq[j] = 1 / theta^(2j / rotary_dim) over j in [0, rotary_dim/2). For
+// the chunked-axis layout brotensor expects, the per-axis tables index this
+// schedule at the HF pair-indices owned by that axis (see `mrope_pairing`).
 void build_axis_tables(int max_pos_inclusive, int d_axis, int rotary_dim,
-                       float rope_theta, bt::Tensor& cos_t, bt::Tensor& sin_t) {
+                       float rope_theta,
+                       const std::vector<int>& freq_indices,
+                       bt::Tensor& cos_t, bt::Tensor& sin_t) {
     const int rows = std::max(1, max_pos_inclusive + 1);
     if (d_axis <= 0) {
         // Degenerate axis: brotensor still accepts a (rows, 0)-ish layout via
@@ -176,12 +235,15 @@ void build_axis_tables(int max_pos_inclusive, int d_axis, int rotary_dim,
         sin_t = bt::Tensor::zeros_on(bt::default_device(), rows, 1, bt::Dtype::FP32);
         return;
     }
+    if (static_cast<int>(freq_indices.size()) != d_axis) {
+        fail("build_axis_tables: freq_indices.size() != d_axis");
+    }
     std::vector<float> cos_h(static_cast<std::size_t>(rows) * d_axis);
     std::vector<float> sin_h(static_cast<std::size_t>(rows) * d_axis);
-    // inv_freq[i] = 1 / theta^(2i / rotary_dim)
     std::vector<float> inv_freq(static_cast<std::size_t>(d_axis));
     for (int i = 0; i < d_axis; ++i) {
-        const float exp = 2.0f * static_cast<float>(i) /
+        const int gj = freq_indices[static_cast<std::size_t>(i)];
+        const float exp = 2.0f * static_cast<float>(gj) /
                           static_cast<float>(rotary_dim);
         inv_freq[static_cast<std::size_t>(i)] =
             1.0f / std::pow(rope_theta, exp);
@@ -307,7 +369,8 @@ void TextModel::load_weights_impl_(
             std::vector<float> q_rows, g_rows;
             split_q_gate_rows(q_host, n_q, HD, H, q_rows, g_rows);
             std::vector<float> q_perm =
-                permute_rotary_rows(q_rows, n_q, HD, rotary_dim_, H);
+                permute_rotary_rows(q_rows, n_q, HD, rotary_dim_, H,
+                                    d_t_, d_h_, d_w_);
             L.full.Wq = brolm::detail::upload_host(q_perm.data(), q_dim, H);
             L.full.Wg = brolm::detail::upload_host(g_rows.data(), q_dim, H);
 
@@ -316,7 +379,8 @@ void TextModel::load_weights_impl_(
                                    kv_dim, H, k_raw, "self_attn.k_proj.weight");
             std::vector<float> k_host = download_fp32(k_raw);
             std::vector<float> k_perm =
-                permute_rotary_rows(k_host, n_kv, HD, rotary_dim_, H);
+                permute_rotary_rows(k_host, n_kv, HD, rotary_dim_, H,
+                                    d_t_, d_h_, d_w_);
             L.full.Wk = brolm::detail::upload_host(k_perm.data(), kv_dim, H);
 
             upload_compute_checked(need(shards, p + "self_attn.v_proj.weight"),
@@ -336,9 +400,11 @@ void TextModel::load_weights_impl_(
             for (float& v : qn_host) v += 1.0f;
             for (float& v : kn_host) v += 1.0f;
             std::vector<float> qn_perm =
-                permute_rotary_rows(qn_host, /*num_heads=*/1, HD, rotary_dim_, 1);
+                permute_rotary_rows(qn_host, /*num_heads=*/1, HD, rotary_dim_, 1,
+                                    d_t_, d_h_, d_w_);
             std::vector<float> kn_perm =
-                permute_rotary_rows(kn_host, /*num_heads=*/1, HD, rotary_dim_, 1);
+                permute_rotary_rows(kn_host, /*num_heads=*/1, HD, rotary_dim_, 1,
+                                    d_t_, d_h_, d_w_);
             L.full.q_norm = brolm::detail::upload_host(qn_perm.data(), HD, 1);
             L.full.k_norm = brolm::detail::upload_host(kn_perm.data(), HD, 1);
         } else {
@@ -496,9 +562,14 @@ void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L,
     upd(pos_t); upd(pos_h); upd(pos_w);
 
     bt::Tensor cos_t, sin_t, cos_h_tbl, sin_h_tbl, cos_w, sin_w;
-    build_axis_tables(max_pos, d_t_, rd, cfg_.rope.rope_theta, cos_t, sin_t);
-    build_axis_tables(max_pos, d_h_, rd, cfg_.rope.rope_theta, cos_h_tbl, sin_h_tbl);
-    build_axis_tables(max_pos, d_w_, rd, cfg_.rope.rope_theta, cos_w, sin_w);
+    // Per-axis global inv_freq indices follow HF's apply_interleaved_mrope.
+    MRopePairing pairing = mrope_pairing(d_t_, d_h_, d_w_);
+    build_axis_tables(max_pos, d_t_, rd, cfg_.rope.rope_theta,
+                      pairing.t_pairs, cos_t, sin_t);
+    build_axis_tables(max_pos, d_h_, rd, cfg_.rope.rope_theta,
+                      pairing.h_pairs, cos_h_tbl, sin_h_tbl);
+    build_axis_tables(max_pos, d_w_, rd, cfg_.rope.rope_theta,
+                      pairing.w_pairs, cos_w, sin_w);
 
     // brotensor's mrope op accepts host pointers on CPU, device on CUDA/Metal.
     // We stage on host then optionally migrate. For simplicity match the
