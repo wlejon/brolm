@@ -97,6 +97,7 @@ target_sources(brolm PRIVATE
     src/qwen35_config.cpp
     src/qwen35_tokenizer.cpp
     src/qwen35_preprocessor.cpp
+    src/qwen35_vision.cpp
 )
 
 # --- Install ---
