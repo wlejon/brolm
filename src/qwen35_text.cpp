@@ -51,6 +51,31 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
     return cpu.to(bt::default_device());
 }
 
+// HF's Qwen3_5RMSNorm applies `(1 + weight)` as the gain (init zeros, centred
+// on identity). brotensor's rms_norm_forward expects the raw gain, so we add
+// 1.0 to every Qwen3_5RMSNorm weight at load time. Qwen3_5RMSNormGated (the
+// linear-attn `linear_attn.norm`) uses plain `weight` (init ones) and is
+// EXCLUDED from this transform. See HF transformers
+// `Qwen3_5RMSNorm.forward` and the `_init_weights` comment "We initialize
+// with 0s to be 1 centered as the RMSNorm here does (1 + weight)".
+void add_one_to_norm_weight(bt::Tensor& t) {
+    // Stage on host (FP32), add 1, re-upload at the original compute dtype.
+    // Load-path only — runs once per layer.
+    std::vector<float> h(static_cast<std::size_t>(t.size()));
+    if (t.dtype == bt::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(h.size());
+        t.copy_to_host_fp16(bits.data());
+        for (std::size_t i = 0; i < h.size(); ++i)
+            h[i] = bt::fp16_bits_to_fp32(bits[i]) + 1.0f;
+    } else {
+        h = t.to_host_vector();
+        for (float& v : h) v += 1.0f;
+    }
+    const int r = t.rows;
+    const int c = t.cols;
+    t = brolm::detail::upload_host(h.data(), r, c);
+}
+
 std::vector<float> download_fp32(const bt::Tensor& t) {
     const std::size_t n = static_cast<std::size_t>(t.size());
     if (t.dtype == bt::Dtype::FP16) {
@@ -248,6 +273,7 @@ void TextModel::load_weights_impl_(
 
     upload_compute_checked(need(shards, prefix + "norm.weight"),
                            H, 1, final_norm_, "language_model.norm.weight");
+    add_one_to_norm_weight(final_norm_);
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         const std::string p =
@@ -256,9 +282,11 @@ void TextModel::load_weights_impl_(
 
         upload_compute_checked(need(shards, p + "input_layernorm.weight"),
                                H, 1, L.in_norm, "input_layernorm.weight");
+        add_one_to_norm_weight(L.in_norm);
         upload_compute_checked(
             need(shards, p + "post_attention_layernorm.weight"),
             H, 1, L.post_attn_norm, "post_attention_layernorm.weight");
+        add_one_to_norm_weight(L.post_attn_norm);
 
         // MLP — same shape on every layer.
         upload_compute_checked(need(shards, p + "mlp.gate_proj.weight"),
@@ -304,6 +332,9 @@ void TextModel::load_weights_impl_(
                                    HD, 1, kn_raw, "self_attn.k_norm.weight");
             std::vector<float> qn_host = download_fp32(qn_raw);
             std::vector<float> kn_host = download_fp32(kn_raw);
+            // HF Qwen3_5RMSNorm applies (1 + weight) as gain — add 1 here.
+            for (float& v : qn_host) v += 1.0f;
+            for (float& v : kn_host) v += 1.0f;
             std::vector<float> qn_perm =
                 permute_rotary_rows(qn_host, /*num_heads=*/1, HD, rotary_dim_, 1);
             std::vector<float> kn_perm =
@@ -769,14 +800,29 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 lin_log_A_.cols = 1;
             }
 
-            // 7) Recurrence: updates c.lin.recurrent in place; writes O.
+            // 7) Pre-recurrence q/k transforms that HF folds into its
+            //    `chunk_gated_delta_rule` / `recurrent_gated_delta_rule` kernels
+            //    when `use_qk_l2norm_in_kernel=True`, but which brotensor's
+            //    `gated_delta_rule_step` does NOT apply internally:
+            //      - L2-normalize q,k along the per-head d_k axis (eps=1e-6).
+            //      - Scale q by 1/sqrt(d_k) (HF: `scale = query.shape[-1]**-0.5`).
+            //    See HF transformers Qwen3_5 `torch_recurrent_gated_delta_rule`
+            //    (l2norm @ line ~331, scale @ line ~340-341) and the chunked
+            //    counterpart for the same two steps.
+            bt::l2_norm_forward(lin_q_, /*head_dim=*/lin_d_k,
+                                /*num_heads=*/lin_h, /*eps=*/1e-6f, lin_q_);
+            bt::l2_norm_forward(lin_k_, /*head_dim=*/lin_d_k,
+                                /*num_heads=*/lin_h, /*eps=*/1e-6f, lin_k_);
+            bt::scale_inplace(lin_q_, 1.0f / std::sqrt(static_cast<float>(lin_d_k)));
+
+            // 8) Recurrence: updates c.lin.recurrent in place; writes O.
             bt::gated_delta_rule_step(lin_q_, lin_k_, lin_v_,
                                        lin_a_raw_, lin_beta_, lin_log_A_,
                                        /*num_heads=*/lin_h,
                                        /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
                                        c.lin.recurrent, lin_O_);
 
-            // 8) Per-head RMSNorm with norm.weight (size value_head_dim), then
+            // 9) Per-head RMSNorm with norm.weight (size value_head_dim), then
             //    multiply by silu(z). Order: HF's Qwen3NextRMSNormGated does
             //    "norm before gate" — rms_norm(h)*weight, then * silu(gate).
             {
@@ -790,7 +836,7 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             bt::silu_forward(lin_z_, lin_zsilu_);
             bt::mul_inplace(lin_O_norm_, lin_zsilu_);
 
-            // 9) out_proj back to hidden, residual add.
+            // 10) out_proj back to hidden, residual add.
             detail::linear_batched(layer.lin.out_proj, nullptr, lin_O_norm_, proj_);
             bt::add_inplace(h_, proj_);
             (void)n_kv;
