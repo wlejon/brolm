@@ -519,23 +519,56 @@ void TextModel::mlp_block_(const MLP& mlp, int L) {
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
+bt::Tensor TextModel::embed_tokens(const std::vector<int>& token_ids) const {
+    if (token_ids.empty()) fail("embed_tokens: token_ids empty");
+    if (embed_.size() == 0) fail("embed_tokens: weights not loaded");
+    const int L = static_cast<int>(token_ids.size());
+    std::vector<int32_t> ids32(L);
+    for (int i = 0; i < L; ++i) {
+        ids32[static_cast<std::size_t>(i)] =
+            static_cast<int32_t>(token_ids[static_cast<std::size_t>(i)]);
+    }
+    bt::Tensor ids_dev = make_idx_device(ids32.data(), L);
+    bt::Tensor out;
+    bt::embedding_lookup_forward(
+        embed_, static_cast<const int32_t*>(ids_dev.data), L, out);
+    // Clone so the result owns its own storage (embedding_lookup_forward may
+    // alias internal scratch on some backends).
+    return out.clone();
+}
+
 void TextModel::forward(const std::vector<int>& token_ids,
                         const std::vector<int64_t>& mrope_t,
                         const std::vector<int64_t>& mrope_h,
                         const std::vector<int64_t>& mrope_w,
                         std::vector<LayerCache>& cache,
                         bt::Tensor& logits_out) {
-    if (token_ids.empty()) fail("forward: token_ids empty");
-    const int L = static_cast<int>(token_ids.size());
+    // Embed then delegate — keeps the token-id and pre-embedded paths sharing
+    // the exact same compute kernel below.
+    bt::Tensor embeds = embed_tokens(token_ids);
+    forward_embeds(embeds, mrope_t, mrope_h, mrope_w, cache, logits_out);
+}
+
+void TextModel::forward_embeds(const bt::Tensor& embeds,
+                               const std::vector<int64_t>& mrope_t,
+                               const std::vector<int64_t>& mrope_h,
+                               const std::vector<int64_t>& mrope_w,
+                               std::vector<LayerCache>& cache,
+                               bt::Tensor& logits_out) {
+    if (embeds.rows <= 0) fail("forward_embeds: empty input");
+    const int L = embeds.rows;
+    if (embeds.cols != cfg_.hidden_size) {
+        fail("forward_embeds: embeds.cols != hidden_size");
+    }
     if (static_cast<int>(mrope_t.size()) != L ||
         static_cast<int>(mrope_h.size()) != L ||
         static_cast<int>(mrope_w.size()) != L) {
-        fail("forward: mrope_{t,h,w} length must match token_ids");
+        fail("forward_embeds: mrope_{t,h,w} length must match embeds.rows");
     }
     if (cache.size() != static_cast<std::size_t>(cfg_.num_hidden_layers)) {
-        fail("forward: cache size mismatch");
+        fail("forward_embeds: cache size mismatch");
     }
-    if (embed_.size() == 0) fail("forward: weights not loaded");
+    if (embed_.size() == 0) fail("forward_embeds: weights not loaded");
 
     const int HD   = cfg_.head_dim;
     const int n_q  = cfg_.num_attention_heads;
@@ -551,15 +584,9 @@ void TextModel::forward(const std::vector<int>& token_ids,
         pos_w[static_cast<std::size_t>(i)] = static_cast<int32_t>(mrope_w[static_cast<std::size_t>(i)]);
     }
 
-    // Embedding lookup (need a host int32 buffer for embedding_lookup_forward).
-    std::vector<int32_t> ids32(L);
-    for (int i = 0; i < L; ++i) {
-        ids32[static_cast<std::size_t>(i)] = static_cast<int32_t>(token_ids[static_cast<std::size_t>(i)]);
-    }
-    ids_dev_ = make_idx_device(ids32.data(), L);
-    bt::embedding_lookup_forward(
-        embed_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
-    h_ = h_.clone();
+    // Initialise the residual stream from the supplied embeddings. Clone so we
+    // don't mutate the caller's tensor across the layer stack.
+    h_ = embeds.clone();
 
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
         LayerSlot& layer = layers_[static_cast<std::size_t>(li)];

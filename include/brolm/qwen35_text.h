@@ -141,6 +141,28 @@ public:
                  std::vector<LayerCache>& cache,
                  brotensor::Tensor& logits_out);
 
+    // Same forward, but starts from already-embedded inputs. `embeds` is a
+    // (T, hidden) tensor at the compute dtype (typically produced by
+    // `embed_tokens(...)` and then sliced/overwritten by the VLM glue to
+    // splice vision-tower outputs into <|image_pad|> positions). The token-id
+    // forward(...) above internally calls this after its own embedding lookup,
+    // so `forward(ids,...) == forward_embeds(embed_tokens(ids),...)` exactly.
+    void forward_embeds(const brotensor::Tensor& embeds,
+                        const std::vector<int64_t>& mrope_t,
+                        const std::vector<int64_t>& mrope_h,
+                        const std::vector<int64_t>& mrope_w,
+                        std::vector<LayerCache>& cache,
+                        brotensor::Tensor& logits_out);
+
+    // Embed a sequence of token ids via the tied embedding table, returning a
+    // freshly-allocated (T, hidden) tensor at the compute dtype. Exposed so
+    // the VLM glue can splice vision-tower embeddings into image-pad slots
+    // before running forward_embeds.
+    brotensor::Tensor embed_tokens(const std::vector<int>& token_ids) const;
+
+    // Read-only handle to the embedding table (vocab, hidden) on device.
+    const brotensor::Tensor& embed_table() const { return embed_; }
+
     const Qwen35Config::Text& config() const { return cfg_; }
 
 private:
