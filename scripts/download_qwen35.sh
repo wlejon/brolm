@@ -3,6 +3,10 @@
 # Download Qwen3.5-0.8B — the smallest Qwen3.5 open-weight model — into brolm's
 # gitignored weights/ directory.
 #
+# Note: every Qwen3.5 release is a vision-language model. There is no text-only
+# Qwen3.5. The preprocessor / vision tower / hybrid text backbone / top-level
+# driver live in brolm/qwen35_{preprocessor,vision,text,vl}.h.
+#
 # Why this model: the Qwen3.6 open-weight checkpoints (27B dense, 35B-A3B MoE)
 # are both 55+ GB. Qwen3.5 and Qwen3.6 share the same hybrid architecture
 # (Gated DeltaNet linear-attention layers + periodic Gated Attention), so the
