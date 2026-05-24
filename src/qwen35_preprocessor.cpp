@@ -16,6 +16,8 @@
 
 #include "brolm/qwen35_preprocessor.h"
 
+#include "broimage/geometric.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -34,51 +36,6 @@ namespace {
 }
 [[noreturn]] void fail_rope(const std::string& msg) {
     throw std::runtime_error("qwen35::build_mrope_position_ids: " + msg);
-}
-
-// Bilinear resize, per-channel, "align_corners=False" center-pixel rule.
-// Mirrors the formula at src/clip_score.cpp:166-208. Kept local on purpose:
-// the task spec asks us not to factor this into a shared header yet.
-//
-//   in  : src_chw, shape (C, H_in, W_in), row-major.
-//   out : dst_chw, shape (C, H_out, W_out), caller-allocated.
-void bilinear_resize_chw(const float* src, int C, int H_in, int W_in,
-                         float* dst, int H_out, int W_out) {
-    const float sx = static_cast<float>(W_in)  / static_cast<float>(W_out);
-    const float sy = static_cast<float>(H_in)  / static_cast<float>(H_out);
-    const std::size_t plane_in  = static_cast<std::size_t>(H_in)  *
-                                  static_cast<std::size_t>(W_in);
-    const std::size_t plane_out = static_cast<std::size_t>(H_out) *
-                                  static_cast<std::size_t>(W_out);
-
-    for (int c = 0; c < C; ++c) {
-        const float* in_plane  = src + static_cast<std::size_t>(c) * plane_in;
-        float*       out_plane = dst + static_cast<std::size_t>(c) * plane_out;
-        for (int y = 0; y < H_out; ++y) {
-            const float fy = (y + 0.5f) * sy - 0.5f;
-            int y0 = static_cast<int>(std::floor(fy));
-            int y1 = y0 + 1;
-            float wy = fy - static_cast<float>(y0);
-            y0 = std::clamp(y0, 0, H_in - 1);
-            y1 = std::clamp(y1, 0, H_in - 1);
-            for (int x = 0; x < W_out; ++x) {
-                const float fx = (x + 0.5f) * sx - 0.5f;
-                int x0 = static_cast<int>(std::floor(fx));
-                int x1 = x0 + 1;
-                float wx = fx - static_cast<float>(x0);
-                x0 = std::clamp(x0, 0, W_in - 1);
-                x1 = std::clamp(x1, 0, W_in - 1);
-
-                const float v00 = in_plane[y0 * W_in + x0];
-                const float v01 = in_plane[y0 * W_in + x1];
-                const float v10 = in_plane[y1 * W_in + x0];
-                const float v11 = in_plane[y1 * W_in + x1];
-                const float v0  = v00 + wx * (v01 - v00);
-                const float v1  = v10 + wx * (v11 - v10);
-                out_plane[y * W_out + x] = v0 + wy * (v1 - v0);
-            }
-        }
-    }
 }
 
 // HF `round` for positive floats uses banker's rounding; here all our inputs
@@ -149,10 +106,12 @@ PreprocessedImage preprocess_image(const float* image_chw, int H, int W,
     int rH = 0, rW = 0;
     smart_resize(H, W, cfg.factor(), cfg.min_pixels, cfg.max_pixels, rH, rW);
 
-    // 2. bilinear resize.
+    // 2. bilinear resize (per-channel, align_corners=False center-pixel rule).
     std::vector<float> resized(
         static_cast<std::size_t>(C) * rH * rW);
-    bilinear_resize_chw(image_chw, C, H, W, resized.data(), rH, rW);
+    broimage::resize_chw_f32(image_chw, W, H, C,
+                             resized.data(), rW, rH,
+                             broimage::Filter::Bilinear);
 
     // 3. normalise: (x - mean) / std per channel.
     {

@@ -7,6 +7,9 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#include "broimage/geometric.h"
+#include "broimage/normalize.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -163,51 +166,25 @@ std::vector<float> CLIPScorer::preprocess_(
              std::to_string(image.size()) + ")");
     }
 
-    // Bilinear resize per channel. We center each output pixel: src_x =
-    // (x + 0.5) * (W / S) - 0.5. Standard "align_corners=False" rule.
-    const float sx = static_cast<float>(W) / static_cast<float>(S);
-    const float sy = static_cast<float>(H) / static_cast<float>(S);
-    const std::size_t plane_in  = static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
-    const std::size_t plane_out = static_cast<std::size_t>(S) * static_cast<std::size_t>(S);
+    // Resize per channel (bilinear, align_corners=False) then CLIP-normalise.
+    // Input is in [-1, 1] (the SD pipeline output); fold the [-1,1] -> [0,1]
+    // rescale into the per-channel mean/std:
+    //   y = (((x + 1) * 0.5) - mean) / std
+    //     = (x - (2*mean - 1)) / (2*std)
+    // so image_normalize_nchw_f32 with adjusted stats produces the same result.
+    std::vector<float> out(static_cast<std::size_t>(C) *
+                           static_cast<std::size_t>(S) * S);
+    broimage::resize_chw_f32(image.data(), W, H, C,
+                             out.data(),   S, S,
+                             broimage::Filter::Bilinear);
 
-    std::vector<float> out(static_cast<std::size_t>(C) * plane_out);
-
+    float mean_eff[3], std_eff[3];
     for (int c = 0; c < C; ++c) {
-        const float* in_plane = image.data() + c * plane_in;
-        const float mean = cfg_.mean[c];
-        const float std_ = cfg_.std_[c];
-        const float inv_std = 1.0f / std_;
-        for (int y = 0; y < S; ++y) {
-            const float fy = (y + 0.5f) * sy - 0.5f;
-            int y0 = static_cast<int>(std::floor(fy));
-            int y1 = y0 + 1;
-            float wy = fy - static_cast<float>(y0);
-            y0 = std::clamp(y0, 0, H - 1);
-            y1 = std::clamp(y1, 0, H - 1);
-            for (int x = 0; x < S; ++x) {
-                const float fx = (x + 0.5f) * sx - 0.5f;
-                int x0 = static_cast<int>(std::floor(fx));
-                int x1 = x0 + 1;
-                float wx = fx - static_cast<float>(x0);
-                x0 = std::clamp(x0, 0, W - 1);
-                x1 = std::clamp(x1, 0, W - 1);
-
-                const float v00 = in_plane[y0 * W + x0];
-                const float v01 = in_plane[y0 * W + x1];
-                const float v10 = in_plane[y1 * W + x0];
-                const float v11 = in_plane[y1 * W + x1];
-                const float v0  = v00 + wx * (v01 - v00);
-                const float v1  = v10 + wx * (v11 - v10);
-                float v         = v0  + wy * (v1  - v0 );
-
-                // [-1, 1] -> [0, 1] -> CLIP-normalised.
-                v = (v + 1.0f) * 0.5f;
-                v = (v - mean) * inv_std;
-
-                out[c * plane_out + y * S + x] = v;
-            }
-        }
+        mean_eff[c] = 2.0f * cfg_.mean[c] - 1.0f;
+        std_eff[c]  = 2.0f * cfg_.std_[c];
     }
+    broimage::image_normalize_nchw_f32(out.data(), mean_eff, std_eff,
+                                       /*N=*/1, C, S, S, out.data());
     return out;
 }
 

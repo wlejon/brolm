@@ -2,13 +2,14 @@
 //
 // usage: run_qwen35_image <weights_dir> <image_path> [user_prompt]
 //
-// Decodes the image with stb_image (any format stb supports — png/jpg/bmp/...),
-// converts to CHW float in [0,1], wraps the user prompt in the standard ChatML
-// vision template, and prints the generated text to stdout.
+// Image decode + area-downscale come from broimage (any format stb supports —
+// png/jpg/bmp/...). The decoded RGBA is dropped to RGB, optionally box-averaged
+// to fit a per-tool pixel cap, and shuffled to CHW float in [0, 1].
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_STATIC
-#include "stb_image.h"
+#include "broimage/buffer.h"
+#include "broimage/color.h"
+#include "broimage/decode.h"
+#include "broimage/geometric.h"
 
 #include "brolm/qwen35_vl.h"
 #include "brotensor/runtime.h"
@@ -21,47 +22,13 @@
 #include <vector>
 
 // Hard cap on input image pixels before it reaches the VLM. Bigger inputs are
-// box-averaged down to fit. The cap exists because vision token count grows
+// area-resampled down to fit. The cap exists because vision token count grows
 // linearly with pixels and the ViT's attention cost grows quadratically with
 // token count — a multi-megapixel screenshot will pin the CPU matmul for many
 // minutes. ~262 K pixels (~512×512) keeps a single forward pass in the
 // tens-of-seconds range on the scalar CPU backend while still being legible
 // for screenshot-style content.
 static constexpr int kMaxInputPixels = 512 * 512;
-
-// Box-average downscale uint8 HWC RGB image (W,H) to (outW,outH). Allocates
-// and returns a new buffer; caller owns it (delete[]). For pure downscaling
-// this is a higher-quality choice than nearest/bilinear: every output pixel is
-// the unweighted mean of all source pixels whose center falls in its cell.
-static unsigned char* box_downscale_rgb(const unsigned char* src,
-                                        int W, int H, int outW, int outH) {
-    auto* out = new unsigned char[static_cast<std::size_t>(outW) * outH * 3];
-    const double sx = static_cast<double>(W) / outW;
-    const double sy = static_cast<double>(H) / outH;
-    for (int oy = 0; oy < outH; ++oy) {
-        const int y0 = static_cast<int>(std::floor(oy * sy));
-        const int y1 = std::min(H, static_cast<int>(std::ceil((oy + 1) * sy)));
-        for (int ox = 0; ox < outW; ++ox) {
-            const int x0 = static_cast<int>(std::floor(ox * sx));
-            const int x1 = std::min(W, static_cast<int>(std::ceil((ox + 1) * sx)));
-            double rsum = 0, gsum = 0, bsum = 0;
-            int n = 0;
-            for (int y = y0; y < y1; ++y) {
-                const unsigned char* row = src + (static_cast<std::size_t>(y) * W + x0) * 3;
-                for (int x = x0; x < x1; ++x, row += 3) {
-                    rsum += row[0]; gsum += row[1]; bsum += row[2];
-                    ++n;
-                }
-            }
-            const double inv = n > 0 ? 1.0 / n : 0.0;
-            unsigned char* d = out + (static_cast<std::size_t>(oy) * outW + ox) * 3;
-            d[0] = static_cast<unsigned char>(rsum * inv + 0.5);
-            d[1] = static_cast<unsigned char>(gsum * inv + 0.5);
-            d[2] = static_cast<unsigned char>(bsum * inv + 0.5);
-        }
-    }
-    return out;
-}
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -74,47 +41,50 @@ int main(int argc, char** argv) {
     const std::string user_prompt =
         argc >= 4 ? argv[3] : "Describe the image.";
 
-    int W = 0, H = 0, ch_in = 0;
-    unsigned char* pixels = stbi_load(image_path.c_str(), &W, &H, &ch_in, 3);
-    if (!pixels) {
-        std::fprintf(stderr, "stb_image: failed to load %s: %s\n",
-                     image_path.c_str(), stbi_failure_reason());
+    broimage::Image rgba;
+    std::string err;
+    if (!broimage::decode_file_oriented(image_path, rgba, &err)) {
+        std::fprintf(stderr, "broimage: failed to load %s: %s\n",
+                     image_path.c_str(), err.c_str());
         return 1;
     }
-    std::fprintf(stderr, "image: %dx%d (file channels=%d, forced to 3)\n",
-                 W, H, ch_in);
+    const int W = rgba.width;
+    const int H = rgba.height;
+    std::fprintf(stderr, "image: %dx%d\n", W, H);
 
-    // Cap input size. Anything bigger than kMaxInputPixels is box-averaged
-    // down preserving aspect ratio; the post-cap dims still get snapped to
-    // multiples of 32 inside the HF preprocessor, so we don't bother here.
-    const long long pix = static_cast<long long>(W) * H;
+    // RGBA8 -> RGB8.
+    std::vector<uint8_t> rgb(static_cast<std::size_t>(W) * H * 3);
+    broimage::rgba_to_rgb_u8(rgba.pixels.data(), rgb.data(), W * H);
+
     int effW = W, effH = H;
-    unsigned char* owned = nullptr;
+    const long long pix = static_cast<long long>(W) * H;
     if (pix > kMaxInputPixels) {
         const double scale = std::sqrt(static_cast<double>(kMaxInputPixels) / pix);
         effW = std::max(1, static_cast<int>(std::round(W * scale)));
         effH = std::max(1, static_cast<int>(std::round(H * scale)));
-        owned = box_downscale_rgb(pixels, W, H, effW, effH);
+        std::vector<uint8_t> down(static_cast<std::size_t>(effW) * effH * 3);
+        broimage::resize_hwc_u8(rgb.data(), W, H, /*channels=*/3,
+                                down.data(), effW, effH,
+                                broimage::Filter::Area);
+        rgb = std::move(down);
         std::fprintf(stderr,
                      "image: downscaled to %dx%d (%.2f MP -> %.2f MP cap)\n",
                      effW, effH, pix / 1.0e6,
                      static_cast<double>(effW) * effH / 1.0e6);
-        stbi_image_free(pixels);
-        pixels = owned;
     }
 
+    // HWC u8 -> CHW float in [0, 1].
     std::vector<float> chw(static_cast<std::size_t>(3) * effH * effW);
+    const std::size_t plane = static_cast<std::size_t>(effH) * effW;
     for (int y = 0; y < effH; ++y) {
         for (int x = 0; x < effW; ++x) {
+            const uint8_t* p = rgb.data() + (static_cast<std::size_t>(y) * effW + x) * 3;
             for (int c = 0; c < 3; ++c) {
-                chw[(static_cast<std::size_t>(c) * effH + y) * effW + x] =
-                    pixels[(static_cast<std::size_t>(y) * effW + x) * 3 + c]
-                    / 255.0f;
+                chw[static_cast<std::size_t>(c) * plane +
+                    static_cast<std::size_t>(y) * effW + x] = p[c] / 255.0f;
             }
         }
     }
-    if (owned) delete[] owned;
-    else stbi_image_free(pixels);
 
     brotensor::init();
 
