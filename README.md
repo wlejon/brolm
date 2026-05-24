@@ -10,7 +10,8 @@ FP16 on a GPU — with the device chosen at runtime.
 brolm turns token sequences into embeddings (encoder models) and generates them
 (decoder models). It owns the tokenizers, the transformer building blocks, and
 the safetensors / Hugging Face weight loaders. brodiffusion depends on brolm for
-its default text encoders.
+its default text encoders. Host-side image decoding and resampling for
+multimodal models go through [broimage](https://github.com/wlejon/broimage).
 
 ## Scope
 
@@ -32,6 +33,7 @@ its default text encoders.
 | `brolm/clip_score.h` | CLIP image/text similarity scoring |
 | `brolm/t5.h` | T5-XXL encoder (encoder-only) |
 | `brolm/qwen_tokenizer.h` | Qwen3 byte-level BPE tokenizer |
+| `brolm/whisper_tokenizer.h` | Whisper byte-level BPE tokenizer (GPT-2 family) + language/task/timestamp specials |
 | `brolm/qwen.h` | Qwen3 decoder LLM — GQA, QK-norm, RoPE, SwiGLU, KV-cache |
 | `brolm/qwen_generate.h` | Sampling (greedy / temperature / top-k / top-p) + autoregressive generation |
 | `brolm/qwen35_config.h` | Qwen3.5-VL typed config (text + vision + multimodal token IDs) |
@@ -42,6 +44,11 @@ its default text encoders.
 | `brolm/qwen35_vl.h` | Top-level VLM driver: tokenize → vision tower → embed splice → text prefill → sample |
 | `brolm/alignment_adapter.h` | Trainable adapter: LLM hidden states → diffusion-conditioning tensors |
 
+The CLIP, Qwen3, Qwen3.5-VL, and Whisper tokenizers share a single byte-level
+BPE core in `brolm::detail::bpe` (`include/brolm/detail/byte_level_bpe.h`) —
+each family-specific tokenizer adds only its own pre-tokenization regex and
+special-token table on top.
+
 ## Build
 
 ```bash
@@ -50,9 +57,18 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-bromath and brotensor are resolved as standalone sibling repos at `../bromath`
-and `../brotensor`, with a `third_party/` submodule fallback — the pattern
-documented in `bro/docs/multi-repo-workflow.md`.
+bromath, brotensor, and broimage are resolved as standalone sibling repos at
+`../bromath`, `../brotensor`, and `../broimage`, with a `third_party/` submodule
+fallback — the pattern documented in `bro/docs/multi-repo-workflow.md`. Override
+any of them with `-DBROMATH_DIR=...`, `-DBROTENSOR_DIR=...`,
+`-DBROIMAGE_DIR=...`. Pass `-DBROTENSOR_WITH_CUDA=ON` or
+`-DBROTENSOR_WITH_METAL=ON` to forward the GPU backend selection to brotensor.
+
+CMake options:
+
+- `BROLM_TESTS` (default `ON` when built standalone) — build the unit/integration suite under `tests/`.
+- `BROLM_TOOLS` (default `ON` when built standalone) — build the ad-hoc tool drivers under `tools/` (not run by ctest).
+- `BROLM_INSTALL` (default `OFF`) — install the static library and public headers. brolm is meant to be consumed via `add_subdirectory`, not `find_package`; no CMake package config is generated.
 
 ## Qwen3.5-VL
 
@@ -105,7 +121,19 @@ scripts/download_qwen35.sh           # Qwen/Qwen3.5-0.8B by default
 REPO=Qwen/Qwen3.5-2B scripts/download_qwen35.sh
 ```
 
-Status: all 18 unit + integration tests pass; the gated real-checkpoint suite
+An ad-hoc CLI driver under `tools/` runs the full pipeline against a real image
+file:
+
+```bash
+build/tools/Release/brolm_run_qwen35_image \
+    weights/Qwen3.5-0.8B path/to/image.png "Describe the image."
+```
+
+It decodes the image via broimage, area-resamples it down to a per-tool pixel
+cap (~512×512 by default — vision token count is linear in pixels and ViT
+attention cost quadratic in tokens), and prints the model's reply.
+
+Status: all 19 unit + integration tests pass; the gated real-checkpoint suite
 loads the official 0.8B safetensors and runs every stage (config / tokenizer /
 preprocessor / vision tower / hybrid text prefill+decode parity / full VLM
 end-to-end) without NaN. Bit-exact numerical parity against HF `transformers`
