@@ -372,6 +372,15 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
     const int cache_cols = n_q * cfg_.head_dim;
     const bt::Dtype dt = brolm::compute_dtype();
     const bt::Device dev = bt::default_device();
+
+    // Linear-attn shapes.
+    const int lin_h    = cfg_.linear_num_value_heads;
+    const int lin_d_v  = cfg_.linear_value_head_dim;
+    const int lin_d_k  = cfg_.linear_key_head_dim;
+    const int qkv_ch   = 3 * lin_h * lin_d_k;             // 3 * heads * d_k
+    const int conv_st_cols = qkv_ch * (cfg_.linear_conv_kernel_dim - 1);
+    const int state_cols   = lin_d_v * lin_d_k;
+
     std::vector<LayerCache> out(static_cast<std::size_t>(cfg_.num_hidden_layers));
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         LayerCache& c = out[static_cast<std::size_t>(i)];
@@ -379,6 +388,14 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
             brolm::detail::resize_like(c.full.k, max_seq, cache_cols, dt, dev);
             brolm::detail::resize_like(c.full.v, max_seq, cache_cols, dt, dev);
             c.full.len = 0;
+        } else {
+            // Recurrent state + conv shift register, both FP32 (the recurrence
+            // op and causal_conv1d_update are FP32 on CPU).
+            c.lin.recurrent = bt::Tensor::zeros_on(dev, lin_h, state_cols,
+                                                   bt::Dtype::FP32);
+            c.lin.conv_state = bt::Tensor::zeros_on(dev, 1, conv_st_cols,
+                                                    bt::Dtype::FP32);
+            c.lin.initialized = true;
         }
     }
     return out;
@@ -598,9 +615,157 @@ void TextModel::forward(const std::vector<int>& token_ids,
             detail::linear_batched(layer.full.Wo, nullptr, attn_, proj_);
             bt::add_inplace(h_, proj_);
         } else {
-            // Linear-attention layer — Stage 3a stub: identity passthrough.
-            // (residual + 0 == residual; literally do nothing to h_.)
-            (void)c;
+            // ── Gated DeltaNet (linear-attention) sub-layer ───────────────
+            //
+            // Faithful port of HF transformers' Qwen3NextGatedDeltaNet.forward
+            // (https://raw.githubusercontent.com/huggingface/transformers/main/
+            //  src/transformers/models/qwen3_next/modeling_qwen3_next.py).
+            //
+            // Per-step rule, applied serially over the T new tokens (also when
+            // T > 1 in prefill — this is a known perf tradeoff vs. HF's
+            // chunked WY/UT formulation; see the note at the top of this
+            // function for Stage 5 follow-up):
+            //
+            //   x      = rms_norm(h, in_norm)                  [already done]
+            //   qkv    = in_proj_qkv @ x                       (T, 3*H*D_k)
+            //   qkv    = silu( causal_conv1d_update(qkv, conv_state) )
+            //   q,k,v  = split qkv  -> each (T, H*D_k or H*D_v)
+            //   z      = in_proj_z @ x                         (T, H*D_v)
+            //   a_raw  = in_proj_a @ x + dt_bias               (T, H) FP32
+            //   b_raw  = in_proj_b @ x                         (T, H) FP32
+            //   O, S'  = gated_delta_rule_step(q,k,v,a_raw,b_raw,log_A,S)
+            //     (per HF: g = -A_log.exp() * softplus(a + dt_bias);
+            //              beta = sigmoid(b); applied inside brotensor's op.)
+            //   O'     = rms_norm_per_head(O, norm.weight)     [per HF: norm
+            //              before gate]
+            //   O'     = O' * silu(z)                          (Qwen3NextRMSNormGated)
+            //   out    = out_proj @ O'                         (T, hidden)
+            //   h     += out
+            const int lin_h   = cfg_.linear_num_value_heads;
+            const int lin_d_k = cfg_.linear_key_head_dim;
+            const int lin_d_v = cfg_.linear_value_head_dim;
+            const int qkv_ch  = 3 * lin_h * lin_d_k;
+            const int kdim    = lin_h * lin_d_k;     // per-stream cols
+            const int vdim    = lin_h * lin_d_v;
+            const int kK      = cfg_.linear_conv_kernel_dim;
+
+            if (!c.lin.initialized) fail("forward: linear-attn cache not allocated");
+            if (c.lin.recurrent.dtype != bt::Dtype::FP32 ||
+                c.lin.conv_state.dtype != bt::Dtype::FP32) {
+                fail("forward: linear-attn state must be FP32");
+            }
+
+            // 1) in_proj_qkv -> (L, qkv_ch)
+            detail::linear_batched(layer.lin.in_proj_qkv, nullptr, norm_, lin_qkv_);
+
+            // 2) Depthwise causal conv1d with state, then SiLU (HF activation).
+            //    brotensor's causal_conv1d_update lays X out as (N, C * L_step)
+            //    with the L_step samples per channel CONTIGUOUS (channel-major).
+            //    Our `lin_qkv_` is (T, C) token-major, so the obvious bulk call
+            //    would reorder the layout. We instead apply the op per token
+            //    (L_step=1) — each call is a length-C row, which matches both
+            //    layouts trivially and keeps the recurrence-equivalence
+            //    between prefill (T>1) and decode (T=1) exact.
+            //
+            //    Perf note: this serial-per-token pass is O(T * C * kL); a
+            //    chunked-parallel implementation matching HF's `causal_conv1d_fn`
+            //    would be a Stage 5 follow-up. For the prefill lengths brolm
+            //    targets (hundreds of tokens) the difference is negligible.
+            brolm::detail::resize_like(lin_qkv_conv_, L, qkv_ch,
+                                       bt::Dtype::FP32, lin_qkv_.device);
+            {
+                bt::Tensor row_in, row_out;
+                for (int t = 0; t < L; ++t) {
+                    row_in = bt::Tensor::view(lin_qkv_.device,
+                        static_cast<char*>(lin_qkv_.data) +
+                            static_cast<std::size_t>(t) * qkv_ch * sizeof(float),
+                        1, qkv_ch, bt::Dtype::FP32);
+                    bt::causal_conv1d_update(row_in, layer.lin.conv1d,
+                                             /*bias=*/nullptr,
+                                             /*N=*/1, /*C=*/qkv_ch, /*L_step=*/1,
+                                             /*kL=*/kK, /*dilation=*/1,
+                                             c.lin.conv_state, row_out);
+                    // Copy row_out (1, qkv_ch) into lin_qkv_conv_ at row t.
+                    bt::copy_d2d(row_out, 0, lin_qkv_conv_, t * qkv_ch, qkv_ch);
+                }
+            }
+            bt::silu_forward(lin_qkv_conv_, lin_qkv_conv_);
+
+            // 3) Split qkv_conv into q,k,v. Layout per HF: dim 0 is q (kdim),
+            //    then k (kdim), then v (vdim). With d_k == d_v this is just
+            //    three equal slabs of `kdim` columns.
+            brolm::detail::resize_like(lin_q_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
+            brolm::detail::resize_like(lin_k_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
+            brolm::detail::resize_like(lin_v_, L, vdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
+            for (int r = 0; r < L; ++r) {
+                bt::copy_d2d(lin_qkv_conv_, r * qkv_ch + 0 * kdim, lin_q_, r * kdim, kdim);
+                bt::copy_d2d(lin_qkv_conv_, r * qkv_ch + 1 * kdim, lin_k_, r * kdim, kdim);
+                bt::copy_d2d(lin_qkv_conv_, r * qkv_ch + 2 * kdim, lin_v_, r * vdim, vdim);
+            }
+
+            // 4) z = in_proj_z @ x  (T, H*D_v)
+            detail::linear_batched(layer.lin.in_proj_z, nullptr, norm_, lin_z_);
+
+            // 5) a_raw = in_proj_a @ x + dt_bias    (T, H), FP32 required by the
+            //    recurrence op. We compute at compute_dtype then convert to FP32.
+            bt::Tensor a_tmp, b_tmp;
+            detail::linear_batched(layer.lin.in_proj_a, nullptr, norm_, a_tmp);
+            detail::linear_batched(layer.lin.in_proj_b, nullptr, norm_, b_tmp);
+            std::vector<float> a_host = download_fp32(a_tmp);
+            std::vector<float> b_host = download_fp32(b_tmp);
+            std::vector<float> dt_host = download_fp32(layer.lin.dt_bias);
+            if (static_cast<int>(dt_host.size()) != lin_h) {
+                fail("forward: dt_bias size mismatch");
+            }
+            // Add dt_bias per row (the bias is broadcast across the T axis;
+            // brotensor's op does softplus internally so we hand it the SUM).
+            for (int r = 0; r < L; ++r) {
+                for (int h = 0; h < lin_h; ++h) {
+                    a_host[static_cast<std::size_t>(r) * lin_h + h] +=
+                        dt_host[static_cast<std::size_t>(h)];
+                }
+            }
+            lin_a_raw_ = bt::Tensor::from_host_on(bt::default_device(),
+                                                  a_host.data(), L, lin_h);
+            lin_beta_  = bt::Tensor::from_host_on(bt::default_device(),
+                                                  b_host.data(), L, lin_h);
+
+            // 6) log_A as (num_heads, 1) FP32 (forces conversion if loaded
+            //    at FP16 on a GPU build; on CPU it's already FP32).
+            if (layer.lin.A_log.dtype != bt::Dtype::FP32) {
+                std::vector<float> la = download_fp32(layer.lin.A_log);
+                lin_log_A_ = bt::Tensor::from_host_on(bt::default_device(),
+                                                     la.data(), lin_h, 1);
+            } else {
+                lin_log_A_ = layer.lin.A_log;
+                lin_log_A_.rows = lin_h;
+                lin_log_A_.cols = 1;
+            }
+
+            // 7) Recurrence: updates c.lin.recurrent in place; writes O.
+            bt::gated_delta_rule_step(lin_q_, lin_k_, lin_v_,
+                                       lin_a_raw_, lin_beta_, lin_log_A_,
+                                       /*num_heads=*/lin_h,
+                                       /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
+                                       c.lin.recurrent, lin_O_);
+
+            // 8) Per-head RMSNorm with norm.weight (size value_head_dim), then
+            //    multiply by silu(z). Order: HF's Qwen3NextRMSNormGated does
+            //    "norm before gate" — rms_norm(h)*weight, then * silu(gate).
+            {
+                bt::Tensor o_view = bt::Tensor::view(
+                    lin_O_.device, lin_O_.data,
+                    L * lin_h, lin_d_v, lin_O_.dtype);
+                bt::rms_norm_forward(o_view, layer.lin.norm, eps, lin_O_norm_);
+                lin_O_norm_.rows = L;
+                lin_O_norm_.cols = vdim;
+            }
+            bt::silu_forward(lin_z_, lin_zsilu_);
+            bt::mul_inplace(lin_O_norm_, lin_zsilu_);
+
+            // 9) out_proj back to hidden, residual add.
+            detail::linear_batched(layer.lin.out_proj, nullptr, lin_O_norm_, proj_);
+            bt::add_inplace(h_, proj_);
             (void)n_kv;
         }
 

@@ -79,9 +79,20 @@ struct FullAttnKVCache {
     int len = 0;
 };
 
-// Per-layer recurrent state slot (linear_attention layers). Declared here so
-// LayerCache has a uniform shape; populated/used in Stage 3b. In Stage 3a the
-// linear-attn block is identity so this slot stays empty.
+// Per-layer recurrent state slot (linear_attention layers).
+//
+//   recurrent : (num_heads, value_head_dim * key_head_dim) FP32
+//               Row h holds S_h in row-major v,k order: state[h,v*d_k+k].
+//               brotensor::gated_delta_rule_step reads + overwrites this in place.
+//
+//   conv_state: (1, qkv_channels * (kernel_dim - 1)) FP32
+//               Rolling left-context shift register for the depthwise causal
+//               conv1d that runs over the concatenated q||k||v stream
+//               (qkv_channels == 3 * num_heads * head_dim). Read + overwritten
+//               in place by brotensor::causal_conv1d_update.
+//
+// `initialized` is true once make_cache() has zeroed both buffers. Allocated
+// only for linear-attention layer slots; full-attention slots leave it false.
 struct LinearAttnState {
     brotensor::Tensor recurrent;
     brotensor::Tensor conv_state;
@@ -214,6 +225,18 @@ private:
     brotensor::Tensor gate_sig_;    // sigmoid(gate)
     brotensor::Tensor proj_;        // o_proj / down_proj output
     brotensor::Tensor mlp_gate_, mlp_up_, swiglu_in_, mlp_act_;
+
+    // Linear-attention scratch (see qwen35_text.cpp linear_attn_block_).
+    brotensor::Tensor lin_qkv_;        // (T, 3*num_heads*head_dim)
+    brotensor::Tensor lin_qkv_conv_;   // (T, 3*num_heads*head_dim) after conv + silu
+    brotensor::Tensor lin_q_, lin_k_, lin_v_;   // (T, num_heads*head_dim) each
+    brotensor::Tensor lin_a_raw_;      // (T, num_heads) FP32
+    brotensor::Tensor lin_beta_;       // (T, num_heads) FP32
+    brotensor::Tensor lin_z_;          // (T, num_heads*value_head_dim)
+    brotensor::Tensor lin_zsilu_;      // silu(z)
+    brotensor::Tensor lin_O_;          // (T, num_heads*value_head_dim) recurrence out
+    brotensor::Tensor lin_O_norm_;     // per-head RMSNormed O
+    brotensor::Tensor lin_log_A_;      // (num_heads, 1) FP32 — cached per layer view
 };
 
 }  // namespace brolm::qwen35

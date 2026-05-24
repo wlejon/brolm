@@ -121,6 +121,14 @@ void run_synthetic() {
         q35::LayerType::Linear, q35::LayerType::Full,
     };
     cfg.full_attention_interval = 4;
+    // Tiny linear-attn dims for the synthetic test. (Real 0.8B uses
+    // 16 heads x 128 head_dim with kernel=4; the recurrence is dtype/shape-
+    // polymorphic so we shrink it.)
+    cfg.linear_num_key_heads   = 2;
+    cfg.linear_num_value_heads = 2;
+    cfg.linear_key_head_dim    = 16;
+    cfg.linear_value_head_dim  = 16;
+    cfg.linear_conv_kernel_dim = 4;
     cfg.rope.rope_theta            = 10000000.0f;
     cfg.rope.partial_rotary_factor = 0.5f;             // rotary_dim = 16
     cfg.rope.mrope_section         = {3, 3, 2};        // 2*(3+3+2)=16
@@ -140,9 +148,21 @@ void run_synthetic() {
 
     b.add("model.embed_tokens.weight", {V, H}, R(static_cast<std::size_t>(V) * H));
 
-    // Linear-attn tensor shapes (synthetic): we use the cfg's linear dims, but
-    // they don't matter functionally in this chunk — just need to load.
-    const int lin_kv     = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+    // Linear-attn tensor shapes (synthetic) — match the real checkpoint layout:
+    //   in_proj_qkv : (3 * H_lin * D_k, hidden)
+    //   in_proj_z   : (H_lin * D_v, hidden)
+    //   in_proj_a   : (H_lin, hidden)          per-head scalar projection
+    //   in_proj_b   : (H_lin, hidden)
+    //   A_log       : (H_lin,)                 per-head learnable decay
+    //   dt_bias     : (H_lin,)
+    //   conv1d.w    : (3*H_lin*D_k, 1, kK)     depthwise
+    //   norm.w      : (D_v,)                   per-head RMSNorm gain
+    //   out_proj    : (hidden, H_lin*D_v)
+    const int H_lin      = cfg.linear_num_value_heads;
+    const int D_k        = cfg.linear_key_head_dim;
+    const int D_v        = cfg.linear_value_head_dim;
+    const int lin_kv     = H_lin * D_k;            // == H_lin * D_v (equal here)
+    const int lin_vv     = H_lin * D_v;
     const int lin_qkv    = 3 * lin_kv;
     const int conv_ch    = lin_qkv;
     const int conv_kd    = cfg.linear_conv_kernel_dim;
@@ -172,22 +192,22 @@ void run_synthetic() {
             b.add(p + "self_attn.k_norm.weight", {HD}, fp16_ones(HD));
         } else {
             const std::string lp = p + "linear_attn.";
-            b.add(lp + "A_log",   {lin_qkv}, R(lin_qkv));
+            b.add(lp + "A_log",   {H_lin}, R(static_cast<std::size_t>(H_lin)));
             b.add(lp + "conv1d.weight",
                   {conv_ch, 1, conv_kd},
                   R(static_cast<std::size_t>(conv_ch) * conv_kd));
-            b.add(lp + "dt_bias", {lin_qkv}, R(lin_qkv));
-            b.add(lp + "in_proj_a.weight",   {lin_kv, H},
-                  R(static_cast<std::size_t>(lin_kv) * H));
-            b.add(lp + "in_proj_b.weight",   {lin_kv, H},
-                  R(static_cast<std::size_t>(lin_kv) * H));
+            b.add(lp + "dt_bias", {H_lin}, R(static_cast<std::size_t>(H_lin)));
+            b.add(lp + "in_proj_a.weight",   {H_lin, H},
+                  R(static_cast<std::size_t>(H_lin) * H));
+            b.add(lp + "in_proj_b.weight",   {H_lin, H},
+                  R(static_cast<std::size_t>(H_lin) * H));
             b.add(lp + "in_proj_qkv.weight", {lin_qkv, H},
                   R(static_cast<std::size_t>(lin_qkv) * H));
-            b.add(lp + "in_proj_z.weight",   {lin_kv, H},
-                  R(static_cast<std::size_t>(lin_kv) * H));
-            b.add(lp + "norm.weight",        {lin_kv}, fp16_ones(lin_kv));
-            b.add(lp + "out_proj.weight",    {H, lin_kv},
-                  R(static_cast<std::size_t>(H) * lin_kv));
+            b.add(lp + "in_proj_z.weight",   {lin_vv, H},
+                  R(static_cast<std::size_t>(lin_vv) * H));
+            b.add(lp + "norm.weight",        {D_v}, fp16_ones(D_v));
+            b.add(lp + "out_proj.weight",    {H, lin_vv},
+                  R(static_cast<std::size_t>(H) * lin_vv));
         }
     }
     b.add("model.norm.weight", {H}, fp16_ones(H));
@@ -298,7 +318,7 @@ void run_real_checkpoint() {
             std::filesystem::exists(merges_path)) {
             auto tok = q35::Tokenizer::load(vocab_path.string(),
                                             merges_path.string());
-            auto enc = tok.encode("Hello, world.");
+            auto enc = tok.encode("The capital of France is");
             ids.assign(enc.begin(), enc.end());
         } else {
             // Fall back to a plausible 5-token prompt.
@@ -322,9 +342,65 @@ void run_real_checkpoint() {
         int nonfinite = 0;
         for (float v : host) if (!bdtest::bd_finite(v)) ++nonfinite;
         CHECK(nonfinite == 0);
+
+        // Inspect the *last* row's top-5 (next-token distribution).
+        const int V = cfg.vocab_size;
+        const std::size_t base = static_cast<std::size_t>(L - 1) * V;
+        std::vector<int> top_ids(5, -1);
+        std::vector<float> top_v(5, -1e30f);
+        for (int j = 0; j < V; ++j) {
+            const float val = host[base + static_cast<std::size_t>(j)];
+            // insertion-sort into the top-5.
+            for (int s = 0; s < 5; ++s) {
+                if (val > top_v[s]) {
+                    for (int t = 4; t > s; --t) {
+                        top_v[t] = top_v[t-1];
+                        top_ids[t] = top_ids[t-1];
+                    }
+                    top_v[s] = val;
+                    top_ids[s] = j;
+                    break;
+                }
+            }
+        }
+
         std::printf("qwen35_text: real-checkpoint prefill ok "
                     "(L=%d, vocab=%d, nonfinite=%d)\n",
                     L, cfg.vocab_size, nonfinite);
+        std::printf("qwen35_text: top-5 next-token candidates:\n");
+        if (std::filesystem::exists(vocab_path) &&
+            std::filesystem::exists(merges_path)) {
+            auto tok = q35::Tokenizer::load(vocab_path.string(),
+                                            merges_path.string());
+            for (int s = 0; s < 5; ++s) {
+                std::string decoded;
+                if (top_ids[s] >= 0) {
+                    decoded = tok.decode({static_cast<int32_t>(top_ids[s])});
+                }
+                std::printf("  #%d id=%d logit=%.4f text=%s\n",
+                            s, top_ids[s], static_cast<double>(top_v[s]),
+                            decoded.c_str());
+            }
+        } else {
+            for (int s = 0; s < 5; ++s) {
+                std::printf("  #%d id=%d logit=%.4f\n",
+                            s, top_ids[s], static_cast<double>(top_v[s]));
+            }
+        }
+        // Sanity: max isn't pinned to a single duplicated id, and the top-5
+        // are distinct.
+        bool distinct = true;
+        for (int i = 0; i < 5; ++i) {
+            for (int j = i+1; j < 5; ++j) {
+                if (top_ids[i] == top_ids[j]) distinct = false;
+            }
+        }
+        CHECK(distinct);
+        // Some entropy: gap between #1 and #5 logits should be finite and
+        // bounded (a sane model has a soft top — not winner-take-all).
+        const float spread = top_v[0] - top_v[4];
+        CHECK(spread > 0.0f);
+        CHECK(spread < 100.0f);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "qwen35_text real-checkpoint threw: %s\n", e.what());
         ++g_failures;
