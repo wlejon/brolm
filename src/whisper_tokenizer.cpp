@@ -1,6 +1,7 @@
 #include "brolm/whisper_tokenizer.h"
 
 #include "brolm/detail/byte_level_bpe.h"
+#include "brotensor/gguf.h"
 
 #include <cstdint>
 #include <cstring>
@@ -158,6 +159,89 @@ Tokenizer Tokenizer::load(const std::string& vocab_json_path,
     // Auto-register every "<|...|>" entry as an atomic special, and pull out
     // the well-known ids while we're scanning. Timestamp tokens form a
     // contiguous id range; track the min/max here too.
+    int ts_min = -1, ts_max = -1;
+    for (const auto& [tok, id] : t.vocab_) {
+        if (!looks_like_special(tok)) continue;
+        t.special_tokens_.emplace(tok, id);
+        t.special_ids_.emplace(id, tok);
+
+        if      (tok == "<|endoftext|>")         t.endoftext_id_     = id;
+        else if (tok == "<|startoftranscript|>") t.sot_id_           = id;
+        else if (tok == "<|nospeech|>" ||
+                 tok == "<|nocaptions|>")        t.no_speech_id_     = id;
+        else if (tok == "<|notimestamps|>")      t.no_timestamps_id_ = id;
+        else if (tok == "<|transcribe|>")        t.transcribe_id_    = id;
+        else if (tok == "<|translate|>")         t.translate_id_     = id;
+        else {
+            double sec;
+            if (parse_timestamp_seconds(tok, sec)) {
+                if (ts_min < 0 || id < ts_min) ts_min = id;
+                if (ts_max < 0 || id > ts_max) ts_max = id;
+            }
+        }
+    }
+    t.first_timestamp_id_ = ts_min;
+    t.last_timestamp_id_  = ts_max;
+    return t;
+}
+
+namespace {
+
+namespace gg = ::brotensor::gguf;
+
+const gg::Value& need_meta(const gg::File& f, const char* key) {
+    const gg::Value* v = f.find_meta(key);
+    if (!v) throw std::runtime_error(
+        std::string("whisper::Tokenizer::from_gguf: missing metadata '") +
+        key + "'");
+    return *v;
+}
+
+}  // namespace
+
+Tokenizer Tokenizer::from_gguf(const gg::File& f) {
+    Tokenizer t;
+    bpe::build_byte_unicode_maps(t.byte_to_unicode_, t.unicode_to_byte_);
+
+    const auto& tokens_v = need_meta(f, "tokenizer.ggml.tokens");
+    if (tokens_v.type != gg::ValueType::Array ||
+        tokens_v.array_elem_type != gg::ValueType::String) {
+        throw std::runtime_error(
+            "whisper::Tokenizer::from_gguf: 'tokenizer.ggml.tokens' is not "
+            "an array of strings");
+    }
+    const auto& tokens = tokens_v.array;
+    t.vocab_.reserve(tokens.size());
+    t.id_to_token_.reserve(tokens.size());
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        const std::int32_t id = static_cast<std::int32_t>(i);
+        t.vocab_.emplace(tokens[i].str, id);
+        t.id_to_token_.emplace(id, tokens[i].str);
+    }
+
+    const auto& merges_v = need_meta(f, "tokenizer.ggml.merges");
+    if (merges_v.type != gg::ValueType::Array ||
+        merges_v.array_elem_type != gg::ValueType::String) {
+        throw std::runtime_error(
+            "whisper::Tokenizer::from_gguf: 'tokenizer.ggml.merges' is not "
+            "an array of strings");
+    }
+    const auto& merges = merges_v.array;
+    t.merge_ranks_.reserve(merges.size());
+    for (std::size_t i = 0; i < merges.size(); ++i) {
+        const std::string& line = merges[i].str;
+        const auto sp = line.find(' ');
+        if (sp == std::string::npos) {
+            throw std::runtime_error(
+                "whisper::Tokenizer::from_gguf: malformed merges entry '" +
+                line + "'");
+        }
+        std::string key = line.substr(0, sp) + '\x01' + line.substr(sp + 1);
+        t.merge_ranks_.emplace(std::move(key), static_cast<std::int32_t>(i));
+    }
+
+    // Auto-register every "<|...|>" entry as a special and cache well-known
+    // ids — same logic as load(), but iterating the freshly populated vocab.
     int ts_min = -1, ts_max = -1;
     for (const auto& [tok, id] : t.vocab_) {
         if (!looks_like_special(tok)) continue;

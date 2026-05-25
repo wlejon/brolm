@@ -34,6 +34,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace brotensor::gguf { class File; }
+
 namespace brolm::whisper {
 
 class Tokenizer {
@@ -43,6 +45,14 @@ public:
     // std::runtime_error on I/O or parse failure.
     static Tokenizer load(const std::string& vocab_json_path,
                           const std::string& merges_txt_path);
+
+    // Build a tokenizer from a Whisper GGUF file's metadata. Reads
+    // tokenizer.ggml.{tokens, merges, token_type} the same way the Qwen3
+    // loader does. Every "<|...|>" vocab entry is auto-registered as a
+    // special and the well-known Whisper ids (sot, eos, language tags,
+    // timestamps) are looked up by string. Throws on missing required
+    // metadata keys.
+    static Tokenizer from_gguf(const brotensor::gguf::File& f);
 
     // Encode `text` into int32 token IDs. Substrings that exactly match a
     // registered special token are emitted as that token's single id; the
