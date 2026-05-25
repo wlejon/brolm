@@ -32,6 +32,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace brotensor::gguf { class File; }
+
 namespace brolm::qwen {
 
 class Tokenizer {
@@ -43,6 +45,19 @@ public:
     static Tokenizer load(const std::string& vocab_json_path,
                           const std::string& merges_txt_path,
                           const std::vector<std::string>& extra_special_tokens = {});
+
+    // Build a tokenizer from a Qwen3 GGUF file's metadata. Reads:
+    //   tokenizer.ggml.tokens   — array of vocab strings (id = index)
+    //   tokenizer.ggml.merges   — array of "a b" merge pairs (priority order)
+    //   tokenizer.ggml.token_type    — optional array of i32; type 3 (control)
+    //                                  ids are registered as special tokens
+    //   tokenizer.ggml.bos/eos/padding_token_id — optional u32
+    // The standard Qwen3 specials (<|endoftext|>, <|im_start|>, <|im_end|>) are
+    // auto-registered by name when present in the vocab. `extra_special_tokens`
+    // works the same way as in load().
+    static Tokenizer from_gguf(
+        const brotensor::gguf::File& f,
+        const std::vector<std::string>& extra_special_tokens = {});
 
     // Encode `text` into int32 token IDs via byte-level BPE. Substrings that
     // exactly match a registered special token are emitted atomically as that

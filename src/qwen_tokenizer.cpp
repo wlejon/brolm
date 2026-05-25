@@ -1,9 +1,11 @@
 #include "brolm/qwen_tokenizer.h"
 
 #include "brolm/detail/byte_level_bpe.h"
+#include "brotensor/gguf.h"
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -139,6 +141,100 @@ Tokenizer Tokenizer::load(const std::string& vocab_json_path,
     specials.insert(specials.end(),
                     extra_special_tokens.begin(), extra_special_tokens.end());
     for (const auto& s : specials) {
+        auto it = t.vocab_.find(s);
+        if (it == t.vocab_.end()) continue;
+        t.special_tokens_.emplace(s, it->second);
+        t.special_ids_.emplace(it->second, s);
+    }
+
+    auto lookup = [&](const char* s) -> int {
+        auto it = t.vocab_.find(s);
+        return it != t.vocab_.end() ? it->second : -1;
+    };
+    t.endoftext_id_ = lookup("<|endoftext|>");
+    t.im_start_id_  = lookup("<|im_start|>");
+    t.im_end_id_    = lookup("<|im_end|>");
+    return t;
+}
+
+namespace {
+
+namespace gg = ::brotensor::gguf;
+
+const gg::Value& need_meta(const gg::File& f, const char* key) {
+    const gg::Value* v = f.find_meta(key);
+    if (!v) throw std::runtime_error(
+        std::string("qwen::Tokenizer::from_gguf: missing metadata '") + key + "'");
+    return *v;
+}
+
+const std::vector<gg::Value>& need_array(const gg::Value& v, const char* key,
+                                         gg::ValueType elem) {
+    if (v.type != gg::ValueType::Array || v.array_elem_type != elem) {
+        throw std::runtime_error(
+            std::string("qwen::Tokenizer::from_gguf: metadata '") + key +
+            "' is not an array of the expected element type");
+    }
+    return v.array;
+}
+
+}  // namespace
+
+Tokenizer Tokenizer::from_gguf(
+    const gg::File& f,
+    const std::vector<std::string>& extra_special_tokens) {
+    Tokenizer t;
+    bpe::build_byte_unicode_maps(t.byte_to_unicode_, t.unicode_to_byte_);
+
+    // Vocab: tokens[i] is the byte-level-encoded string for id i.
+    const auto& tokens =
+        need_array(need_meta(f, "tokenizer.ggml.tokens"),
+                   "tokenizer.ggml.tokens", gg::ValueType::String);
+    t.vocab_.reserve(tokens.size());
+    t.id_to_token_.reserve(tokens.size());
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        const std::int32_t id = static_cast<std::int32_t>(i);
+        t.vocab_.emplace(tokens[i].str, id);
+        t.id_to_token_.emplace(id, tokens[i].str);
+    }
+
+    // Merges: each entry is "a b" in priority order; lowest index = lowest rank.
+    const auto& merges =
+        need_array(need_meta(f, "tokenizer.ggml.merges"),
+                   "tokenizer.ggml.merges", gg::ValueType::String);
+    t.merge_ranks_.reserve(merges.size());
+    for (std::size_t i = 0; i < merges.size(); ++i) {
+        const std::string& line = merges[i].str;
+        const auto sp = line.find(' ');
+        if (sp == std::string::npos) {
+            throw std::runtime_error(
+                "qwen::Tokenizer::from_gguf: malformed merges entry '" + line + "'");
+        }
+        std::string key = line.substr(0, sp) + '\x01' + line.substr(sp + 1);
+        t.merge_ranks_.emplace(std::move(key), static_cast<std::int32_t>(i));
+    }
+
+    // Optional token_type array: type 3 (CONTROL) ids become atomic specials.
+    if (const auto* tt = f.find_meta("tokenizer.ggml.token_type")) {
+        if (tt->type == gg::ValueType::Array &&
+            tt->array_elem_type == gg::ValueType::I32) {
+            for (std::size_t i = 0; i < tt->array.size() && i < tokens.size(); ++i) {
+                if (tt->array[i].scalar.i32 == 3) {
+                    const std::int32_t id = static_cast<std::int32_t>(i);
+                    t.special_tokens_.emplace(tokens[i].str, id);
+                    t.special_ids_.emplace(id, tokens[i].str);
+                }
+            }
+        }
+    }
+
+    // Always make sure the Qwen3 ChatML specials and caller-supplied extras are
+    // registered if they exist by name (some converters omit token_type).
+    std::vector<std::string> by_name = {
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>"};
+    by_name.insert(by_name.end(),
+                   extra_special_tokens.begin(), extra_special_tokens.end());
+    for (const auto& s : by_name) {
         auto it = t.vocab_.find(s);
         if (it == t.vocab_.end()) continue;
         t.special_tokens_.emplace(s, it->second);

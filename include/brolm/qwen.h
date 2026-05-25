@@ -42,11 +42,21 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brotensor::safetensors { class File; struct TensorView; }
+namespace brotensor::gguf { class File; }
+namespace brolm::detail::weights { class Source; }
 
 namespace brolm::qwen {
+
+// Translate a HF-style Qwen3 tensor name (e.g.
+// "model.layers.3.self_attn.q_proj.weight") into the ggml/llama.cpp name used
+// in a Qwen3 .gguf checkpoint ("blk.3.attn_q.weight"). Returns an empty
+// string if the name does not match any known Qwen3 weight. Exposed so
+// callers can build their own gguf-shard pipelines.
+std::string qwen3_hf_to_ggml(std::string_view hf_name);
 
 struct Qwen3Config {
     int   vocab_size            = 151936;
@@ -60,6 +70,15 @@ struct Qwen3Config {
     float rope_theta            = 1000000.0f;
     bool  tie_word_embeddings   = true;
     int   max_position_embeddings = 40960;
+
+    // Populate a Qwen3Config from the metadata of a Qwen3 .gguf file. Reads
+    // the llama.cpp-convention keys (`qwen3.embedding_length`,
+    // `qwen3.attention.head_count`, ...) plus the tokenizer vocab length for
+    // `vocab_size`. `tie_word_embeddings` is set from whether the file
+    // contains an `output.weight` tensor (absent = tied). Throws
+    // std::runtime_error on missing required metadata or an architecture
+    // mismatch (`general.architecture` != "qwen3").
+    static Qwen3Config from_gguf(const brotensor::gguf::File& f);
 };
 
 class Qwen3Model {
@@ -86,6 +105,17 @@ public:
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "");
+
+    // GGUF overloads. Tensor names follow the ggml/llama.cpp Qwen3 convention
+    // (`token_embd.weight`, `blk.N.attn_q.weight`, ...); see qwen3_hf_to_ggml.
+    // Quantized weights (Q4_K / Q6_K / Q8_0) keep their on-disk dtype and
+    // dispatch through brotensor's fused-dequant matmuls (GPU-only today;
+    // CPU + quant weights throws at first matmul). When tie_word_embeddings
+    // is true, the `output.weight` tensor is expected to be absent and the
+    // embedding matrix is reused.
+    void load_weights(const brotensor::gguf::File& f);
+    void load_weights(
+        const std::vector<const brotensor::gguf::File*>& shards);
 
     // Allocate the per-layer K/V cache for sequences up to `max_seq_len`
     // tokens. Sized once; resets cache_len to 0.
@@ -118,9 +148,7 @@ private:
         brotensor::Tensor K_cache, V_cache;
     };
 
-    void load_weights_impl_(
-        const std::vector<const brotensor::safetensors::File*>& shards,
-        const std::string& prefix);
+    void load_weights_impl_(const brolm::detail::weights::Source& src);
 
     // GQA head expansion: copy each KV head's head_dim block out to the
     // group of query heads it serves. `src` is (L, n_kv*head_dim); `dst`

@@ -48,14 +48,28 @@ inline brotensor::Tensor upload_host(const float* src, int rows, int cols) {
 
 // Batched linear with optional bias. brotensor exposes the FP16 batched
 // linear as a separate WMMA op; the plain op is the FP32 path. Dispatch on
-// the weight dtype so one call site serves CPU and GPU.
+// the weight dtype so one call site serves CPU and GPU. Quantized weight
+// dtypes (Q4_K / Q6_K / Q8_0) route through brotensor's fused-dequant
+// matmuls — GPU-only today.
 inline void linear_batched(const brotensor::Tensor& W,
                            const brotensor::Tensor* bias,
                            const brotensor::Tensor& X,
                            brotensor::Tensor& Y) {
-    if (W.dtype == brotensor::Dtype::FP16) {
-        brotensor::linear_forward_batched_fp16(W, bias, X, Y);
-        return;
+    switch (W.dtype) {
+        case brotensor::Dtype::FP16:
+            brotensor::linear_forward_batched_fp16(W, bias, X, Y);
+            return;
+        case brotensor::Dtype::Q4_K:
+            brotensor::linear_forward_batched_q4k_fp16(W, bias, X, Y);
+            return;
+        case brotensor::Dtype::Q6_K:
+            brotensor::linear_forward_batched_q6k_fp16(W, bias, X, Y);
+            return;
+        case brotensor::Dtype::Q8_0:
+            brotensor::linear_forward_batched_q8_0_fp16(W, bias, X, Y);
+            return;
+        default:
+            break;
     }
     if (bias != nullptr) {
         brotensor::linear_forward_batched(W, *bias, X, Y);

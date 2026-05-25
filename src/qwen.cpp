@@ -1,8 +1,10 @@
 #include "brolm/qwen.h"
 
+#include "brotensor/gguf.h"
 #include "brotensor/safetensors.h"
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brolm::qwen {
@@ -19,31 +22,12 @@ namespace brolm::qwen {
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
-using st::upload_compute_checked;
-
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("qwen::Qwen3Model: " + msg);
-}
-
-// Find a tensor by name across one or more shards; first match wins.
-const st::TensorView& need(const std::vector<const st::File*>& shards,
-                           const std::string& key) {
-    for (const st::File* f : shards) {
-        if (const auto* v = f->find(key)) return *v;
-    }
-    fail("missing tensor '" + key + "'");
-}
-
-const st::TensorView* find_in(const std::vector<const st::File*>& shards,
-                              const std::string& key) {
-    for (const st::File* f : shards) {
-        if (const auto* v = f->find(key)) return v;
-    }
-    return nullptr;
 }
 
 // Build a device-resident INT32 buffer holding `n` token ids. brotensor has
@@ -56,23 +40,171 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
     return cpu.to(bt::default_device());
 }
 
-// Download a loaded weight tensor into a host FP32 vector, handling both the
-// FP16 (GPU) and FP32 (CPU) compute-dtype cases.
-std::vector<float> download_fp32(const bt::Tensor& t) {
-    const std::size_t n = static_cast<std::size_t>(t.size());
-    if (t.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(n);
-        t.copy_to_host_fp16(bits.data());
-        std::vector<float> out(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            out[i] = bt::fp16_bits_to_fp32(bits[i]);
-        }
-        return out;
+}  // namespace
+
+// ─── Qwen3Config::from_gguf ────────────────────────────────────────────────
+
+namespace {
+
+namespace gg = ::brotensor::gguf;
+
+const gg::Value& need_meta(const gg::File& f, const char* key) {
+    const gg::Value* v = f.find_meta(key);
+    if (!v) throw std::runtime_error(
+        std::string("qwen::Qwen3Config::from_gguf: missing metadata '") + key + "'");
+    return *v;
+}
+
+// Pull an integer-valued metadata into int. Accepts the common int-shaped
+// gguf scalar types (u32/i32/u64/i64/u16/i16/u8/i8).
+int meta_as_int(const gg::Value& v, const char* key) {
+    switch (v.type) {
+        case gg::ValueType::U8:  return static_cast<int>(v.scalar.u8);
+        case gg::ValueType::I8:  return static_cast<int>(v.scalar.i8);
+        case gg::ValueType::U16: return static_cast<int>(v.scalar.u16);
+        case gg::ValueType::I16: return static_cast<int>(v.scalar.i16);
+        case gg::ValueType::U32: return static_cast<int>(v.scalar.u32);
+        case gg::ValueType::I32: return static_cast<int>(v.scalar.i32);
+        case gg::ValueType::U64: return static_cast<int>(v.scalar.u64);
+        case gg::ValueType::I64: return static_cast<int>(v.scalar.i64);
+        default:
+            throw std::runtime_error(
+                std::string("qwen::Qwen3Config::from_gguf: metadata '") + key +
+                "' is not an integer scalar");
     }
-    return t.to_host_vector();
+}
+
+float meta_as_f32(const gg::Value& v, const char* key) {
+    if (v.type == gg::ValueType::F32) return v.scalar.f32;
+    if (v.type == gg::ValueType::F64) return static_cast<float>(v.scalar.f64);
+    throw std::runtime_error(
+        std::string("qwen::Qwen3Config::from_gguf: metadata '") + key +
+        "' is not a float scalar");
 }
 
 }  // namespace
+
+Qwen3Config Qwen3Config::from_gguf(const gg::File& f) {
+    // Architecture check — guards against pointing at, say, a LLaMA gguf.
+    if (const auto* arch = f.find_meta("general.architecture")) {
+        if (arch->type == gg::ValueType::String && arch->str != "qwen3") {
+            throw std::runtime_error(
+                "qwen::Qwen3Config::from_gguf: general.architecture is '" +
+                arch->str + "', expected 'qwen3'");
+        }
+    }
+
+    Qwen3Config cfg;
+    cfg.hidden_size = meta_as_int(
+        need_meta(f, "qwen3.embedding_length"), "qwen3.embedding_length");
+    cfg.intermediate_size = meta_as_int(
+        need_meta(f, "qwen3.feed_forward_length"), "qwen3.feed_forward_length");
+    cfg.num_hidden_layers = meta_as_int(
+        need_meta(f, "qwen3.block_count"), "qwen3.block_count");
+    cfg.num_attention_heads = meta_as_int(
+        need_meta(f, "qwen3.attention.head_count"), "qwen3.attention.head_count");
+
+    if (const auto* v = f.find_meta("qwen3.attention.head_count_kv")) {
+        cfg.num_key_value_heads = meta_as_int(*v, "qwen3.attention.head_count_kv");
+    } else {
+        cfg.num_key_value_heads = cfg.num_attention_heads;
+    }
+
+    if (const auto* v = f.find_meta("qwen3.attention.key_length")) {
+        cfg.head_dim = meta_as_int(*v, "qwen3.attention.key_length");
+    } else {
+        cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    }
+
+    if (const auto* v = f.find_meta("qwen3.attention.layer_norm_rms_epsilon")) {
+        cfg.rms_norm_eps = meta_as_f32(*v, "qwen3.attention.layer_norm_rms_epsilon");
+    }
+    if (const auto* v = f.find_meta("qwen3.rope.freq_base")) {
+        cfg.rope_theta = meta_as_f32(*v, "qwen3.rope.freq_base");
+    }
+    if (const auto* v = f.find_meta("qwen3.context_length")) {
+        cfg.max_position_embeddings = meta_as_int(*v, "qwen3.context_length");
+    }
+
+    // vocab_size: prefer the tokenizer's actual token list length; fall back
+    // to a model-level scalar if present.
+    if (const auto* v = f.find_meta("tokenizer.ggml.tokens");
+        v && v->type == gg::ValueType::Array) {
+        cfg.vocab_size = static_cast<int>(v->array.size());
+    } else if (const auto* v = f.find_meta("qwen3.vocab_size")) {
+        cfg.vocab_size = meta_as_int(*v, "qwen3.vocab_size");
+    }
+
+    // Tied embeddings: if there's an explicit metadata flag use it; otherwise
+    // infer from the presence of `output.weight`.
+    if (const auto* v = f.find_meta("qwen3.tie_word_embeddings");
+        v && v->type == gg::ValueType::Bool) {
+        cfg.tie_word_embeddings = v->scalar.b;
+    } else {
+        cfg.tie_word_embeddings = (f.find_tensor("output.weight") == nullptr);
+    }
+
+    return cfg;
+}
+
+// ─── HF → ggml tensor-name map (Qwen3) ─────────────────────────────────────
+//
+// HF naming:  model.embed_tokens.weight,
+//             model.layers.N.{self_attn.{q,k,v,o}_proj, self_attn.{q,k}_norm,
+//                             input_layernorm, post_attention_layernorm,
+//                             mlp.{gate,up,down}_proj}.weight,
+//             model.norm.weight, lm_head.weight.
+// ggml naming (llama.cpp Qwen3 convention):
+//             token_embd.weight,
+//             blk.N.{attn_q, attn_k, attn_v, attn_output, attn_q_norm,
+//                    attn_k_norm, attn_norm, ffn_norm,
+//                    ffn_gate, ffn_up, ffn_down}.weight,
+//             output_norm.weight, output.weight.
+
+namespace {
+
+bool starts_with(std::string_view s, std::string_view p) {
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+
+}  // namespace
+
+std::string qwen3_hf_to_ggml(std::string_view hf_name) {
+    if (hf_name == "model.embed_tokens.weight") return "token_embd.weight";
+    if (hf_name == "model.norm.weight")         return "output_norm.weight";
+    if (hf_name == "lm_head.weight")            return "output.weight";
+
+    constexpr std::string_view kLayersPrefix = "model.layers.";
+    if (!starts_with(hf_name, kLayersPrefix)) return {};
+    const auto dot = hf_name.find('.', kLayersPrefix.size());
+    if (dot == std::string_view::npos) return {};
+    const std::string_view idx = hf_name.substr(
+        kLayersPrefix.size(), dot - kLayersPrefix.size());
+    const std::string_view tail = hf_name.substr(dot + 1);
+
+    auto blk = [&](std::string_view suffix) -> std::string {
+        std::string out;
+        out.reserve(4 + idx.size() + 1 + suffix.size());
+        out.append("blk.");
+        out.append(idx);
+        out.push_back('.');
+        out.append(suffix);
+        return out;
+    };
+
+    if (tail == "self_attn.q_proj.weight")           return blk("attn_q.weight");
+    if (tail == "self_attn.k_proj.weight")           return blk("attn_k.weight");
+    if (tail == "self_attn.v_proj.weight")           return blk("attn_v.weight");
+    if (tail == "self_attn.o_proj.weight")           return blk("attn_output.weight");
+    if (tail == "self_attn.q_norm.weight")           return blk("attn_q_norm.weight");
+    if (tail == "self_attn.k_norm.weight")           return blk("attn_k_norm.weight");
+    if (tail == "input_layernorm.weight")            return blk("attn_norm.weight");
+    if (tail == "post_attention_layernorm.weight")   return blk("ffn_norm.weight");
+    if (tail == "mlp.gate_proj.weight")              return blk("ffn_gate.weight");
+    if (tail == "mlp.up_proj.weight")                return blk("ffn_up.weight");
+    if (tail == "mlp.down_proj.weight")              return blk("ffn_down.weight");
+    return {};
+}
 
 // ─── RoPE weight permutation ───────────────────────────────────────────────
 //
@@ -99,35 +231,10 @@ std::vector<float> download_fp32(const bt::Tensor& t) {
 // same consistent permutation of V which... is NOT permuted — so attention
 // output stays in HF head order and o_proj sees HF-order activations. This is
 // the standard HF→interleaved trick (llama.cpp does the same).
-
-namespace {
-
-// Permute `head_dim` consecutive rows within each of `num_heads` blocks of an
-// (num_heads*head_dim, cols) host buffer, mapping interleaved -> HF order.
-std::vector<float> permute_rope_rows(const std::vector<float>& src,
-                                     int num_heads, int head_dim, int cols) {
-    const int half = head_dim / 2;
-    std::vector<float> dst(src.size());
-    for (int h = 0; h < num_heads; ++h) {
-        const std::size_t base =
-            static_cast<std::size_t>(h) * head_dim *
-            static_cast<std::size_t>(cols);
-        for (int i = 0; i < half; ++i) {
-            // dst rows 2i, 2i+1  <-  src rows i, i+half
-            const std::size_t d0 = base + static_cast<std::size_t>(2 * i) * cols;
-            const std::size_t d1 = base + static_cast<std::size_t>(2 * i + 1) * cols;
-            const std::size_t s0 = base + static_cast<std::size_t>(i) * cols;
-            const std::size_t s1 = base + static_cast<std::size_t>(i + half) * cols;
-            std::memcpy(&dst[d0], &src[s0],
-                        static_cast<std::size_t>(cols) * sizeof(float));
-            std::memcpy(&dst[d1], &src[s1],
-                        static_cast<std::size_t>(cols) * sizeof(float));
-        }
-    }
-    return dst;
-}
-
-}  // namespace
+//
+// The actual row permutation lives in brolm::detail::weights::Source and is
+// applied uniformly across safetensors (FP32 host roundtrip) and gguf
+// (byte-level row swap for quant carriers, FP32 roundtrip for dense).
 
 // ─── ctor / dtor ───────────────────────────────────────────────────────────
 
@@ -155,18 +262,31 @@ Qwen3Model::~Qwen3Model() = default;
 
 void Qwen3Model::load_weights(const st::File& f, const std::string& prefix) {
     const std::vector<const st::File*> shards = {&f};
-    load_weights_impl_(shards, prefix);
+    load_weights(shards, prefix);
 }
 
 void Qwen3Model::load_weights(const std::vector<const st::File*>& shards,
                               const std::string& prefix) {
-    load_weights_impl_(shards, prefix);
+    if (shards.empty()) fail("load_weights: no safetensors shards");
+    brolm::detail::weights::SafetensorsSource src(shards, prefix);
+    load_weights_impl_(src);
+}
+
+void Qwen3Model::load_weights(const bt::gguf::File& f) {
+    const std::vector<const bt::gguf::File*> shards = {&f};
+    load_weights(shards);
+}
+
+void Qwen3Model::load_weights(
+    const std::vector<const bt::gguf::File*>& shards) {
+    if (shards.empty()) fail("load_weights: no gguf shards");
+    brolm::detail::weights::GgufSource src(
+        shards, [](std::string_view hf) { return qwen3_hf_to_ggml(hf); });
+    load_weights_impl_(src);
 }
 
 void Qwen3Model::load_weights_impl_(
-    const std::vector<const st::File*>& shards, const std::string& prefix) {
-    if (shards.empty()) fail("load_weights: no safetensors shards");
-
+    const brolm::detail::weights::Source& src) {
     const int V    = cfg_.vocab_size;
     const int H    = cfg_.hidden_size;
     const int F    = cfg_.intermediate_size;
@@ -176,70 +296,52 @@ void Qwen3Model::load_weights_impl_(
     const int q_dim  = n_q  * HD;
     const int kv_dim = n_kv * HD;
 
-    upload_compute_checked(need(shards, prefix + "model.embed_tokens.weight"),
-                           V, H, embed_tokens_, "embed_tokens.weight");
-
-    // Load q_proj / k_proj, then permute their per-head head_dim row ordering
-    // from HF rotate_half order into brotensor's interleaved-pair order.
-    auto load_rope_proj = [&](const std::string& key, int out_dim,
-                              int num_heads, bt::Tensor& dst,
-                              const std::string& name) {
-        bt::Tensor raw;
-        upload_compute_checked(need(shards, key), out_dim, H, raw, name);
-        std::vector<float> host = download_fp32(raw);
-        std::vector<float> perm = permute_rope_rows(host, num_heads, HD, H);
-        dst = brolm::detail::upload_host(perm.data(), out_dim, H);
-    };
-
-    // Load q_norm / k_norm (length head_dim) with the same interleaved permute.
-    auto load_rope_norm = [&](const std::string& key, bt::Tensor& dst,
-                              const std::string& name) {
-        bt::Tensor raw;
-        upload_compute_checked(need(shards, key), HD, 1, raw, name);
-        std::vector<float> host = download_fp32(raw);
-        std::vector<float> perm = permute_rope_rows(host, /*num_heads=*/1, HD, 1);
-        dst = brolm::detail::upload_host(perm.data(), HD, 1);
-    };
+    src.upload_compute_checked("model.embed_tokens.weight",
+                               V, H, embed_tokens_, "embed_tokens.weight");
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-        const std::string p =
-            prefix + "model.layers." + std::to_string(i) + ".";
+        const std::string p = "model.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(shards, p + "input_layernorm.weight"),
-                               H, 1, L.input_ln, "input_layernorm.weight");
+        src.upload_compute_checked(p + "input_layernorm.weight",
+                                   H, 1, L.input_ln, "input_layernorm.weight");
 
-        load_rope_proj(p + "self_attn.q_proj.weight", q_dim, n_q,
-                       L.Wq, "q_proj.weight");
-        load_rope_proj(p + "self_attn.k_proj.weight", kv_dim, n_kv,
-                       L.Wk, "k_proj.weight");
-        upload_compute_checked(need(shards, p + "self_attn.v_proj.weight"),
-                               kv_dim, H, L.Wv, "v_proj.weight");
-        upload_compute_checked(need(shards, p + "self_attn.o_proj.weight"),
-                               H, q_dim, L.Wo, "o_proj.weight");
+        src.upload_compute_rope_permuted(p + "self_attn.q_proj.weight",
+                                         q_dim, H, n_q, HD, L.Wq, "q_proj.weight");
+        src.upload_compute_rope_permuted(p + "self_attn.k_proj.weight",
+                                         kv_dim, H, n_kv, HD, L.Wk, "k_proj.weight");
+        src.upload_compute_checked(p + "self_attn.v_proj.weight",
+                                   kv_dim, H, L.Wv, "v_proj.weight");
+        src.upload_compute_checked(p + "self_attn.o_proj.weight",
+                                   H, q_dim, L.Wo, "o_proj.weight");
 
-        load_rope_norm(p + "self_attn.q_norm.weight", L.q_norm, "q_norm.weight");
-        load_rope_norm(p + "self_attn.k_norm.weight", L.k_norm, "k_norm.weight");
+        // q_norm / k_norm are length head_dim (cols == 1); permute as if a
+        // single head over head_dim entries.
+        src.upload_compute_rope_permuted(p + "self_attn.q_norm.weight",
+                                         HD, 1, /*num_heads=*/1, HD,
+                                         L.q_norm, "q_norm.weight");
+        src.upload_compute_rope_permuted(p + "self_attn.k_norm.weight",
+                                         HD, 1, /*num_heads=*/1, HD,
+                                         L.k_norm, "k_norm.weight");
 
-        upload_compute_checked(
-            need(shards, p + "post_attention_layernorm.weight"),
-            H, 1, L.post_attn_ln, "post_attention_layernorm.weight");
+        src.upload_compute_checked(p + "post_attention_layernorm.weight",
+                                   H, 1, L.post_attn_ln,
+                                   "post_attention_layernorm.weight");
 
-        upload_compute_checked(need(shards, p + "mlp.gate_proj.weight"),
-                               F, H, L.gate_W, "gate_proj.weight");
-        upload_compute_checked(need(shards, p + "mlp.up_proj.weight"),
-                               F, H, L.up_W, "up_proj.weight");
-        upload_compute_checked(need(shards, p + "mlp.down_proj.weight"),
-                               H, F, L.down_W, "down_proj.weight");
+        src.upload_compute_checked(p + "mlp.gate_proj.weight",
+                                   F, H, L.gate_W, "gate_proj.weight");
+        src.upload_compute_checked(p + "mlp.up_proj.weight",
+                                   F, H, L.up_W, "up_proj.weight");
+        src.upload_compute_checked(p + "mlp.down_proj.weight",
+                                   H, F, L.down_W, "down_proj.weight");
     }
 
-    upload_compute_checked(need(shards, prefix + "model.norm.weight"),
-                           H, 1, final_norm_, "model.norm.weight");
+    src.upload_compute_checked("model.norm.weight",
+                               H, 1, final_norm_, "model.norm.weight");
 
-    // lm_head: absent iff weights are tied to embed_tokens.
-    const auto* lm = find_in(shards, prefix + "lm_head.weight");
-    if (lm != nullptr) {
-        upload_compute_checked(*lm, V, H, lm_head_, "lm_head.weight");
+    if (src.has("lm_head.weight")) {
+        src.upload_compute_checked("lm_head.weight",
+                                   V, H, lm_head_, "lm_head.weight");
     } else {
         if (!cfg_.tie_word_embeddings) {
             fail("load_weights: lm_head.weight missing and "
