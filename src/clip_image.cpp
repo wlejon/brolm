@@ -2,6 +2,7 @@
 #include "brotensor/safetensors.h"
 #include "brolm/detail/device.h"
 #include "brolm/detail/compute.h"
+#include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -15,19 +16,10 @@ namespace brolm::clip_image {
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
-// Validate-and-upload a safetensors weight view at the compute dtype.
-using st::upload_compute_checked;
-
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("clip_image::ImageEncoder: " + msg);
-}
-
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("clip_image::ImageEncoder: missing tensor '" + key + "'");
-    return *v;
 }
 
 }  // namespace
@@ -58,63 +50,61 @@ void ImageEncoder::load_weights(const st::File& f,
     const int P = cfg_.patch_size;
     const int T = num_tokens(cfg_);
 
+    brolm::detail::weights::SafetensorsSource src({&f}, prefix);
+
     // patch_embed conv: (D, C*P*P). HF stores (D, C, P, P) which is the
     // same C-contiguous layout brotensor's conv2d expects.
-    upload_compute_checked(need(f, prefix + "embeddings.patch_embedding.weight"),
-                        D, C * P * P, patch_W_, "patch_embedding.weight");
+    src.upload_compute_checked("embeddings.patch_embedding.weight",
+                               D, C * P * P, patch_W_, "patch_embedding.weight");
 
     // class_embedding: (D,) stored 1-D in HF. Load as (1, D) row to ease
     // the copy into seq_ row 0.
-    upload_compute_checked(need(f, prefix + "embeddings.class_embedding"),
-                        1, D, class_embed_, "class_embedding");
+    src.upload_compute_checked("embeddings.class_embedding",
+                               1, D, class_embed_, "class_embedding");
 
-    upload_compute_checked(need(f, prefix + "embeddings.position_embedding.weight"),
-                        T, D, position_embed_, "position_embedding");
+    src.upload_compute_checked("embeddings.position_embedding.weight",
+                               T, D, position_embed_, "position_embedding");
 
     // pre_layrnorm is the upstream HF typo. Accept either spelling.
-    const std::string pre_key_typo = prefix + "pre_layrnorm.";
-    const std::string pre_key_alt  = prefix + "pre_layernorm.";
-    const auto* pre_g_v = f.find(pre_key_typo + "weight");
-    const auto* pre_b_v = f.find(pre_key_typo + "bias");
-    if (!pre_g_v && pre_layrnorm_alt) {
-        pre_g_v = f.find(pre_key_alt + "weight");
-        pre_b_v = f.find(pre_key_alt + "bias");
-    }
-    if (!pre_g_v || !pre_b_v) {
+    const bool has_typo = src.has("pre_layrnorm.weight");
+    const bool has_alt  = pre_layrnorm_alt && src.has("pre_layernorm.weight");
+    const std::string pre = has_typo ? "pre_layrnorm." :
+                            (has_alt ? "pre_layernorm." : std::string());
+    if (pre.empty()) {
         fail("missing pre_layrnorm/pre_layernorm weight/bias");
     }
-    upload_compute_checked(*pre_g_v, D, 1, pre_g_, "pre_ln.weight");
-    upload_compute_checked(*pre_b_v, D, 1, pre_b_, "pre_ln.bias");
+    src.upload_compute_checked(pre + "weight", D, 1, pre_g_, "pre_ln.weight");
+    src.upload_compute_checked(pre + "bias",   D, 1, pre_b_, "pre_ln.bias");
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
-        const std::string p = prefix + "encoder.layers." + std::to_string(i) + ".";
+        const std::string p = "encoder.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(f, p + "layer_norm1.weight"), D, 1, L.ln1_g, "ln1.weight");
-        upload_compute_checked(need(f, p + "layer_norm1.bias"),   D, 1, L.ln1_b, "ln1.bias");
+        src.upload_compute_checked(p + "layer_norm1.weight", D, 1, L.ln1_g, "ln1.weight");
+        src.upload_compute_checked(p + "layer_norm1.bias",   D, 1, L.ln1_b, "ln1.bias");
 
-        upload_compute_checked(need(f, p + "self_attn.q_proj.weight"), D, D, L.Wq, "q_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.q_proj.bias"),   D, 1, L.bq, "q_proj.b");
-        upload_compute_checked(need(f, p + "self_attn.k_proj.weight"), D, D, L.Wk, "k_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.k_proj.bias"),   D, 1, L.bk, "k_proj.b");
-        upload_compute_checked(need(f, p + "self_attn.v_proj.weight"), D, D, L.Wv, "v_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.v_proj.bias"),   D, 1, L.bv, "v_proj.b");
-        upload_compute_checked(need(f, p + "self_attn.out_proj.weight"), D, D, L.Wo, "out_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.out_proj.bias"),   D, 1, L.bo, "out_proj.b");
+        src.upload_compute_checked(p + "self_attn.q_proj.weight", D, D, L.Wq, "q_proj.W");
+        src.upload_compute_checked(p + "self_attn.q_proj.bias",   D, 1, L.bq, "q_proj.b");
+        src.upload_compute_checked(p + "self_attn.k_proj.weight", D, D, L.Wk, "k_proj.W");
+        src.upload_compute_checked(p + "self_attn.k_proj.bias",   D, 1, L.bk, "k_proj.b");
+        src.upload_compute_checked(p + "self_attn.v_proj.weight", D, D, L.Wv, "v_proj.W");
+        src.upload_compute_checked(p + "self_attn.v_proj.bias",   D, 1, L.bv, "v_proj.b");
+        src.upload_compute_checked(p + "self_attn.out_proj.weight", D, D, L.Wo, "out_proj.W");
+        src.upload_compute_checked(p + "self_attn.out_proj.bias",   D, 1, L.bo, "out_proj.b");
 
-        upload_compute_checked(need(f, p + "layer_norm2.weight"), D, 1, L.ln2_g, "ln2.weight");
-        upload_compute_checked(need(f, p + "layer_norm2.bias"),   D, 1, L.ln2_b, "ln2.bias");
+        src.upload_compute_checked(p + "layer_norm2.weight", D, 1, L.ln2_g, "ln2.weight");
+        src.upload_compute_checked(p + "layer_norm2.bias",   D, 1, L.ln2_b, "ln2.bias");
 
-        upload_compute_checked(need(f, p + "mlp.fc1.weight"), F, D, L.fc1_W, "fc1.W");
-        upload_compute_checked(need(f, p + "mlp.fc1.bias"),   F, 1, L.fc1_b, "fc1.b");
-        upload_compute_checked(need(f, p + "mlp.fc2.weight"), D, F, L.fc2_W, "fc2.W");
-        upload_compute_checked(need(f, p + "mlp.fc2.bias"),   D, 1, L.fc2_b, "fc2.b");
+        src.upload_compute_checked(p + "mlp.fc1.weight", F, D, L.fc1_W, "fc1.W");
+        src.upload_compute_checked(p + "mlp.fc1.bias",   F, 1, L.fc1_b, "fc1.b");
+        src.upload_compute_checked(p + "mlp.fc2.weight", D, F, L.fc2_W, "fc2.W");
+        src.upload_compute_checked(p + "mlp.fc2.bias",   D, 1, L.fc2_b, "fc2.b");
     }
 
-    upload_compute_checked(need(f, prefix + "post_layernorm.weight"),
-                        D, 1, post_g_, "post_ln.weight");
-    upload_compute_checked(need(f, prefix + "post_layernorm.bias"),
-                        D, 1, post_b_, "post_ln.bias");
+    src.upload_compute_checked("post_layernorm.weight",
+                               D, 1, post_g_, "post_ln.weight");
+    src.upload_compute_checked("post_layernorm.bias",
+                               D, 1, post_b_, "post_ln.bias");
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────

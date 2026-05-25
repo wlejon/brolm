@@ -2,6 +2,7 @@
 #include "brotensor/safetensors.h"
 #include "brolm/detail/device.h"
 #include "brolm/detail/compute.h"
+#include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -23,9 +24,6 @@ namespace brolm::clip_score {
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
-// Validate-and-upload a safetensors weight view at the compute dtype.
-using st::upload_compute_checked;
-
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
@@ -45,12 +43,6 @@ std::vector<float> download_compute(const bt::Tensor& t) {
         return out;
     }
     return t.to_host_vector();
-}
-
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("clip_score::CLIPScorer: missing tensor '" + key + "'");
-    return *v;
 }
 
 float l2_normalise_in_place(std::vector<float>& v) {
@@ -78,10 +70,11 @@ void CLIPScorer::load_projections(const st::File& f, const std::string& prefix) 
     const int Dv = image_enc_.config().hidden_dim;
     const int Dt = text_enc_.config().hidden_dim;
 
-    upload_compute_checked(need(f, prefix + "visual_projection.weight"),
-                        P, Dv, visual_proj_W_, "visual_projection.weight");
-    upload_compute_checked(need(f, prefix + "text_projection.weight"),
-                        P, Dt, text_proj_W_, "text_projection.weight");
+    brolm::detail::weights::SafetensorsSource src({&f}, prefix);
+    src.upload_compute_checked("visual_projection.weight",
+                               P, Dv, visual_proj_W_, "visual_projection.weight");
+    src.upload_compute_checked("text_projection.weight",
+                               P, Dt, text_proj_W_, "text_projection.weight");
 }
 
 void CLIPScorer::set_prompt(std::string_view prompt) {

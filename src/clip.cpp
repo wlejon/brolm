@@ -2,6 +2,7 @@
 #include "brotensor/safetensors.h"
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -19,8 +20,6 @@ namespace brolm::clip {
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
-// Validate-and-upload a safetensors weight view at the compute dtype —
-// shared across the CLIP text / image encoders and the scorer.
 using st::upload_compute_checked;
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -38,12 +37,6 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
     bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
     std::memcpy(cpu.host_raw_mut(), host, static_cast<std::size_t>(n) * sizeof(int32_t));
     return cpu.to(bt::default_device());
-}
-
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("clip::TextEncoder: missing tensor '" + key + "'");
-    return *v;
 }
 
 }  // namespace
@@ -72,49 +65,50 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
     const int D = cfg_.hidden_dim;
     const int F = cfg_.intermediate_dim;
 
-    upload_compute_checked(need(f, prefix + "embeddings.token_embedding.weight"),
-                        V, D, token_embed_, "token_embedding");
-    upload_compute_checked(need(f, prefix + "embeddings.position_embedding.weight"),
-                        P, D, position_embed_, "position_embedding");
+    brolm::detail::weights::SafetensorsSource src({&f}, prefix);
+
+    src.upload_compute_checked("embeddings.token_embedding.weight",
+                               V, D, token_embed_, "token_embedding");
+    src.upload_compute_checked("embeddings.position_embedding.weight",
+                               P, D, position_embed_, "position_embedding");
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
-        const std::string p = prefix + "encoder.layers." + std::to_string(i) + ".";
+        const std::string p = "encoder.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(f, p + "layer_norm1.weight"), D, 1, L.ln1_gamma, "ln1.weight");
-        upload_compute_checked(need(f, p + "layer_norm1.bias"),   D, 1, L.ln1_beta,  "ln1.bias");
+        src.upload_compute_checked(p + "layer_norm1.weight", D, 1, L.ln1_gamma, "ln1.weight");
+        src.upload_compute_checked(p + "layer_norm1.bias",   D, 1, L.ln1_beta,  "ln1.bias");
 
-        upload_compute_checked(need(f, p + "self_attn.q_proj.weight"), D, D, L.Wq, "q_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.q_proj.bias"),   D, 1, L.bq, "q_proj.b");
-        upload_compute_checked(need(f, p + "self_attn.k_proj.weight"), D, D, L.Wk, "k_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.k_proj.bias"),   D, 1, L.bk, "k_proj.b");
-        upload_compute_checked(need(f, p + "self_attn.v_proj.weight"), D, D, L.Wv, "v_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.v_proj.bias"),   D, 1, L.bv, "v_proj.b");
-        upload_compute_checked(need(f, p + "self_attn.out_proj.weight"), D, D, L.Wo, "out_proj.W");
-        upload_compute_checked(need(f, p + "self_attn.out_proj.bias"),   D, 1, L.bo, "out_proj.b");
+        src.upload_compute_checked(p + "self_attn.q_proj.weight", D, D, L.Wq, "q_proj.W");
+        src.upload_compute_checked(p + "self_attn.q_proj.bias",   D, 1, L.bq, "q_proj.b");
+        src.upload_compute_checked(p + "self_attn.k_proj.weight", D, D, L.Wk, "k_proj.W");
+        src.upload_compute_checked(p + "self_attn.k_proj.bias",   D, 1, L.bk, "k_proj.b");
+        src.upload_compute_checked(p + "self_attn.v_proj.weight", D, D, L.Wv, "v_proj.W");
+        src.upload_compute_checked(p + "self_attn.v_proj.bias",   D, 1, L.bv, "v_proj.b");
+        src.upload_compute_checked(p + "self_attn.out_proj.weight", D, D, L.Wo, "out_proj.W");
+        src.upload_compute_checked(p + "self_attn.out_proj.bias",   D, 1, L.bo, "out_proj.b");
 
-        upload_compute_checked(need(f, p + "layer_norm2.weight"), D, 1, L.ln2_gamma, "ln2.weight");
-        upload_compute_checked(need(f, p + "layer_norm2.bias"),   D, 1, L.ln2_beta,  "ln2.bias");
+        src.upload_compute_checked(p + "layer_norm2.weight", D, 1, L.ln2_gamma, "ln2.weight");
+        src.upload_compute_checked(p + "layer_norm2.bias",   D, 1, L.ln2_beta,  "ln2.bias");
 
-        upload_compute_checked(need(f, p + "mlp.fc1.weight"), F, D, L.fc1_W, "fc1.W");
-        upload_compute_checked(need(f, p + "mlp.fc1.bias"),   F, 1, L.fc1_b, "fc1.b");
-        upload_compute_checked(need(f, p + "mlp.fc2.weight"), D, F, L.fc2_W, "fc2.W");
-        upload_compute_checked(need(f, p + "mlp.fc2.bias"),   D, 1, L.fc2_b, "fc2.b");
+        src.upload_compute_checked(p + "mlp.fc1.weight", F, D, L.fc1_W, "fc1.W");
+        src.upload_compute_checked(p + "mlp.fc1.bias",   F, 1, L.fc1_b, "fc1.b");
+        src.upload_compute_checked(p + "mlp.fc2.weight", D, F, L.fc2_W, "fc2.W");
+        src.upload_compute_checked(p + "mlp.fc2.bias",   D, 1, L.fc2_b, "fc2.b");
     }
 
-    upload_compute_checked(need(f, prefix + "final_layer_norm.weight"),
-                        D, 1, final_gamma_, "final_ln.weight");
-    upload_compute_checked(need(f, prefix + "final_layer_norm.bias"),
-                        D, 1, final_beta_,  "final_ln.bias");
+    src.upload_compute_checked("final_layer_norm.weight",
+                               D, 1, final_gamma_, "final_ln.weight");
+    src.upload_compute_checked("final_layer_norm.bias",
+                               D, 1, final_beta_,  "final_ln.bias");
 
     // Optional projection. CLIPTextModelWithProjection ships a
-    // {prefix}text_projection.weight of shape (D, D) (diffusers (out, in)
-    // row-major). Plain CLIPTextModel — which is what Flux uses — omits it,
-    // in which case the pooled output is the raw EOS hidden state.
-    const auto* tp = f.find(prefix + "text_projection.weight");
-    has_text_projection_ = (tp != nullptr);
+    // {prefix}text_projection.weight of shape (D, D); plain CLIPTextModel
+    // (what Flux uses) omits it.
+    has_text_projection_ = src.has("text_projection.weight");
     if (has_text_projection_) {
-        upload_compute_checked(*tp, D, D, text_projection_, "text_projection.weight");
+        src.upload_compute_checked("text_projection.weight",
+                                   D, D, text_projection_, "text_projection.weight");
     }
 
     // Position-id buffer is fixed [0, 1, ..., P-1]. Upload once.
