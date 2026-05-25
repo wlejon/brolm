@@ -70,6 +70,35 @@ CMake options:
 - `BROLM_TOOLS` (default `ON` when built standalone) — build the ad-hoc tool drivers under `tools/` (not run by ctest).
 - `BROLM_INSTALL` (default `OFF`) — install the static library and public headers. brolm is meant to be consumed via `add_subdirectory`, not `find_package`; no CMake package config is generated.
 
+## GGUF
+
+In addition to Hugging Face safetensors, brolm loads `.gguf` checkpoints
+(llama.cpp's format) directly. Tokenizer vocab, merges, and special-token IDs
+are read from the file's metadata; model weights are read by their ggml tensor
+names. The same model class is used either way — only the loader entry point
+differs:
+
+```cpp
+brotensor::gguf::File f("weights/Qwen3-0.6B-GGUF/Qwen3-0.6B-BF16.gguf");
+
+auto tok = brolm::qwen::Tokenizer::from_gguf(f);
+auto cfg = brolm::qwen::Qwen3Config::from_gguf(f);
+brolm::qwen::Qwen3 model(cfg);
+model.load_weights(f);
+```
+
+Supported today: Qwen3 (model + tokenizer + config), T5 (model + tokenizer +
+config), Whisper (tokenizer). BF16 weights load on every backend; on-disk
+quants (e.g. Q8_0) are kept in their original dtype and dispatched through
+brotensor's quant-carrier kernels (CUDA-only at the moment).
+
+A helper script pulls the smallest text-only Qwen3 in both BF16 and Q8_0:
+
+```bash
+scripts/download_qwen3_gguf.sh                              # unsloth/Qwen3-0.6B-GGUF
+REPO=Qwen/Qwen3-1.7B-GGUF scripts/download_qwen3_gguf.sh    # different size
+```
+
 ## Qwen3.5-VL
 
 Qwen3.5-VL is the first multimodal model fully supported in brolm. The pipeline
@@ -133,10 +162,10 @@ It decodes the image via broimage, area-resamples it down to a per-tool pixel
 cap (~512×512 by default — vision token count is linear in pixels and ViT
 attention cost quadratic in tokens), and prints the model's reply.
 
-Status: all 19 unit + integration tests pass; the gated real-checkpoint suite
-loads the official 0.8B safetensors and runs every stage (config / tokenizer /
-preprocessor / vision tower / hybrid text prefill+decode parity / full VLM
-end-to-end) without NaN. Bit-exact numerical parity against HF `transformers`
+Status: the unconditional CPU test suite passes, and the gated real-checkpoint
+suite loads the official 0.8B safetensors and runs every stage (config /
+tokenizer / preprocessor / vision tower / hybrid text prefill+decode parity /
+full VLM end-to-end) without NaN. Bit-exact numerical parity against HF `transformers`
 is not yet asserted — that's the remaining validation step before this is
 production-ready. The MTP head present in the checkpoint is loaded by the text
 model but not yet wired into a speculative-decoding pass.
