@@ -1,7 +1,9 @@
 #include "brolm/t5.h"
 
+#include "brotensor/gguf.h"
 #include "brotensor/safetensors.h"
 #include "brolm/detail/compute.h"
+#include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brolm::t5 {
@@ -20,32 +23,12 @@ namespace brolm::t5 {
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
-using st::upload_compute_checked;
-
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("t5::TextEncoder: " + msg);
-}
-
-// Find a tensor by name across one or more shards; first match wins.
-const st::TensorView& need(const std::vector<const st::File*>& shards,
-                           const std::string& key) {
-    for (const st::File* f : shards) {
-        if (const auto* v = f->find(key)) return *v;
-    }
-    throw std::runtime_error("t5::TextEncoder: missing tensor '" + key + "'");
-}
-
-// Find a tensor by name across shards; nullptr if absent in every shard.
-const st::TensorView* find_in(const std::vector<const st::File*>& shards,
-                              const std::string& key) {
-    for (const st::File* f : shards) {
-        if (const auto* v = f->find(key)) return v;
-    }
-    return nullptr;
 }
 
 // Build a device-resident INT32 buffer holding `n` token ids. brotensor has
@@ -59,8 +42,8 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
 }
 
 // Download a loaded weight tensor into a host FP32 vector, handling both the
-// FP16 (GPU) and FP32 (CPU) compute-dtype cases — same pattern as
-// pipeline.cpp's decode().
+// FP16 (GPU) and FP32 (CPU) compute-dtype cases — used to pull the
+// relative-position-bias table back to the host after upload.
 std::vector<float> download_fp32(const bt::Tensor& t) {
     const std::size_t n = static_cast<std::size_t>(t.size());
     if (t.dtype == bt::Dtype::FP16) {
@@ -116,6 +99,151 @@ TextEncoder::TextEncoder(const T5Config& cfg) : cfg_(cfg) {
 
 TextEncoder::~TextEncoder() = default;
 
+// ─── HF → ggml tensor-name map (T5) ────────────────────────────────────────
+//
+// HF naming:  shared.weight (or encoder.embed_tokens.weight),
+//             encoder.block.N.layer.0.layer_norm.weight,
+//             encoder.block.N.layer.0.SelfAttention.{q,k,v,o}.weight,
+//             encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight,
+//             encoder.block.N.layer.1.layer_norm.weight,
+//             encoder.block.N.layer.1.DenseReluDense.{wi_0,wi_1,wo}.weight,
+//             encoder.final_layer_norm.weight.
+// ggml naming (llama.cpp / city96 T5 GGUFs):
+//             token_embd.weight,
+//             enc.blk.N.attn_norm.weight,
+//             enc.blk.N.attn_{q,k,v,o}.weight,
+//             enc.blk.0.attn_rel_b.weight,
+//             enc.blk.N.ffn_norm.weight,
+//             enc.blk.N.ffn_{gate,up,down}.weight,   (wi_0/wi_1/wo)
+//             enc.output_norm.weight.
+
+namespace {
+
+bool starts_with(std::string_view s, std::string_view p) {
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+
+}  // namespace
+
+std::string t5_hf_to_ggml(std::string_view hf_name) {
+    if (hf_name == "shared.weight" ||
+        hf_name == "encoder.embed_tokens.weight") {
+        return "token_embd.weight";
+    }
+    if (hf_name == "encoder.final_layer_norm.weight") {
+        return "enc.output_norm.weight";
+    }
+    constexpr std::string_view kBlk = "encoder.block.";
+    if (!starts_with(hf_name, kBlk)) return {};
+    const auto dot = hf_name.find('.', kBlk.size());
+    if (dot == std::string_view::npos) return {};
+    const std::string_view idx  = hf_name.substr(kBlk.size(),
+                                                 dot - kBlk.size());
+    const std::string_view tail = hf_name.substr(dot + 1);
+
+    auto blk = [&](std::string_view suffix) -> std::string {
+        std::string out;
+        out.reserve(8 + idx.size() + 1 + suffix.size());
+        out.append("enc.blk.");
+        out.append(idx);
+        out.push_back('.');
+        out.append(suffix);
+        return out;
+    };
+
+    if (tail == "layer.0.layer_norm.weight")       return blk("attn_norm.weight");
+    if (tail == "layer.0.SelfAttention.q.weight")  return blk("attn_q.weight");
+    if (tail == "layer.0.SelfAttention.k.weight")  return blk("attn_k.weight");
+    if (tail == "layer.0.SelfAttention.v.weight")  return blk("attn_v.weight");
+    if (tail == "layer.0.SelfAttention.o.weight")  return blk("attn_o.weight");
+    if (tail == "layer.0.SelfAttention.relative_attention_bias.weight")
+        return blk("attn_rel_b.weight");
+    if (tail == "layer.1.layer_norm.weight")       return blk("ffn_norm.weight");
+    if (tail == "layer.1.DenseReluDense.wi_0.weight") return blk("ffn_gate.weight");
+    if (tail == "layer.1.DenseReluDense.wi_1.weight") return blk("ffn_up.weight");
+    if (tail == "layer.1.DenseReluDense.wo.weight")   return blk("ffn_down.weight");
+    return {};
+}
+
+// ─── T5Config::from_gguf ───────────────────────────────────────────────────
+
+namespace {
+
+namespace gg = ::brotensor::gguf;
+
+const gg::Value& need_meta(const gg::File& f, const char* key) {
+    const gg::Value* v = f.find_meta(key);
+    if (!v) throw std::runtime_error(
+        std::string("t5::T5Config::from_gguf: missing metadata '") + key + "'");
+    return *v;
+}
+
+int meta_as_int(const gg::Value& v, const char* key) {
+    switch (v.type) {
+        case gg::ValueType::U8:  return static_cast<int>(v.scalar.u8);
+        case gg::ValueType::I8:  return static_cast<int>(v.scalar.i8);
+        case gg::ValueType::U16: return static_cast<int>(v.scalar.u16);
+        case gg::ValueType::I16: return static_cast<int>(v.scalar.i16);
+        case gg::ValueType::U32: return static_cast<int>(v.scalar.u32);
+        case gg::ValueType::I32: return static_cast<int>(v.scalar.i32);
+        case gg::ValueType::U64: return static_cast<int>(v.scalar.u64);
+        case gg::ValueType::I64: return static_cast<int>(v.scalar.i64);
+        default:
+            throw std::runtime_error(
+                std::string("t5::T5Config::from_gguf: metadata '") + key +
+                "' is not an integer scalar");
+    }
+}
+
+float meta_as_f32(const gg::Value& v, const char* key) {
+    if (v.type == gg::ValueType::F32) return v.scalar.f32;
+    if (v.type == gg::ValueType::F64) return static_cast<float>(v.scalar.f64);
+    throw std::runtime_error(
+        std::string("t5::T5Config::from_gguf: metadata '") + key +
+        "' is not a float scalar");
+}
+
+}  // namespace
+
+T5Config T5Config::from_gguf(const gg::File& f) {
+    if (const auto* arch = f.find_meta("general.architecture")) {
+        if (arch->type == gg::ValueType::String && arch->str != "t5") {
+            throw std::runtime_error(
+                "t5::T5Config::from_gguf: general.architecture is '" +
+                arch->str + "', expected 't5'");
+        }
+    }
+    T5Config cfg;
+    cfg.d_model    = meta_as_int(need_meta(f, "t5.embedding_length"),
+                                 "t5.embedding_length");
+    cfg.d_ff       = meta_as_int(need_meta(f, "t5.feed_forward_length"),
+                                 "t5.feed_forward_length");
+    cfg.num_layers = meta_as_int(need_meta(f, "t5.block_count"),
+                                 "t5.block_count");
+    cfg.num_heads  = meta_as_int(need_meta(f, "t5.attention.head_count"),
+                                 "t5.attention.head_count");
+
+    if (const auto* v = f.find_meta("t5.attention.key_length")) {
+        cfg.d_kv = meta_as_int(*v, "t5.attention.key_length");
+    } else {
+        cfg.d_kv = cfg.d_model / cfg.num_heads;
+    }
+    if (const auto* v = f.find_meta("t5.attention.relative_buckets_count")) {
+        cfg.relative_attention_num_buckets =
+            meta_as_int(*v, "t5.attention.relative_buckets_count");
+    }
+    if (const auto* v = f.find_meta("t5.attention.layer_norm_epsilon")) {
+        cfg.layer_norm_eps = meta_as_f32(*v, "t5.attention.layer_norm_epsilon");
+    }
+    if (const auto* toks = f.find_meta("tokenizer.ggml.tokens");
+        toks && toks->type == gg::ValueType::Array) {
+        cfg.vocab_size = static_cast<int>(toks->array.size());
+    } else if (const auto* vs = f.find_meta("t5.vocab_size")) {
+        cfg.vocab_size = meta_as_int(*vs, "t5.vocab_size");
+    }
+    return cfg;
+}
+
 // ─── load_weights ──────────────────────────────────────────────────────────
 
 void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
@@ -126,31 +254,46 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
 void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
                                const std::string& prefix) {
     if (shards.empty()) fail("load_weights: no safetensors shards");
+    brolm::detail::weights::SafetensorsSource src(shards, prefix);
+    load_weights_impl_(src);
+}
+
+void TextEncoder::load_weights(const bt::gguf::File& f) {
+    const std::vector<const bt::gguf::File*> shards = {&f};
+    load_weights(shards);
+}
+
+void TextEncoder::load_weights(
+    const std::vector<const bt::gguf::File*>& shards) {
+    if (shards.empty()) fail("load_weights: no gguf shards");
+    brolm::detail::weights::GgufSource src(
+        shards, [](std::string_view hf) { return t5_hf_to_ggml(hf); });
+    load_weights_impl_(src);
+}
+
+void TextEncoder::load_weights_impl_(
+    const brolm::detail::weights::Source& src) {
     const int V  = cfg_.vocab_size;
     const int D  = cfg_.d_model;
     const int FF = cfg_.d_ff;
     const int NB = cfg_.relative_attention_num_buckets;
     const int H  = cfg_.num_heads;
 
-    // Token embedding: standalone export uses "shared.weight"; an
-    // encoder-only export may instead carry "encoder.embed_tokens.weight".
-    {
-        const std::string shared_key = prefix + "shared.weight";
-        const std::string embed_key  = prefix + "encoder.embed_tokens.weight";
-        const auto* tv = find_in(shards, shared_key);
-        if (!tv) tv = find_in(shards, embed_key);
-        if (!tv) {
-            fail("missing token embedding ('" + shared_key + "' or '" +
-                 embed_key + "')");
-        }
-        upload_compute_checked(*tv, V, D, token_embed_, "shared.weight");
+    // Token embedding: HF naming is "shared.weight"; encoder-only exports
+    // sometimes use "encoder.embed_tokens.weight" instead. Both map to
+    // "token_embd.weight" in gguf, so either probe succeeds there.
+    if (src.has("shared.weight")) {
+        src.upload_compute_checked("shared.weight", V, D, token_embed_,
+                                   "shared.weight");
+    } else if (src.has("encoder.embed_tokens.weight")) {
+        src.upload_compute_checked("encoder.embed_tokens.weight", V, D,
+                                   token_embed_, "shared.weight");
+    } else {
+        fail("missing token embedding ('shared.weight' or "
+             "'encoder.embed_tokens.weight')");
     }
 
-    // INT8 (W8A16) quantisation decision. GPU-only: the W8A16 ops have no
-    // CPU path, so on the CPU backend (FP32 compute dtype) the flag is
-    // ignored and every weight stays FP32. When active, each per-block
-    // attention / FFN matrix is quantised on the host straight from its
-    // safetensors view — the FP16 weight is never uploaded to VRAM.
+    // INT8 (W8A16) quantisation decision. GPU-only.
     const bool do_quantize =
         cfg_.quantize_weights &&
         (brolm::compute_dtype() == bt::Dtype::FP16);
@@ -160,26 +303,21 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
             "T5Config::quantize_weights on the CPU backend.\n");
     }
 
-    // Load one attention/FFN weight: as INT8 straight from the checkpoint
-    // when quantising (FP16 tensor `W` left empty), else as a plain
-    // compute-dtype upload (`q` left inactive).
     auto load_w = [&](const std::string& key, int out, int in,
                       bt::Tensor& W, QWeight& q, const std::string& name) {
-        const st::TensorView& view = need(shards, key);
         if (do_quantize) {
-            quantize_weight_from_view_(view, out, in, q, name);
+            quantize_weight_from_source_(src, key, out, in, q, name);
         } else {
-            upload_compute_checked(view, out, in, W, name);
+            src.upload_compute_checked(key, out, in, W, name);
         }
     };
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
-        const std::string p =
-            prefix + "encoder.block." + std::to_string(i) + ".";
+        const std::string p = "encoder.block." + std::to_string(i) + ".";
         Block& B = blocks_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(shards, p + "layer.0.layer_norm.weight"),
-                               D, 1, B.ln0, "block.layer.0.layer_norm");
+        src.upload_compute_checked(p + "layer.0.layer_norm.weight",
+                                   D, 1, B.ln0, "block.layer.0.layer_norm");
 
         const std::string sa = p + "layer.0.SelfAttention.";
         load_w(sa + "q.weight", D, D, B.Wq, B.Wq_q, "SelfAttention.q");
@@ -187,8 +325,8 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
         load_w(sa + "v.weight", D, D, B.Wv, B.Wv_q, "SelfAttention.v");
         load_w(sa + "o.weight", D, D, B.Wo, B.Wo_q, "SelfAttention.o");
 
-        upload_compute_checked(need(shards, p + "layer.1.layer_norm.weight"),
-                               D, 1, B.ln1, "block.layer.1.layer_norm");
+        src.upload_compute_checked(p + "layer.1.layer_norm.weight",
+                                   D, 1, B.ln1, "block.layer.1.layer_norm");
 
         const std::string dr = p + "layer.1.DenseReluDense.";
         load_w(dr + "wi_0.weight", FF, D, B.wi_0, B.wi_0_q, "DenseReluDense.wi_0");
@@ -199,71 +337,33 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
     // Relative-position bias table — block 0 only, shared by every layer.
     {
         bt::Tensor rel;
-        upload_compute_checked(
-            need(shards, prefix + "encoder.block.0.layer.0.SelfAttention."
-                             "relative_attention_bias.weight"),
+        src.upload_compute_checked(
+            "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight",
             NB, H, rel, "relative_attention_bias");
         rel_attn_bias_ = download_fp32(rel);
     }
 
-    upload_compute_checked(need(shards, prefix + "encoder.final_layer_norm.weight"),
-                           D, 1, final_ln_, "final_layer_norm");
+    src.upload_compute_checked("encoder.final_layer_norm.weight",
+                               D, 1, final_ln_, "final_layer_norm");
 
-    // Invalidate any cached position bias — weights just changed.
     pos_bias_L_ = -1;
 }
 
 // ─── INT8 (W8A16) quantisation ─────────────────────────────────────────────
 
-void TextEncoder::quantize_weight_from_view_(const st::TensorView& view,
-                                             int out, int in, QWeight& q,
-                                             const std::string& name) {
+void TextEncoder::quantize_weight_from_source_(
+    const brolm::detail::weights::Source& src, const std::string& name,
+    int out, int in, QWeight& q, const std::string& label) {
     const std::size_t n =
         static_cast<std::size_t>(out) * static_cast<std::size_t>(in);
-    if (view.numel() != static_cast<std::int64_t>(n)) {
-        fail("quantize '" + name + "': element count " +
-             std::to_string(view.numel()) + " != expected " +
-             std::to_string(n));
-    }
-
-    // Convert the source view to a host FP16 buffer — the input dtype
-    // brotensor::quantize_int8_per_row_host expects. On-disk weights are
-    // F16, F32, or BF16 (BF16 for Flux-family checkpoints); the source bytes
-    // live in the safetensors mmap, never in VRAM.
-    std::vector<std::uint16_t> host_fp16(n);
-    switch (view.dtype) {
-        case st::Dtype::F16:
-            std::memcpy(host_fp16.data(), view.data,
-                        n * sizeof(std::uint16_t));
-            break;
-        case st::Dtype::F32: {
-            const auto* src = reinterpret_cast<const float*>(view.data);
-            for (std::size_t i = 0; i < n; ++i) {
-                host_fp16[i] = bt::fp32_to_fp16_bits(src[i]);
-            }
-            break;
-        }
-        case st::Dtype::BF16: {
-            const auto* src =
-                reinterpret_cast<const std::uint16_t*>(view.data);
-            for (std::size_t i = 0; i < n; ++i) {
-                host_fp16[i] =
-                    bt::fp32_to_fp16_bits(bt::bf16_bits_to_fp32(src[i]));
-            }
-            break;
-        }
-        default:
-            fail("quantize '" + name + "': unsupported source dtype " +
-                 std::string(st::dtype_name(view.dtype)));
-    }
+    std::vector<std::uint16_t> host_fp16;
+    src.download_host_fp16(name, out, in, host_fp16, label);
 
     std::vector<std::int8_t> host_int8(n);
     std::vector<float>       host_scales(static_cast<std::size_t>(out));
     bt::quantize_int8_per_row_host(host_fp16.data(), out, in,
                                    host_int8.data(), host_scales.data());
 
-    // brotensor has no from_host path for INT8 — stage the quantised bytes
-    // on the host, then migrate to the default (GPU) device.
     bt::Tensor cpu_int8 =
         bt::Tensor::empty_on(bt::Device::CPU, out, in, bt::Dtype::INT8);
     std::memcpy(cpu_int8.host_raw_mut(), host_int8.data(), n);

@@ -31,11 +31,20 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brotensor::safetensors { class File; struct TensorView; }
+namespace brotensor::gguf { class File; }
+namespace brolm::detail::weights { class Source; }
 
 namespace brolm::t5 {
+
+// Translate a HF T5 tensor name (e.g.
+// "encoder.block.3.layer.0.SelfAttention.q.weight") into the ggml / llama.cpp
+// T5 name used in a T5 .gguf checkpoint ("enc.blk.3.attn_q.weight"). Returns
+// an empty string if the name is unrecognized.
+std::string t5_hf_to_ggml(std::string_view hf_name);
 
 struct T5Config {
     int   vocab_size  = 32128;
@@ -47,6 +56,12 @@ struct T5Config {
     int   relative_attention_num_buckets  = 32;
     int   relative_attention_max_distance = 128;
     float layer_norm_eps = 1e-6f;
+
+    // Populate from a T5 .gguf file's `t5.*` metadata. vocab_size is taken
+    // from the tokenizer's `tokenizer.ggml.tokens` array length when present.
+    // Throws std::runtime_error on `general.architecture` != "t5" or missing
+    // required keys.
+    static T5Config from_gguf(const brotensor::gguf::File& f);
 
     // When true, load_weights() stores the per-block attention and FFN
     // weight matrices (Wq/Wk/Wv/Wo, wi_0/wi_1/wo) as INT8 weight-only
@@ -101,6 +116,15 @@ public:
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "");
 
+    // GGUF overloads. Tensor names follow llama.cpp's T5 convention
+    // (`token_embd.weight`, `enc.blk.N.attn_q.weight`, ...); see
+    // t5_hf_to_ggml. The on-disk dtype may be F32/F16/BF16 or a recognized
+    // quant carrier (Q4_K/Q6_K/Q8_0); quant tensors keep their dtype and
+    // dispatch through brotensor's fused-dequant matmuls (GPU-only).
+    void load_weights(const brotensor::gguf::File& f);
+    void load_weights(
+        const std::vector<const brotensor::gguf::File*>& shards);
+
     // Forward over a length-L int32 token-id sequence (host pointer).
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
     //   out: (L, d_model) Tensor at the compute dtype, resized as needed.
@@ -148,17 +172,22 @@ private:
     // Cached: only rebuilt when L changes.
     void rebuild_position_bias_(int L);
 
-    // Quantise one weight to INT8 (W8A16) straight from its safetensors
-    // view, without ever materialising the FP16 weight in VRAM: convert the
-    // source (F16/F32/BF16) to a host FP16 buffer, run
-    // brotensor::quantize_int8_per_row_host for per-output-row symmetric
-    // scales, then upload only the INT8 weight + scales into `q`. `name`
-    // labels validation errors. Used by load_weights when
+    // Shared implementation: walks `src` for all weight names. The two
+    // public load_weights variants build a SafetensorsSource or GgufSource
+    // and call this.
+    void load_weights_impl_(const brolm::detail::weights::Source& src);
+
+    // Quantise one weight to INT8 (W8A16) via the Source: ask the source
+    // for an FP16 host buffer (it dispatches on its own source dtype —
+    // F16/F32/BF16), run brotensor::quantize_int8_per_row_host for
+    // per-output-row symmetric scales, then upload only the INT8 weight +
+    // scales into `q`. Used by load_weights_impl_ when
     // T5Config::quantize_weights is set on a GPU backend; the matching FP16
     // weight tensor is left empty.
-    void quantize_weight_from_view_(
-        const brotensor::safetensors::TensorView& view,
-        int out, int in, QWeight& q, const std::string& name);
+    void quantize_weight_from_source_(
+        const brolm::detail::weights::Source& src,
+        const std::string& name, int out, int in,
+        QWeight& q, const std::string& label);
 
     // One FFN linear: the INT8 W8A16 path when `q` is active, else the plain
     // compute-dtype batched linear on `W`. Bias-free (T5 has no linear bias).

@@ -128,11 +128,11 @@ Qwen3Config Qwen3Config::from_gguf(const gg::File& f) {
 
     // vocab_size: prefer the tokenizer's actual token list length; fall back
     // to a model-level scalar if present.
-    if (const auto* v = f.find_meta("tokenizer.ggml.tokens");
-        v && v->type == gg::ValueType::Array) {
-        cfg.vocab_size = static_cast<int>(v->array.size());
-    } else if (const auto* v = f.find_meta("qwen3.vocab_size")) {
-        cfg.vocab_size = meta_as_int(*v, "qwen3.vocab_size");
+    if (const auto* toks = f.find_meta("tokenizer.ggml.tokens");
+        toks && toks->type == gg::ValueType::Array) {
+        cfg.vocab_size = static_cast<int>(toks->array.size());
+    } else if (const auto* vs = f.find_meta("qwen3.vocab_size")) {
+        cfg.vocab_size = meta_as_int(*vs, "qwen3.vocab_size");
     }
 
     // Tied embeddings: if there's an explicit metadata flag use it; otherwise

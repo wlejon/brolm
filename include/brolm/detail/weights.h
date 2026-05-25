@@ -66,6 +66,16 @@ public:
                                               int num_heads, int head_dim,
                                               brotensor::Tensor& dst,
                                               const std::string& label) const = 0;
+
+    // Read `name` into the caller's host FP16 buffer, resizing it to
+    // rows*cols elements. Source dtype must be a dense float type
+    // (F16/F32/BF16); F16 is memcpy'd verbatim, F32 / BF16 are converted via
+    // brotensor::fp32_to_fp16_bits. Used by callers that do further host-side
+    // processing (e.g. T5's INT8 W8A16 quantization) before upload.
+    virtual void download_host_fp16(const std::string& name,
+                                    int rows, int cols,
+                                    std::vector<std::uint16_t>& out,
+                                    const std::string& label) const = 0;
 };
 
 // ─── permute helpers ───────────────────────────────────────────────────────
@@ -169,6 +179,47 @@ public:
         dst = brolm::detail::upload_host(perm.data(), rows, cols);
     }
 
+    void download_host_fp16(const std::string& name, int rows, int cols,
+                            std::vector<std::uint16_t>& out,
+                            const std::string& label) const override {
+        const auto& view = need_(prefix_ + name);
+        namespace stns = brotensor::safetensors;
+        const std::int64_t expected =
+            static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(cols);
+        if (view.numel() != expected) {
+            throw std::runtime_error(
+                label + " ('" + view.name + "'): shape mismatch (expected " +
+                std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
+                std::to_string(view.numel()) + " elements)");
+        }
+        const std::size_t n = static_cast<std::size_t>(expected);
+        out.resize(n);
+        switch (view.dtype) {
+            case stns::Dtype::F16:
+                std::memcpy(out.data(), view.data, n * sizeof(std::uint16_t));
+                return;
+            case stns::Dtype::F32: {
+                const auto* src = reinterpret_cast<const float*>(view.data);
+                for (std::size_t i = 0; i < n; ++i) {
+                    out[i] = brotensor::fp32_to_fp16_bits(src[i]);
+                }
+                return;
+            }
+            case stns::Dtype::BF16: {
+                const auto* src = reinterpret_cast<const std::uint16_t*>(view.data);
+                for (std::size_t i = 0; i < n; ++i) {
+                    out[i] = brotensor::fp32_to_fp16_bits(
+                        brotensor::bf16_bits_to_fp32(src[i]));
+                }
+                return;
+            }
+            default:
+                throw std::runtime_error(
+                    label + " ('" + view.name +
+                    "'): unsupported source dtype for download_host_fp16");
+        }
+    }
+
 private:
     const brotensor::safetensors::TensorView* find_(const std::string& key) const {
         for (const auto* f : shards_) {
@@ -270,6 +321,40 @@ public:
         std::vector<float> perm = detail_::permute_rope_fp32(host, num_heads,
                                                              head_dim, cols);
         dst = brolm::detail::upload_host(perm.data(), rows, cols);
+    }
+
+    void download_host_fp16(const std::string& name, int rows, int cols,
+                            std::vector<std::uint16_t>& out,
+                            const std::string& label) const override {
+        const auto& info = need_(name, label);
+        check_shape_(info, rows, cols, label);
+        const brotensor::Dtype dt = info.dtype;
+        if (dt != brotensor::Dtype::FP16 && dt != brotensor::Dtype::FP32 &&
+            dt != brotensor::Dtype::BF16) {
+            throw std::runtime_error(
+                label + " ('" + info.name +
+                "'): unsupported source dtype for download_host_fp16 "
+                "(quant dtypes cannot be host-FP16-projected without dequant)");
+        }
+        const std::size_t n =
+            static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+        out.resize(n);
+        if (dt == brotensor::Dtype::FP16) {
+            std::memcpy(out.data(), info.data, n * sizeof(std::uint16_t));
+            return;
+        }
+        if (dt == brotensor::Dtype::FP32) {
+            const auto* src = reinterpret_cast<const float*>(info.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                out[i] = brotensor::fp32_to_fp16_bits(src[i]);
+            }
+            return;
+        }
+        // BF16
+        const auto* src = reinterpret_cast<const std::uint16_t*>(info.data);
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i] = brotensor::fp32_to_fp16_bits(brotensor::bf16_bits_to_fp32(src[i]));
+        }
     }
 
 private:
