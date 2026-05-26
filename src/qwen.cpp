@@ -296,14 +296,14 @@ void Qwen3Model::load_weights_impl_(
     const int q_dim  = n_q  * HD;
     const int kv_dim = n_kv * HD;
 
-    src.upload_compute_checked("model.embed_tokens.weight",
+    src.upload_compute_dequant("model.embed_tokens.weight",
                                V, H, embed_tokens_, "embed_tokens.weight");
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        src.upload_compute_checked(p + "input_layernorm.weight",
+        src.upload_compute_dequant(p + "input_layernorm.weight",
                                    H, 1, L.input_ln, "input_layernorm.weight");
 
         src.upload_compute_rope_permuted(p + "self_attn.q_proj.weight",
@@ -324,7 +324,7 @@ void Qwen3Model::load_weights_impl_(
                                          HD, 1, /*num_heads=*/1, HD,
                                          L.k_norm, "k_norm.weight");
 
-        src.upload_compute_checked(p + "post_attention_layernorm.weight",
+        src.upload_compute_dequant(p + "post_attention_layernorm.weight",
                                    H, 1, L.post_attn_ln,
                                    "post_attention_layernorm.weight");
 
@@ -336,7 +336,7 @@ void Qwen3Model::load_weights_impl_(
                                    H, F, L.down_W, "down_proj.weight");
     }
 
-    src.upload_compute_checked("model.norm.weight",
+    src.upload_compute_dequant("model.norm.weight",
                                H, 1, final_norm_, "model.norm.weight");
 
     if (src.has("lm_head.weight")) {
