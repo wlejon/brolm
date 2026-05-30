@@ -43,8 +43,16 @@ public:
     // Load a HF Whisper vocab.json + merges.txt. Every vocab entry of the
     // form "<|...|>" is auto-registered as an atomic special. Throws
     // std::runtime_error on I/O or parse failure.
+    //
+    // Upstream openai/whisper-* checkpoints split the ~1600 "<|...|>" specials
+    // out of vocab.json into a separate added_tokens.json (same {string: id}
+    // shape). Pass its path as `added_tokens_json_path` to merge those entries
+    // into the vocab before the special-token scan, so an UNMODIFIED upstream
+    // checkout tokenizes correctly. Empty (the default) loads vocab.json alone
+    // — the layout produced by the older convert-whisper.py merge step.
     static Tokenizer load(const std::string& vocab_json_path,
-                          const std::string& merges_txt_path);
+                          const std::string& merges_txt_path,
+                          const std::string& added_tokens_json_path = "");
 
     // Build a tokenizer from a Whisper GGUF file's metadata. Reads
     // tokenizer.ggml.{tokens, merges, token_type} the same way the Qwen3

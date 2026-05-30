@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -146,11 +147,28 @@ bool parse_timestamp_seconds(const std::string& tok, double& out) {
 // ─── Tokenizer driver ──────────────────────────────────────────────────────
 
 Tokenizer Tokenizer::load(const std::string& vocab_json_path,
-                          const std::string& merges_txt_path) {
+                          const std::string& merges_txt_path,
+                          const std::string& added_tokens_json_path) {
     Tokenizer t;
     t.vocab_       = bpe::load_vocab_json(vocab_json_path);
     t.merge_ranks_ = bpe::load_merges_txt(merges_txt_path);
     bpe::build_byte_unicode_maps(t.byte_to_unicode_, t.unicode_to_byte_);
+
+    // Upstream Whisper keeps its specials in a separate added_tokens.json (same
+    // {string: id} shape as vocab.json). Merge them in so the "<|...|>" scan
+    // below registers them; entries already in vocab.json are left as-is.
+    // Tolerate a missing file: the converted layout folds these into vocab.json,
+    // so callers can pass the path unconditionally regardless of which layout
+    // they hand us.
+    if (!added_tokens_json_path.empty()) {
+        std::ifstream probe(added_tokens_json_path, std::ios::binary);
+        if (probe.good()) {
+            probe.close();
+            for (const auto& [tok, id] : bpe::load_vocab_json(added_tokens_json_path)) {
+                t.vocab_.emplace(tok, id);
+            }
+        }
+    }
 
     for (const auto& [tok, id] : t.vocab_) {
         t.id_to_token_.emplace(id, tok);
