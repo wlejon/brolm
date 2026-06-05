@@ -20,7 +20,9 @@ multimodal models go through [broimage](https://github.com/wlejon/broimage).
   (LLMs), composed from brotensor ops.
 - **Alignment adapters** — trainable projection/pooling that retargets an
   encoder or LLM's hidden states into a diffusion denoiser's conditioning.
-- **Generation** — sampling and KV-cache for decoder LLMs.
+- **Generation** — sampling (greedy / temperature / top-k / top-p), KV-cache,
+  and the autoregressive generate loop for decoder LLMs, plus chat-template
+  rendering (`<|im_start|>role…<|im_end|>`) on the Qwen3 tokenizer.
 
 ## Components
 
@@ -32,7 +34,7 @@ multimodal models go through [broimage](https://github.com/wlejon/broimage).
 | `brolm/clip_image.h` | CLIP ViT-L/14 vision encoder |
 | `brolm/clip_score.h` | CLIP image/text similarity scoring |
 | `brolm/t5.h` | T5-XXL encoder (encoder-only) |
-| `brolm/qwen_tokenizer.h` | Qwen3 byte-level BPE tokenizer |
+| `brolm/qwen_tokenizer.h` | Qwen3 byte-level BPE tokenizer + `apply_chat_template` |
 | `brolm/whisper_tokenizer.h` | Whisper byte-level BPE tokenizer (GPT-2 family) + language/task/timestamp specials |
 | `brolm/qwen.h` | Qwen3 decoder LLM — GQA, QK-norm, RoPE, SwiGLU, KV-cache |
 | `brolm/qwen_generate.h` | Sampling (greedy / temperature / top-k / top-p) + autoregressive generation |
@@ -83,14 +85,16 @@ brotensor::gguf::File f("weights/Qwen3-0.6B-GGUF/Qwen3-0.6B-BF16.gguf");
 
 auto tok = brolm::qwen::Tokenizer::from_gguf(f);
 auto cfg = brolm::qwen::Qwen3Config::from_gguf(f);
-brolm::qwen::Qwen3 model(cfg);
+brolm::qwen::Qwen3Model model(cfg);
 model.load_weights(f);
 ```
 
 Supported today: Qwen3 (model + tokenizer + config), T5 (model + tokenizer +
 config), Whisper (tokenizer). BF16 weights load on every backend; on-disk
-quants (e.g. Q8_0) are kept in their original dtype and dispatched through
-brotensor's quant-carrier kernels (CUDA-only at the moment).
+quants (Q4_K / Q6_K / Q8_0) are kept in their original dtype and dispatched
+through brotensor's quant-carrier kernels (CUDA-only at the moment). Dense
+tensors whose downstream op is dense-only (embedding lookup, RMSNorm gamma) are
+dequantised to the compute dtype on load.
 
 A helper script pulls the smallest text-only Qwen3 in both BF16 and Q8_0:
 

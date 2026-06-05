@@ -43,9 +43,11 @@ standalone), `BROLM_INSTALL` (default OFF — brolm is consumed via
 `add_subdirectory`, not `find_package`; no package config is generated, by
 design — see the comment in `CMakeLists.txt`).
 
-Tests live in `tests/`, one file per public header. CPU-only tests are
-unconditional; tests gated on real HF checkpoints look for files under
-`weights/` and skip cleanly when absent.
+Tests live in `tests/`, one file per public header. They are plain
+`int main()` executables (manual asserts + nonzero exit on failure — no gtest)
+registered with `add_test`, so `ctest` drives them. CPU-only tests are
+unconditional; tests gated on real HF / GGUF checkpoints look for files under
+`weights/` (or an env-var path override) and skip cleanly when absent.
 
 The ad-hoc CLI driver `tools/run_qwen35_image.cpp` (binary:
 `brolm_run_qwen35_image`) is **not** run by ctest — it's for eyeballing the
@@ -55,8 +57,11 @@ full image → reply pipeline.
 
 ```
 include/brolm/
+  version.h                — library version constants + version_string()
   detail/                  — internal helpers (not part of the public surface)
     byte_level_bpe.h       — shared GPT-2-family BPE core (CLIP, Qwen, Whisper)
+    weights.h              — uniform Source over safetensors + gguf (incl. quant
+                             dequant); model loaders stay container-agnostic
     compute.h, device.h    — backend dispatch glue
     json.h                 — minimal JSON reader for HF config files
   tokenizer.h              — CLIP BPE
@@ -72,8 +77,9 @@ include/brolm/
   alignment_adapter.h
 src/                       — one .cpp per public header (CLIP tokenizer is
                              `tokenizer_clip.cpp` because `tokenizer.h` is the
-                             generic name)
-tests/                     — gtest suite, one file per header
+                             generic name); plus `version.cpp` and
+                             `detail/byte_level_bpe.cpp`
+tests/                     — one `int main()` test per header, run via ctest
 tools/                     — ad-hoc driver binaries
 scripts/                   — shell-only helpers (e.g. weight download)
 weights/                   — real HF checkpoints used by gated tests (gitignored)
@@ -93,7 +99,13 @@ and `tests/CMakeLists.txt`).
   reuse it and add only their pre-tokenization regex and special-token table.
 - **Load HF safetensors directly** — no offline conversion step. Tokenizers
   read `vocab.json` + `merges.txt` (or `tokenizer.json`); models read the
-  sharded safetensors + `config.json` from a directory.
+  sharded safetensors + `config.json` from a directory. `.gguf` checkpoints
+  (llama.cpp format) load through the same model classes via `from_gguf` /
+  `load_weights(gguf::File)`; both containers go through the
+  `brolm::detail::weights::Source` adapter so loaders stay format-agnostic.
+  Supported via GGUF today: Qwen3 (model + tokenizer + config), T5 (model +
+  tokenizer + config), Whisper (tokenizer). On-disk quants (Q4_K / Q6_K / Q8_0)
+  keep their dtype and dispatch through brotensor's CUDA quant kernels.
 - **Numerical parity work in progress.** Qwen3.5-VL passes structural and
   no-NaN checks against the real 0.8B checkpoint; bit-exact parity vs HF
   `transformers` is not yet asserted end-to-end. When touching attention,
