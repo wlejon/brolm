@@ -32,6 +32,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "brolm/detail/byte_level_bpe.h"
+
 namespace brotensor::gguf { class File; }
 
 namespace brolm::qwen {
@@ -120,10 +122,8 @@ private:
     std::unordered_map<int32_t, std::string> id_to_token_;
     // Key: "first\x01second" (\x01 cannot appear in a byte-encoded token).
     std::unordered_map<std::string, int32_t> merge_ranks_;
-    // Special-token string -> id. These are matched verbatim before BPE.
-    std::unordered_map<std::string, int32_t> special_tokens_;
-    // ids that correspond to special tokens (so decode emits them literally).
-    std::unordered_map<int32_t, std::string> special_ids_;
+    // Special tokens matched verbatim before BPE / rendered literally on decode.
+    brolm::detail::bpe::SpecialTokens specials_;
     // Byte (0..255) -> UTF-8 of the GPT-2 byte-level unicode mapping.
     std::string byte_to_unicode_[256];
     // Inverse: GPT-2 unicode codepoint -> original byte, for decode().

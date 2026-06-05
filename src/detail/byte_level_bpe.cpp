@@ -327,6 +327,156 @@ void encode_piece(
     }
 }
 
+// ─── base64 ────────────────────────────────────────────────────────────────
+
+std::string base64_decode(std::string_view in) {
+    auto val = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    // Drop trailing '=' padding; the remaining length determines byte count.
+    std::size_t n = in.size();
+    while (n > 0 && in[n - 1] == '=') --n;
+
+    std::string out;
+    out.reserve(n / 4 * 3 + 3);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        int v = val(static_cast<unsigned char>(in[i]));
+        if (v < 0) {
+            throw std::runtime_error("base64_decode: invalid character");
+        }
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>((acc >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// ─── tiktoken (raw-byte) BPE ───────────────────────────────────────────────
+
+void tiktoken_encode_piece(
+    std::string_view piece,
+    const std::unordered_map<std::string, int32_t>& byte_to_id,
+    std::vector<int32_t>& out) {
+    if (piece.empty()) return;
+
+    // Start from single bytes. Unlike the GPT-2 path there is no unicode
+    // remap — each unit is one raw byte.
+    std::vector<std::string> word;
+    word.reserve(piece.size());
+    for (char c : piece) word.emplace_back(1, c);
+
+    if (word.size() > 1) {
+        while (true) {
+            // Lowest-id mergeable adjacent pair (== lowest BPE rank).
+            int32_t best_id = -1;
+            std::size_t best_i = 0;
+            for (std::size_t i = 0; i + 1 < word.size(); ++i) {
+                auto it = byte_to_id.find(word[i] + word[i + 1]);
+                if (it != byte_to_id.end() &&
+                    (best_id < 0 || it->second < best_id)) {
+                    best_id = it->second;
+                    best_i = i;
+                }
+            }
+            if (best_id < 0) break;
+
+            // Merge every non-overlapping occurrence of the chosen pair.
+            const std::string a = word[best_i];
+            const std::string b = word[best_i + 1];
+            std::vector<std::string> next;
+            next.reserve(word.size());
+            std::size_t i = 0;
+            while (i < word.size()) {
+                if (i + 1 < word.size() && word[i] == a && word[i + 1] == b) {
+                    next.emplace_back(a + b);
+                    i += 2;
+                } else {
+                    next.emplace_back(word[i]);
+                    i += 1;
+                }
+            }
+            word = std::move(next);
+            if (word.size() == 1) break;
+        }
+    }
+
+    for (const auto& u : word) {
+        auto it = byte_to_id.find(u);
+        if (it != byte_to_id.end()) out.push_back(it->second);
+        // A complete tiktoken vocab holds every single byte, so a miss is
+        // impossible for a well-formed vocabulary; drop silently if it happens.
+    }
+}
+
+// ─── Special tokens ────────────────────────────────────────────────────────
+
+void SpecialTokens::add(const std::string& token, int32_t id) {
+    if (token.empty()) return;
+    auto it = by_str_.find(token);
+    if (it != by_str_.end()) {
+        if (it->second == id) return;
+        // Drop the orphaned id->token entry for the previous id.
+        auto bi = by_id_.find(it->second);
+        if (bi != by_id_.end() && bi->second == token) by_id_.erase(bi);
+        it->second = id;
+    } else {
+        by_str_.emplace(token, id);
+        by_first_byte_[static_cast<unsigned char>(token[0])].push_back(token);
+    }
+    by_id_[id] = token;
+}
+
+void SpecialTokens::remove(const std::string& token) {
+    auto it = by_str_.find(token);
+    if (it == by_str_.end()) return;
+    auto bi = by_id_.find(it->second);
+    if (bi != by_id_.end() && bi->second == token) by_id_.erase(bi);
+    auto& bucket = by_first_byte_[static_cast<unsigned char>(token[0])];
+    for (std::size_t i = 0; i < bucket.size(); ++i) {
+        if (bucket[i] == token) { bucket.erase(bucket.begin() + i); break; }
+    }
+    by_str_.erase(it);
+}
+
+std::pair<std::size_t, int32_t> SpecialTokens::match(
+    std::string_view text, std::size_t pos) const {
+    if (pos >= text.size()) return {0, -1};
+    auto bit = by_first_byte_.find(static_cast<unsigned char>(text[pos]));
+    if (bit == by_first_byte_.end()) return {0, -1};
+
+    std::size_t best_len = 0;
+    int32_t best_id = -1;
+    const std::size_t avail = text.size() - pos;
+    for (const auto& tok : bit->second) {
+        if (tok.size() <= best_len || tok.size() > avail) continue;
+        if (std::memcmp(text.data() + pos, tok.data(), tok.size()) == 0) {
+            best_len = tok.size();
+            best_id = by_str_.at(tok);
+        }
+    }
+    return {best_len, best_id};
+}
+
+const std::string* SpecialTokens::token_for_id(int32_t id) const {
+    auto it = by_id_.find(id);
+    return it != by_id_.end() ? &it->second : nullptr;
+}
+
+int32_t SpecialTokens::id_for_token(const std::string& token) const {
+    auto it = by_str_.find(token);
+    return it != by_str_.end() ? it->second : -1;
+}
+
 // ─── ASCII helper ──────────────────────────────────────────────────────────
 
 bool starts_with(std::string_view s, std::size_t i, const char* lit) {

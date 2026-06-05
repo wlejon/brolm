@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace brolm::detail::bpe {
@@ -94,6 +95,103 @@ void encode_piece(
     const std::unordered_map<std::string, int32_t>& merge_ranks,
     bool append_end_of_word,
     std::vector<int32_t>& out);
+
+// ─── base64 ────────────────────────────────────────────────────────────────
+
+// Decode standard base64 (RFC 4648 '+'/'/' alphabet, optional '=' padding)
+// into raw bytes. tiktoken-family vocabularies (Mistral's tekken.json) store
+// each token as base64-encoded raw bytes. Throws std::runtime_error on a
+// malformed input character or length.
+std::string base64_decode(std::string_view in);
+
+// ─── tiktoken (raw-byte) BPE ───────────────────────────────────────────────
+//
+// The tiktoken family (Mistral's Tekken) differs from the GPT-2 family in two
+// ways: it operates on RAW bytes (no build_byte_to_unicode remapping), and it
+// has no explicit merges.txt — the merge order is implied by the vocabulary
+// itself. At each step the adjacent byte-pair whose concatenation has the
+// lowest id in `byte_to_id` is merged; ids are monotonic in BPE rank, so the
+// lowest id is the lowest-rank (earliest-learned) merge.
+
+// Split `piece` into single bytes, BPE-merge to a fixpoint against
+// `byte_to_id` (raw-byte string -> id), then append each resulting piece's id
+// to `out`. Single-byte tokens are assumed present in the vocab (tiktoken
+// vocabularies include all 256 bytes), so every byte sequence is representable.
+void tiktoken_encode_piece(
+    std::string_view piece,
+    const std::unordered_map<std::string, int32_t>& byte_to_id,
+    std::vector<int32_t>& out);
+
+// ─── Special tokens ────────────────────────────────────────────────────────
+
+// Atomic special tokens (<|im_end|>, [INST], <SPECIAL_42>, ...) matched
+// verbatim in the input *before* BPE and emitted as a single id, and rendered
+// literally on decode. Shared by every byte-level-BPE tokenizer in brolm.
+//
+// match() returns the LONGEST registered special that is a prefix of the input
+// at a position, so overlapping specials disambiguate to the longest. A
+// first-byte bucket keeps matching cheap when the input contains few
+// special-leading bytes (the common case) even with Tekken's ~1000 reserved
+// slots registered.
+class SpecialTokens {
+public:
+    // Register `token` with `id`. Re-registering an existing token updates its
+    // id (dropping the now-orphaned id->token entry). `token` need not exist in
+    // any vocab. Empty tokens are ignored.
+    void add(const std::string& token, int32_t id);
+    // Remove `token` if present (both directions).
+    void remove(const std::string& token);
+
+    // Longest special that is a prefix of text[pos..]. Returns {length, id},
+    // or {0, -1} when none matches.
+    std::pair<std::size_t, int32_t> match(std::string_view text,
+                                          std::size_t pos) const;
+
+    // id -> token string, or nullptr if `id` is not a registered special.
+    const std::string* token_for_id(int32_t id) const;
+    // token -> id, or -1 if not registered.
+    int32_t id_for_token(const std::string& token) const;
+
+    std::size_t size() const { return by_str_.size(); }
+
+private:
+    std::unordered_map<std::string, int32_t> by_str_;
+    std::unordered_map<int32_t, std::string> by_id_;
+    // first byte -> tokens starting with it (scanned in match()).
+    std::unordered_map<unsigned char, std::vector<std::string>> by_first_byte_;
+};
+
+// Encode `text` by alternating special-token matching and plain-span BPE: at
+// each position the longest registered special is emitted as its id, and the
+// maximal span between specials is handed to `encode_span`, which appends the
+// span's ids to `out`. `encode_span` is any callable with the signature
+// void(std::string_view span, std::vector<int32_t>& out) — each family supplies
+// its own pre-tokenization + merge there. Header-inline to stay allocation- and
+// indirection-free.
+template <class EncodeSpan>
+void encode_with_specials(std::string_view text,
+                          const SpecialTokens& specials,
+                          EncodeSpan&& encode_span,
+                          std::vector<int32_t>& out) {
+    std::size_t i = 0;
+    std::size_t span_start = 0;
+    while (i < text.size()) {
+        const auto m = specials.match(text, i);
+        if (m.first > 0) {
+            if (i > span_start) {
+                encode_span(text.substr(span_start, i - span_start), out);
+            }
+            out.push_back(m.second);
+            i += m.first;
+            span_start = i;
+        } else {
+            ++i;
+        }
+    }
+    if (text.size() > span_start) {
+        encode_span(text.substr(span_start), out);
+    }
+}
 
 // ─── ASCII char-class helpers (pre-tokenizers reuse these) ─────────────────
 

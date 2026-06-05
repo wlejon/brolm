@@ -143,8 +143,7 @@ Tokenizer Tokenizer::load(const std::string& vocab_json_path,
     for (const auto& s : specials) {
         auto it = t.vocab_.find(s);
         if (it == t.vocab_.end()) continue;
-        t.special_tokens_.emplace(s, it->second);
-        t.special_ids_.emplace(it->second, s);
+        t.specials_.add(s, it->second);
     }
 
     auto lookup = [&](const char* s) -> int {
@@ -220,9 +219,7 @@ Tokenizer Tokenizer::from_gguf(
             tt->array_elem_type == gg::ValueType::I32) {
             for (std::size_t i = 0; i < tt->array.size() && i < tokens.size(); ++i) {
                 if (tt->array[i].scalar.i32 == 3) {
-                    const std::int32_t id = static_cast<std::int32_t>(i);
-                    t.special_tokens_.emplace(tokens[i].str, id);
-                    t.special_ids_.emplace(id, tokens[i].str);
+                    t.specials_.add(tokens[i].str, static_cast<std::int32_t>(i));
                 }
             }
         }
@@ -237,8 +234,7 @@ Tokenizer Tokenizer::from_gguf(
     for (const auto& s : by_name) {
         auto it = t.vocab_.find(s);
         if (it == t.vocab_.end()) continue;
-        t.special_tokens_.emplace(s, it->second);
-        t.special_ids_.emplace(it->second, s);
+        t.specials_.add(s, it->second);
     }
 
     auto lookup = [&](const char* s) -> int {
@@ -252,13 +248,7 @@ Tokenizer Tokenizer::from_gguf(
 }
 
 void Tokenizer::register_special_token(const std::string& token, int32_t id) {
-    auto prev = special_tokens_.find(token);
-    if (prev != special_tokens_.end()) {
-        special_ids_.erase(prev->second);
-        special_tokens_.erase(prev);
-    }
-    special_tokens_.emplace(token, id);
-    special_ids_.emplace(id, token);
+    specials_.add(token, id);
     if (token == "<|endoftext|>")      endoftext_id_ = id;
     else if (token == "<|im_start|>")  im_start_id_  = id;
     else if (token == "<|im_end|>")    im_end_id_    = id;
@@ -276,36 +266,13 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text,
     ids.reserve(text.size());
 
     // Walk the input, splitting out verbatim special-token substrings and
-    // BPE-encoding the spans between them.
-    std::size_t i = 0;
-    std::size_t span_start = 0;
-    while (i < text.size()) {
-        std::size_t best_len = 0;
-        int32_t best_id = -1;
-        for (const auto& [s, id] : special_tokens_) {
-            if (s.size() > best_len &&
-                i + s.size() <= text.size() &&
-                std::memcmp(text.data() + i, s.data(), s.size()) == 0) {
-                best_len = s.size();
-                best_id = id;
-            }
-        }
-        if (best_len > 0) {
-            if (i > span_start) {
-                std::string_view span = text.substr(span_start, i - span_start);
-                for (const auto& p : pre_tokenize(span)) encode_piece_(p, ids);
-            }
-            ids.push_back(best_id);
-            i += best_len;
-            span_start = i;
-        } else {
-            ++i;
-        }
-    }
-    if (text.size() > span_start) {
-        std::string_view span = text.substr(span_start);
-        for (const auto& p : pre_tokenize(span)) encode_piece_(p, ids);
-    }
+    // BPE-encoding the spans between them via GPT-2 pre-tokenization.
+    bpe::encode_with_specials(
+        text, specials_,
+        [this](std::string_view span, std::vector<int32_t>& out) {
+            for (const auto& p : pre_tokenize(span)) encode_piece_(p, out);
+        },
+        ids);
 
     // Qwen3 has no BOS. add_special only appends <|endoftext|> as an EOS hook.
     if (add_special && endoftext_id_ >= 0) {
@@ -330,10 +297,9 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     };
 
     for (int32_t id : ids) {
-        auto sp = special_ids_.find(id);
-        if (sp != special_ids_.end()) {
+        if (const std::string* sp = specials_.token_for_id(id)) {
             flush_encoded();
-            out += sp->second;
+            out += *sp;
             continue;
         }
         auto it = id_to_token_.find(id);
