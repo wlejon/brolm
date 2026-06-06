@@ -109,6 +109,20 @@ public:
     // before any forward.
     void forward(const int32_t* ids, int L, brotensor::Tensor& logits_out);
 
+    // Embedding lookup only: write `out` := (L, hidden_size) input embeddings
+    // for `ids` at the compute dtype. Does NOT touch the KV cache. Used by
+    // multimodal callers that need to splice non-text embeddings (e.g. image
+    // tokens) into the input stream before running forward_embeds.
+    void embed_tokens(const int32_t* ids, int L, brotensor::Tensor& out);
+
+    // Like forward(), but starts from precomputed input embeddings rather than
+    // token ids — `embeds` must be (L, hidden_size) at the compute dtype (e.g.
+    // the output of embed_tokens with selected rows overwritten by image
+    // embeddings). Appends at [cache_len, cache_len + L), writes
+    // `logits_out` := (L, vocab_size), and advances cache_len by L.
+    void forward_embeds(const brotensor::Tensor& embeds, int L,
+                        brotensor::Tensor& logits_out);
+
     const DenseDecoderConfig& config() const { return cfg_; }
 
 private:
@@ -127,6 +141,12 @@ private:
     // of query heads it serves. `src` is (L, n_kv*head_dim); `dst` becomes
     // (L, n_q*head_dim).
     void expand_kv_heads_(const brotensor::Tensor& src, brotensor::Tensor& dst);
+
+    // Run all decoder layers + final norm + lm_head over the residual stream
+    // already populated in h_ (L rows at the compute dtype), writing
+    // `logits_out` := (L, vocab_size) and advancing cache_len by L. Shared by
+    // forward() (h_ from embedding lookup) and forward_embeds() (h_ supplied).
+    void run_layers_(int L, brotensor::Tensor& logits_out);
 
     DenseDecoderConfig cfg_;
 

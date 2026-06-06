@@ -250,6 +250,25 @@ int main() {
             CHECK(max_rel < 1e-4f);
         }
 
+        // ── 3b. embed_tokens + forward_embeds == forward(ids) ─────────────
+        // The multimodal entry point must reproduce the token-id path exactly
+        // when the embeddings are the unmodified token embeddings.
+        {
+            m3::TextModel model(cfg);
+            model.load_weights(file, "");
+            model.allocate_cache(16);
+            bt::Tensor emb;
+            model.embed_tokens(seq.data(), Lseq, emb);
+            CHECK(emb.rows == Lseq);
+            CHECK(emb.cols == cfg.hidden_size);
+            bt::Tensor logits_e;
+            model.forward_embeds(emb, Lseq, logits_e);
+            bt::sync_all();
+            CHECK(model.cache_len() == Lseq);
+            std::vector<float> via_embeds = bdtest::bd_download(logits_e);
+            CHECK(via_embeds == prefill_logits);
+        }
+
         // ── 4. an untied checkpoint that is missing lm_head must error ─────
         {
             Builder nb;

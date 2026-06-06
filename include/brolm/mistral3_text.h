@@ -101,6 +101,20 @@ public:
         core_.forward(ids, L, logits_out);
     }
 
+    // Embedding lookup only: `out` := (L, hidden_size) input embeddings, no KV
+    // cache touched. The VL path uses this to build the input stream before
+    // overwriting [IMG] rows with projector embeddings.
+    void embed_tokens(const int32_t* ids, int L, brotensor::Tensor& out) {
+        core_.embed_tokens(ids, L, out);
+    }
+
+    // Forward from precomputed (L, hidden_size) input embeddings (e.g. text
+    // embeddings with image rows spliced in). Appends at [cache_len, +L).
+    void forward_embeds(const brotensor::Tensor& embeds, int L,
+                        brotensor::Tensor& logits_out) {
+        core_.forward_embeds(embeds, L, logits_out);
+    }
+
     const Mistral3Config::Text& config() const { return cfg_; }
 
 private:

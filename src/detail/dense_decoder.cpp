@@ -180,6 +180,17 @@ void DenseDecoder::expand_kv_heads_(const bt::Tensor& src, bt::Tensor& dst) {
 
 // ─── forward ─────────────────────────────────────────────────────────────────
 
+void DenseDecoder::embed_tokens(const int32_t* ids, int L, bt::Tensor& out) {
+    if (!ids) fail("embed_tokens: ids pointer is null");
+    if (L <= 0) fail("embed_tokens: L must be positive");
+    if (embed_tokens_.size() == 0) fail("embed_tokens: weights not loaded");
+
+    bt::Tensor idx = make_idx_device(ids, L);
+    bt::embedding_lookup_forward(
+        embed_tokens_, static_cast<const int32_t*>(idx.data), L, out);
+    out = out.clone();
+}
+
 void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out) {
     if (!ids) fail("forward: ids pointer is null");
     if (L <= 0) fail("forward: L must be positive");
@@ -189,6 +200,34 @@ void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out) {
         fail("forward: cache_len + L exceeds allocated cache capacity");
     }
 
+    // Embedding lookup -> own a stable residual stream in h_.
+    ids_dev_ = make_idx_device(ids, L);
+    bt::embedding_lookup_forward(
+        embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
+    h_ = h_.clone();
+
+    run_layers_(L, logits_out);
+}
+
+void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
+                                  bt::Tensor& logits_out) {
+    if (L <= 0) fail("forward_embeds: L must be positive");
+    if (embed_tokens_.size() == 0) fail("forward_embeds: weights not loaded");
+    if (max_seq_len_ == 0) fail("forward_embeds: cache not allocated");
+    if (cache_len_ + L > max_seq_len_) {
+        fail("forward_embeds: cache_len + L exceeds allocated cache capacity");
+    }
+    if (embeds.rows != L || embeds.cols != cfg_.hidden_size) {
+        fail("forward_embeds: embeds must be (L, hidden_size)");
+    }
+
+    // Own a stable residual stream in h_ (the layer loop mutates it in place).
+    h_ = embeds.clone();
+
+    run_layers_(L, logits_out);
+}
+
+void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out) {
     const int HD   = cfg_.head_dim;
     const int n_q  = cfg_.num_attention_heads;
     const int n_kv = cfg_.num_key_value_heads;
@@ -211,12 +250,6 @@ void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out) {
         dst.rows = rows;
         dst.cols = num_heads * HD;
     };
-
-    // Embedding lookup -> own a stable residual stream in h_.
-    ids_dev_ = make_idx_device(ids, L);
-    bt::embedding_lookup_forward(
-        embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
-    h_ = h_.clone();
 
     for (Layer& layer : layers_) {
         // ── self-attention sub-layer ──────────────────────────────────────
