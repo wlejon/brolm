@@ -112,6 +112,7 @@ target_sources(brolm PRIVATE
     src/mistral3_vision.cpp
     src/mistral3_projector.cpp
     src/mistral3_preprocessor.cpp
+    src/mistral3_vl.cpp
     src/whisper_tokenizer.cpp
     src/clip.cpp
     src/t5.cpp
