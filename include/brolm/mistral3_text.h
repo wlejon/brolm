@@ -32,11 +32,22 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brotensor::safetensors { class File; }
+namespace brotensor::gguf { class File; }
 
 namespace brolm::mistral3 {
+
+// Translate a HF-style Mistral tensor name (e.g.
+// "model.layers.3.self_attn.q_proj.weight") into the ggml/llama.cpp name used
+// in a Mistral .gguf checkpoint ("blk.3.attn_q.weight"). This is the Qwen3 map
+// minus the q_norm/k_norm entries — Mistral has no QK-norm — and with
+// `lm_head.weight` → `output.weight` for the untied head. Returns an empty
+// string if the name matches no known Mistral text weight. Exposed so callers
+// can build their own gguf-shard pipelines.
+std::string mistral3_hf_to_ggml(std::string_view hf_name);
 
 class TextModel {
 public:
@@ -61,6 +72,15 @@ public:
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "");
+
+    // GGUF overloads. Tensor names follow the ggml/llama.cpp convention
+    // (`token_embd.weight`, `blk.N.attn_q.weight`, `output.weight`, ...); see
+    // mistral3_hf_to_ggml. Quantized weights (Q4_K / Q6_K / Q8_0) keep their
+    // on-disk dtype and dispatch through brotensor's fused-dequant matmuls
+    // (GPU-only today; CPU + quant weights throws at first matmul). Mistral is
+    // untied, so `output.weight` is expected to be present.
+    void load_weights(const brotensor::gguf::File& f);
+    void load_weights(const std::vector<const brotensor::gguf::File*>& shards);
 
     // Allocate the per-layer K/V cache for sequences up to `max_seq_len`
     // tokens. Sized once; resets cache_len to 0.

@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+namespace brotensor::gguf { class File; }
+
 namespace brolm::mistral3 {
 
 struct Mistral3Config {
@@ -85,6 +87,20 @@ struct Mistral3Config {
 
     // Parse from an in-memory JSON document (useful for tests).
     static Mistral3Config from_json_text(const std::string& json_text);
+
+    // Populate the Text section from the metadata of a Mistral .gguf file
+    // (llama.cpp container). llama.cpp prefixes every model-metadata key with
+    // `general.architecture` (e.g. `llama.embedding_length`); this reads that
+    // arch verbatim and uses it as the key prefix, so it works whether the
+    // converter tagged the text model "llama" or "mistral". `head_dim` is read
+    // from `<arch>.attention.key_length` (Mistral 3.1's 128 ≠ hidden/heads, so
+    // it cannot be derived). `vocab_size` comes from the embedded tokenizer's
+    // token list; `tie_word_embeddings` is inferred from the presence of an
+    // `output.weight` tensor (absent = tied). The Vision section and top-level
+    // glue keep their defaults (the text .gguf carries no vision config — that
+    // lives in the separate mmproj file). Throws std::runtime_error on missing
+    // required metadata.
+    static Mistral3Config from_gguf(const brotensor::gguf::File& f);
 
     // Validate cross-field invariants (positive dims, GQA divisibility, even
     // head_dim). Called by both loaders; throws on inconsistency.
