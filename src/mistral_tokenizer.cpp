@@ -233,6 +233,35 @@ void parse_config(Reader& r, ParsedTekken& t) {
     r.expect('}');
 }
 
+// Canonical Tekken v7 special-token table, positions = ids. Mistral's
+// tekken.json (e.g. Mistral-Small-3.1) omits the special_tokens list entirely —
+// the table is carried out-of-band (mistral-common hardcodes it; the HF export
+// mirrors it in tokenizer_config.json's added_tokens_decoder). We use this when
+// the file provides no special_tokens; the remaining slots up to
+// num_special_tokens are padded with "<SPECIAL_n>" placeholders.
+const char* const kDefaultSpecials[] = {
+    "<unk>",            // 0
+    "<s>",              // 1
+    "</s>",             // 2
+    "[INST]",           // 3
+    "[/INST]",          // 4
+    "[AVAILABLE_TOOLS]",  // 5
+    "[/AVAILABLE_TOOLS]", // 6
+    "[TOOL_RESULTS]",   // 7
+    "[/TOOL_RESULTS]",  // 8
+    "[TOOL_CALLS]",     // 9
+    "[IMG]",            // 10
+    "<pad>",            // 11
+    "[IMG_BREAK]",      // 12
+    "[IMG_END]",        // 13
+    "[PREFIX]",         // 14
+    "[MIDDLE]",         // 15
+    "[SUFFIX]",         // 16
+    "[SYSTEM_PROMPT]",  // 17
+    "[/SYSTEM_PROMPT]", // 18
+    "[TOOL_CONTENT]",   // 19
+};
+
 ParsedTekken parse_tekken(const std::string& text) {
     Reader r{text.data(), text.data() + text.size()};
     ParsedTekken t;
@@ -313,15 +342,11 @@ std::vector<std::string> pre_tokenize(std::string_view text) {
         }
 
         if (bpe::is_ascii_digit(c)) {
-            // Digit groups of up to three (cl100k \p{N}{1,3}). No folded space:
-            // a space before a digit was emitted standalone above, so start==i.
-            std::size_t j = i;
-            int n = 0;
-            while (j < text.size() &&
-                   bpe::is_ascii_digit(static_cast<unsigned char>(text[j])) &&
-                   n < 3) { ++j; ++n; }
-            pieces.emplace_back(text.substr(start, j - start));
-            i = j;
+            // Tekken splits digits individually — its config pattern uses \p{N}
+            // (exactly one), not the cl100k \p{N}{1,3}. A space before a digit
+            // is never folded (see above), so start == i here.
+            pieces.emplace_back(text.substr(i, 1));
+            ++i;
             continue;
         }
 
@@ -397,9 +422,17 @@ Tokenizer Tokenizer::load(const std::string& tekken_json_path) {
         t.id_to_bytes_.emplace(id, std::move(e.bytes));
     }
 
-    // Special tokens occupy ids [0, num_special_tokens). Register the ones the
-    // file declares, then pad the remaining slots with "<SPECIAL_n>" so every
-    // id in the reserved range maps (mirrors mistral-common's filler scheme).
+    // Special tokens occupy ids [0, num_special_tokens). Newer tekken.json files
+    // list them; Mistral's omit the list, so fall back to the canonical Tekken
+    // table. Either way, register what we have, then pad the remaining slots
+    // with "<SPECIAL_n>" so every id in the reserved range maps.
+    if (parsed.specials.empty()) {
+        const int n = static_cast<int>(sizeof(kDefaultSpecials) /
+                                       sizeof(kDefaultSpecials[0]));
+        for (int i = 0; i < n && i < t.num_special_tokens_; ++i) {
+            parsed.specials.emplace_back(i, kDefaultSpecials[i]);
+        }
+    }
     std::vector<bool> filled(static_cast<std::size_t>(t.num_special_tokens_), false);
     for (auto& [rank, tok] : parsed.specials) {
         if (rank < 0 || rank >= t.num_special_tokens_) continue;

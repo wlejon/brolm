@@ -60,7 +60,7 @@ static int byte_id(int b) { return b + NSPECIAL; }
 // of merged tokens, a small reserved special-token block, and a few unknown /
 // nested keys to exercise the streaming reader's skip paths. Ranks:
 //   single bytes : rank == byte value (0..255)
-//   "hi"=256 "ca"=257 "cat"=258 " hi"=259 "12"=260 "123"=261 "1234"=262
+//   "hi"=256 "ca"=257 "cat"=258 " hi"=259
 // Crucially, no "at"/" c"/" h" merge exists, so each cascade is deterministic.
 static void write_fixture(const std::filesystem::path& path) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -81,8 +81,8 @@ static void write_fixture(const std::filesystem::path& path) {
     f << "{";
     // config first — exercises key order independence (vocab parsed after).
     f << "\"type\":\"Tekken\",\"version\":7,";
-    f << "\"config\":{\"pattern\":\"[unused approx]\",\"num_vocab_tokens\":273,"
-         "\"default_vocab_size\":273,\"default_num_special_tokens\":" << NSPECIAL
+    f << "\"config\":{\"pattern\":\"[unused approx]\",\"num_vocab_tokens\":270,"
+         "\"default_vocab_size\":270,\"default_num_special_tokens\":" << NSPECIAL
       << ",\"version\":\"v7\"},";
     // an unknown nested object to skip.
     f << "\"image\":{\"image_token\":\"[IMG]\",\"sizes\":[14,14,2]},";
@@ -95,9 +95,6 @@ static void write_fixture(const std::filesystem::path& path) {
         vtok("ca", 257, first);
         vtok("cat", 258, first);
         vtok(" hi", 259, first);            // space + h + i
-        vtok("12", 260, first);
-        vtok("123", 261, first);
-        vtok("1234", 262, first);
     }
     f << "],";
 
@@ -127,8 +124,8 @@ static void test_synthetic() {
 
     // ── id math ──
     CHECK(tok.num_special_tokens() == NSPECIAL);
-    CHECK(tok.vocab_size() == 273);
-    CHECK(tok.vocab_count() == 263);        // 256 bytes + 7 merged
+    CHECK(tok.vocab_size() == 270);
+    CHECK(tok.vocab_count() == 260);        // 256 bytes + 4 merged
     CHECK(tok.special_count() == 10);       // 8 explicit + 2 fillers
 
     // ── named special ids ──
@@ -168,13 +165,14 @@ static void test_synthetic() {
         CHECK(ids[2] == 258 + NSPECIAL);    // cat
     }
 
-    // Digit groups cap at three: "1234" -> "123" + "4", so the (present) "1234"
-    // token is never formed.
+    // Digits split individually (Tekken's \p{N}): "1234" -> four byte tokens.
     {
         auto ids = tok.encode("1234");
-        CHECK(ids.size() == 2);
-        CHECK(ids[0] == 261 + NSPECIAL);    // 123
-        CHECK(ids[1] == byte_id('4'));
+        CHECK(ids.size() == 4);
+        CHECK(ids[0] == byte_id('1'));
+        CHECK(ids[1] == byte_id('2'));
+        CHECK(ids[2] == byte_id('3'));
+        CHECK(ids[3] == byte_id('4'));
     }
 
     // Special token embedded in text is emitted atomically.
@@ -229,6 +227,59 @@ static void test_synthetic() {
     std::filesystem::remove(path, ec);
 }
 
+// A tekken.json with NO special_tokens list — as Mistral's real checkpoints
+// ship. The loader must fall back to the canonical Tekken v7 table.
+static void test_default_specials() {
+    constexpr int N2 = 32;
+    auto tmp = std::filesystem::temp_directory_path();
+    auto path = tmp / "brolm_tekken_nospecials.json";
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "{\"config\":{\"default_num_special_tokens\":" << N2
+          << ",\"default_vocab_size\":" << (N2 + 256) << ",\"version\":\"v7\"},";
+        f << "\"vocab\":[";
+        bool first = true;
+        for (int b = 0; b < 256; ++b) {
+            if (!first) f << ",";
+            first = false;
+            f << "{\"rank\":" << b << ",\"token_bytes\":\""
+              << b64(std::string(1, static_cast<char>(b))) << "\"}";
+        }
+        f << "]}";   // no "special_tokens" key
+    }
+
+    auto tok = mistral::Tokenizer::load(path.string());
+
+    CHECK(tok.num_special_tokens() == N2);
+    CHECK(tok.special_count() == N2);
+    CHECK(tok.vocab_count() == 256);
+
+    // Canonical Tekken v7 ids resolve from the built-in default table.
+    CHECK(tok.unk_id() == 0);
+    CHECK(tok.bos_id() == 1);
+    CHECK(tok.eos_id() == 2);
+    CHECK(tok.inst_id() == 3);
+    CHECK(tok.inst_end_id() == 4);
+    CHECK(tok.special_id("[TOOL_CALLS]") == 9);
+    CHECK(tok.img_id() == 10);
+    CHECK(tok.pad_id() == 11);
+    CHECK(tok.img_break_id() == 12);
+    CHECK(tok.img_end_id() == 13);
+    CHECK(tok.special_id("[SYSTEM_PROMPT]") == 17);
+    CHECK(tok.special_id("[TOOL_CONTENT]") == 19);
+    // Slots past the named table are <SPECIAL_n> fillers.
+    CHECK(tok.special_id("<SPECIAL_20>") == 20);
+    CHECK(tok.special_id("<SPECIAL_31>") == 31);
+
+    CHECK(tok.decode({1}) == "<s>");
+    CHECK(tok.decode({3}) == "[INST]");
+    { auto ids = tok.encode("[INST]"); CHECK(ids.size() == 1 && ids[0] == 3); }
+    { auto ids = tok.encode("hi", true); CHECK(!ids.empty() && ids.front() == 1); }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 // Real-checkpoint smoke test, gated on BROLM_MISTRAL_DIR (skips when absent).
 static void test_real_checkpoint() {
     const char* dir = std::getenv("BROLM_MISTRAL_DIR");
@@ -273,6 +324,7 @@ static void test_real_checkpoint() {
 
 int main() {
     test_synthetic();
+    test_default_specials();
     test_real_checkpoint();
 
     if (g_failures == 0) std::printf("mistral_tokenizer: OK\n");

@@ -17,16 +17,20 @@
 //     "<SPECIAL_n>" placeholders so every id in [0, num_special_tokens) maps.
 //
 // Special tokens (<s>, </s>, [INST], [/INST], [SYSTEM_PROMPT], [IMG], ...) are
-// read from tekken.json's special_tokens list, matched verbatim before BPE,
-// and rendered literally on decode — the shared brolm::detail::bpe scaffolding
-// (SpecialTokens + encode_with_specials) does this, exactly as for qwen.
+// matched verbatim before BPE and rendered literally on decode — the shared
+// brolm::detail::bpe scaffolding (SpecialTokens + encode_with_specials) does
+// this, exactly as for qwen. Newer tekken.json files carry a special_tokens
+// list; Mistral's (e.g. Mistral-Small-3.1) omit it, so the loader falls back to
+// the canonical Tekken v7 table (ids 0..19: <unk> <s> </s> [INST] ... ).
 //
-// Pre-tokenization is an ASCII-focused approximation of the Tekken
-// (cl100k-family) split: contraction splits, letter runs, digit groups of up
-// to three, punctuation runs, and a single leading space folded into a
-// following letter/punctuation run (but not a digit run). This matches
-// mistral-common on English and code; full Unicode-property pre-tokenization
-// (Tekken is multilingual) is out of scope here, as it is for qwen.
+// Pre-tokenization is an ASCII-focused approximation of the Tekken split (the
+// config.pattern regex): contraction splits, letter runs, single digits (the
+// pattern uses \p{N}, one digit per token), punctuation runs, and a single
+// leading space folded into a following letter/punctuation run (but not a digit
+// run). This matches mistral-common on lowercase English and code; the regex's
+// case-aware letter splitting and full Unicode-property classes (Tekken is
+// multilingual) are out of scope here, as they are for qwen. Tokenization stays
+// lossless and round-trips regardless.
 
 #include <cstdint>
 #include <string>
