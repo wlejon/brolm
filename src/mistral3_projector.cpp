@@ -2,6 +2,8 @@
 
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/weights.h"
+#include "brotensor/gguf.h"
 #include "brotensor/ops.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -11,25 +13,19 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brolm::mistral3 {
 
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
-
-using st::upload_compute_checked;
+namespace wt = ::brolm::detail::weights;
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("mistral3::MultiModalProjector: " + msg);
-}
-
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("mistral3::MultiModalProjector: missing tensor '" + key + "'");
-    return *v;
 }
 
 // Download a compute-dtype tensor to host FP32. (Same helper as the vision
@@ -111,22 +107,42 @@ MultiModalProjector::MultiModalProjector(const Mistral3Config& cfg)
 
 MultiModalProjector::~MultiModalProjector() = default;
 
+// ─── HF → ggml (mmproj/clip) tensor-name map ────────────────────────────────
+
+std::string mistral3_projector_hf_to_ggml(std::string_view name) {
+    if (name == "norm.weight")                          return "mm.input_norm.weight";
+    if (name == "patch_merger.merging_layer.weight")    return "mm.patch_merger.weight";
+    if (name == "linear_1.weight")                      return "mm.1.weight";
+    if (name == "linear_2.weight")                      return "mm.2.weight";
+    return {};
+}
+
 // ─── load_weights ──────────────────────────────────────────────────────────
 
-void MultiModalProjector::load_weights(const st::File& f, const std::string& prefix) {
+void MultiModalProjector::load_from_(const wt::Source& src) {
     const int d  = vision_hidden_;
     const int T  = text_hidden_;
     const int dm = d * merge_ * merge_;
 
-    upload_compute_checked(need(f, prefix + "norm.weight"), d, 1, norm_g_, "norm.weight");
-    upload_compute_checked(need(f, prefix + "patch_merger.merging_layer.weight"),
-                           d, dm, merge_W_, "patch_merger.merging_layer.weight");
-    upload_compute_checked(need(f, prefix + "linear_1.weight"), T, d, lin1_W_, "linear_1.weight");
-    upload_compute_checked(need(f, prefix + "linear_2.weight"), T, T, lin2_W_, "linear_2.weight");
+    // norm RMSNorm gamma is a dense-only op operand.
+    src.upload_compute_dequant("norm.weight", d, 1, norm_g_, "norm.weight");
+    src.upload_compute_checked("patch_merger.merging_layer.weight", d, dm, merge_W_, "patch_merger.merging_layer.weight");
+    src.upload_compute_checked("linear_1.weight", T, d, lin1_W_, "linear_1.weight");
+    src.upload_compute_checked("linear_2.weight", T, T, lin2_W_, "linear_2.weight");
     if (has_bias_) {
-        upload_compute_checked(need(f, prefix + "linear_1.bias"), T, 1, lin1_b_, "linear_1.bias");
-        upload_compute_checked(need(f, prefix + "linear_2.bias"), T, 1, lin2_b_, "linear_2.bias");
+        src.upload_compute_dequant("linear_1.bias", T, 1, lin1_b_, "linear_1.bias");
+        src.upload_compute_dequant("linear_2.bias", T, 1, lin2_b_, "linear_2.bias");
     }
+}
+
+void MultiModalProjector::load_weights(const st::File& f, const std::string& prefix) {
+    wt::SafetensorsSource src({&f}, prefix);
+    load_from_(src);
+}
+
+void MultiModalProjector::load_weights(const bt::gguf::File& f) {
+    wt::GgufSource src({&f}, [](std::string_view n) { return mistral3_projector_hf_to_ggml(n); });
+    load_from_(src);
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────

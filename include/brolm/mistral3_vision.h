@@ -40,11 +40,21 @@
 #include "brotensor/tensor.h"
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brotensor::safetensors { class File; }
+namespace brotensor::gguf { class File; }
+namespace brolm::detail::weights { class Source; }
 
 namespace brolm::mistral3 {
+
+// Translate a relative Pixtral vision tensor name (as used internally, e.g.
+// "transformer.layers.3.attention.q_proj.weight") into the ggml name in a
+// llama.cpp mmproj/clip gguf ("v.blk.3.attn_q.weight"). Returns "" if the name
+// matches no known vision-tower weight. Exposed for callers building their own
+// gguf pipelines.
+std::string mistral3_vision_hf_to_ggml(std::string_view name);
 
 class VisionTower {
 public:
@@ -65,6 +75,12 @@ public:
     // missing key or shape/dtype mismatch.
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "vision_tower.");
+
+    // Load from a llama.cpp mmproj/clip gguf (the file Mistral 3.1 ships beside
+    // the text gguf). Tensor names follow the ggml `v.*` convention; see
+    // mistral3_vision_hf_to_ggml. F16/F32 dense weights land at the compute
+    // dtype; an all-F16 mmproj therefore loads (and the tower runs) on CPU too.
+    void load_weights(const brotensor::gguf::File& f);
 
     // Forward pass for a single image.
     //
@@ -110,6 +126,11 @@ private:
 
     // Host-side cos/sin tables for the 2-D rotary, (N, head_dim) each.
     std::vector<float> cos_host_, sin_host_;
+
+    // Shared loader over the container-agnostic weights Source (safetensors or
+    // mmproj gguf). Names are relative (no `vision_tower.` prefix); the Source
+    // applies the prefix / ggml mapping.
+    void load_from_(const brolm::detail::weights::Source& src);
 
     // Build the per-patch (N, head_dim) cos/sin tables for this image's grid
     // following PixtralRotaryEmbedding: the h-position drives the first quarter

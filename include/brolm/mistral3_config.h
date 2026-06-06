@@ -69,6 +69,10 @@ struct Mistral3Config {
         int   patch_size           = 14;
         int   image_size           = 1540;  // longest supported square side
         float rope_theta           = 1.0e4f;
+        // Pixtral RMSNorm epsilon. Not in the HF config.json (PixtralRMSNorm is
+        // instantiated with a fixed eps); the mmproj gguf carries it as
+        // clip.vision.attention.layer_norm_epsilon. Default matches Mistral.
+        float rms_norm_eps         = 1.0e-5f;
         // hidden_act is "silu" (gated SwiGLU) in every Mistral 3.1 release;
         // hard-coded in the eventual vision-block forward.
     } vision;
@@ -101,6 +105,15 @@ struct Mistral3Config {
     // lives in the separate mmproj file). Throws std::runtime_error on missing
     // required metadata.
     static Mistral3Config from_gguf(const brotensor::gguf::File& f);
+
+    // Overwrite the Vision section + spatial_merge_size from a llama.cpp mmproj
+    // (clip) gguf — the separate vision-tower/projector file Mistral 3.1 ships
+    // alongside the text gguf. Reads the clip.vision.* metadata
+    // (embedding_length, block_count, attention.head_count → head_dim,
+    // feed_forward_length, patch_size, image_size, spatial_merge_size,
+    // attention.layer_norm_epsilon). The text section is untouched (it comes
+    // from the text gguf / config.json). Throws on missing required metadata.
+    void merge_vision_from_mmproj_gguf(const brotensor::gguf::File& f);
 
     // Validate cross-field invariants (positive dims, GQA divisibility, even
     // head_dim). Called by both loaders; throws on inconsistency.

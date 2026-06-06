@@ -30,10 +30,19 @@
 #include "brotensor/tensor.h"
 
 #include <string>
+#include <string_view>
 
 namespace brotensor::safetensors { class File; }
+namespace brotensor::gguf { class File; }
+namespace brolm::detail::weights { class Source; }
 
 namespace brolm::mistral3 {
+
+// Translate a relative projector tensor name ("linear_1.weight",
+// "patch_merger.merging_layer.weight", ...) into the ggml name in a llama.cpp
+// mmproj/clip gguf ("mm.1.weight", "mm.patch_merger.weight", ...). Returns ""
+// for an unknown name.
+std::string mistral3_projector_hf_to_ggml(std::string_view name);
 
 class MultiModalProjector {
 public:
@@ -57,6 +66,10 @@ public:
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "multi_modal_projector.");
 
+    // Load from a llama.cpp mmproj/clip gguf (the `mm.*` tensors). See
+    // mistral3_projector_hf_to_ggml. The mmproj is bias-free.
+    void load_weights(const brotensor::gguf::File& f);
+
     // Project one image's patch features.
     //   features : (num_patches, vision_hidden) at the compute dtype, in the
     //              tower's row-major (h, w) patch order. num_patches must equal
@@ -67,6 +80,9 @@ public:
                  brotensor::Tensor& out);
 
 private:
+    // Shared loader over the weights Source (safetensors or mmproj gguf).
+    void load_from_(const brolm::detail::weights::Source& src);
+
     int vision_hidden_;
     int text_hidden_;
     int merge_;

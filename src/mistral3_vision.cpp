@@ -2,6 +2,8 @@
 
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/weights.h"
+#include "brotensor/gguf.h"
 #include "brotensor/ops.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -13,6 +15,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,26 +23,12 @@ namespace brolm::mistral3 {
 
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
-
-using st::upload_compute_checked;
-
-// Pixtral RMSNorm epsilon. HF instantiates PixtralRMSNorm at the vision tower
-// with eps=1e-5 (the Mistral-family default); not carried as a config field.
-// TODO: confirm against the real vision checkpoint when the full safetensors
-// is downloaded — a wrong eps only perturbs real-weights parity, not the
-// structural tests.
-namespace { constexpr float kVisionRmsEps = 1.0e-5f; }
+namespace wt = ::brolm::detail::weights;
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("mistral3::VisionTower: " + msg);
-}
-
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("mistral3::VisionTower: missing tensor '" + key + "'");
-    return *v;
 }
 
 // Download a compute-dtype tensor to a host FP32 vector. The tower's RoPE and
@@ -132,36 +121,83 @@ VisionTower::VisionTower(const Mistral3Config::Vision& cfg) : cfg_(cfg) {
 
 VisionTower::~VisionTower() = default;
 
+namespace {
+bool starts_with(std::string_view s, std::string_view p) {
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+}  // namespace
+
+// ─── HF → ggml (mmproj/clip) tensor-name map ────────────────────────────────
+
+std::string mistral3_vision_hf_to_ggml(std::string_view name) {
+    if (name == "patch_conv.weight") return "v.patch_embd.weight";
+    if (name == "ln_pre.weight")     return "v.pre_ln.weight";
+
+    constexpr std::string_view kPrefix = "transformer.layers.";
+    if (!starts_with(name, kPrefix)) return {};
+    const auto dot = name.find('.', kPrefix.size());
+    if (dot == std::string_view::npos) return {};
+    const std::string_view idx = name.substr(kPrefix.size(), dot - kPrefix.size());
+    const std::string_view tail = name.substr(dot + 1);
+
+    auto blk = [&](std::string_view suffix) -> std::string {
+        std::string out = "v.blk.";
+        out.append(idx);
+        out.push_back('.');
+        out.append(suffix);
+        return out;
+    };
+
+    if (tail == "attention.q_proj.weight")        return blk("attn_q.weight");
+    if (tail == "attention.k_proj.weight")        return blk("attn_k.weight");
+    if (tail == "attention.v_proj.weight")        return blk("attn_v.weight");
+    if (tail == "attention.o_proj.weight")        return blk("attn_out.weight");
+    if (tail == "attention_norm.weight")          return blk("ln1.weight");
+    if (tail == "ffn_norm.weight")                return blk("ln2.weight");
+    if (tail == "feed_forward.gate_proj.weight")  return blk("ffn_gate.weight");
+    if (tail == "feed_forward.up_proj.weight")    return blk("ffn_up.weight");
+    if (tail == "feed_forward.down_proj.weight")  return blk("ffn_down.weight");
+    return {};
+}
+
 // ─── load_weights ──────────────────────────────────────────────────────────
 
-void VisionTower::load_weights(const st::File& f, const std::string& prefix) {
+void VisionTower::load_from_(const wt::Source& src) {
     const int D = cfg_.hidden_size;
     const int F = cfg_.intermediate_size;
     const int C = cfg_.num_channels;
     const int P = cfg_.patch_size;
 
-    // patch_conv : Conv2d(C, D, P, P) on disk shape (D, C, P, P); flattened to
-    // (D, C*P*P). Bias-free.
-    upload_compute_checked(need(f, prefix + "patch_conv.weight"),
-                           D, C * P * P, patch_W_, "patch_conv.weight");
-    upload_compute_checked(need(f, prefix + "ln_pre.weight"),
-                           D, 1, ln_pre_g_, "ln_pre.weight");
+    // patch_conv : Conv2d(C, D, P, P) flattened to (D, C*P*P), bias-free.
+    src.upload_compute_checked("patch_conv.weight", D, C * P * P, patch_W_, "patch_conv.weight");
+    // ln_pre RMSNorm gamma is a dense-only op operand (no quant kernel).
+    src.upload_compute_dequant("ln_pre.weight", D, 1, ln_pre_g_, "ln_pre.weight");
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-        const std::string p = prefix + "transformer.layers." + std::to_string(i) + ".";
+        const std::string p = "transformer.layers." + std::to_string(i) + ".";
         Block& B = blocks_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(f, p + "attention_norm.weight"), D, 1, B.attn_norm_g, "attention_norm.weight");
-        upload_compute_checked(need(f, p + "attention.q_proj.weight"), D, D, B.q_W, "attention.q_proj.weight");
-        upload_compute_checked(need(f, p + "attention.k_proj.weight"), D, D, B.k_W, "attention.k_proj.weight");
-        upload_compute_checked(need(f, p + "attention.v_proj.weight"), D, D, B.v_W, "attention.v_proj.weight");
-        upload_compute_checked(need(f, p + "attention.o_proj.weight"), D, D, B.o_W, "attention.o_proj.weight");
+        src.upload_compute_dequant(p + "attention_norm.weight", D, 1, B.attn_norm_g, "attention_norm.weight");
+        src.upload_compute_checked(p + "attention.q_proj.weight", D, D, B.q_W, "attention.q_proj.weight");
+        src.upload_compute_checked(p + "attention.k_proj.weight", D, D, B.k_W, "attention.k_proj.weight");
+        src.upload_compute_checked(p + "attention.v_proj.weight", D, D, B.v_W, "attention.v_proj.weight");
+        src.upload_compute_checked(p + "attention.o_proj.weight", D, D, B.o_W, "attention.o_proj.weight");
 
-        upload_compute_checked(need(f, p + "ffn_norm.weight"), D, 1, B.ffn_norm_g, "ffn_norm.weight");
-        upload_compute_checked(need(f, p + "feed_forward.gate_proj.weight"), F, D, B.gate_W, "feed_forward.gate_proj.weight");
-        upload_compute_checked(need(f, p + "feed_forward.up_proj.weight"),   F, D, B.up_W,   "feed_forward.up_proj.weight");
-        upload_compute_checked(need(f, p + "feed_forward.down_proj.weight"), D, F, B.down_W, "feed_forward.down_proj.weight");
+        src.upload_compute_dequant(p + "ffn_norm.weight", D, 1, B.ffn_norm_g, "ffn_norm.weight");
+        src.upload_compute_checked(p + "feed_forward.gate_proj.weight", F, D, B.gate_W, "feed_forward.gate_proj.weight");
+        src.upload_compute_checked(p + "feed_forward.up_proj.weight",   F, D, B.up_W,   "feed_forward.up_proj.weight");
+        src.upload_compute_checked(p + "feed_forward.down_proj.weight", D, F, B.down_W, "feed_forward.down_proj.weight");
     }
+}
+
+void VisionTower::load_weights(const st::File& f, const std::string& prefix) {
+    wt::SafetensorsSource src({&f}, prefix);
+    load_from_(src);
+}
+
+void VisionTower::load_weights(const bt::gguf::File& f) {
+    wt::GgufSource src({&f}, [](std::string_view n) { return mistral3_vision_hf_to_ggml(n); });
+    load_from_(src);
 }
 
 // ─── rotary tables (PixtralRotaryEmbedding) ─────────────────────────────────
@@ -310,7 +346,7 @@ void VisionTower::forward(const bt::Tensor& patches, int grid_h, int grid_w,
     detail::linear_batched(patch_W_, /*bias=*/nullptr, patches, x_);
 
     // ln_pre RMSNorm on the patch embeddings, in place via a swap.
-    bt::rms_norm_forward(x_, ln_pre_g_, kVisionRmsEps, xn_);
+    bt::rms_norm_forward(x_, ln_pre_g_, cfg_.rms_norm_eps, xn_);
     std::swap(x_, xn_);
 
     // Rotary tables for this image's grid (shared across all blocks).
@@ -318,7 +354,7 @@ void VisionTower::forward(const bt::Tensor& patches, int grid_h, int grid_w,
 
     for (auto& B : blocks_) {
         // ── attention sub-block ──────────────────────────────────────────
-        bt::rms_norm_forward(x_, B.attn_norm_g, kVisionRmsEps, xn_);
+        bt::rms_norm_forward(x_, B.attn_norm_g, cfg_.rms_norm_eps, xn_);
         detail::linear_batched(B.q_W, /*bias=*/nullptr, xn_, q_);
         detail::linear_batched(B.k_W, /*bias=*/nullptr, xn_, k_);
         detail::linear_batched(B.v_W, /*bias=*/nullptr, xn_, v_);
@@ -331,7 +367,7 @@ void VisionTower::forward(const bt::Tensor& patches, int grid_h, int grid_w,
         bt::add_inplace(x_, proj_out_);
 
         // ── SiLU-gated MLP sub-block ─────────────────────────────────────
-        bt::rms_norm_forward(x_, B.ffn_norm_g, kVisionRmsEps, xn_);
+        bt::rms_norm_forward(x_, B.ffn_norm_g, cfg_.rms_norm_eps, xn_);
         detail::linear_batched(B.gate_W, /*bias=*/nullptr, xn_, gate_);
         detail::linear_batched(B.up_W,   /*bias=*/nullptr, xn_, up_);
 

@@ -190,6 +190,35 @@ Mistral3Config Mistral3Config::from_gguf(const gg::File& f) {
     return cfg;
 }
 
+void Mistral3Config::merge_vision_from_mmproj_gguf(const gg::File& f) {
+    // llama.cpp's clip/mmproj container keys the vision metadata under
+    // `clip.vision.*` (not the general.architecture prefix the text gguf uses).
+    Vision& v = vision;
+    v.hidden_size = meta_as_int(
+        need_meta(f, "clip.vision.embedding_length"), "clip.vision.embedding_length");
+    v.num_hidden_layers = meta_as_int(
+        need_meta(f, "clip.vision.block_count"), "clip.vision.block_count");
+    v.num_attention_heads = meta_as_int(
+        need_meta(f, "clip.vision.attention.head_count"), "clip.vision.attention.head_count");
+    v.intermediate_size = meta_as_int(
+        need_meta(f, "clip.vision.feed_forward_length"), "clip.vision.feed_forward_length");
+    // Pixtral head_dim = hidden / heads (not carried separately).
+    v.head_dim = v.hidden_size / v.num_attention_heads;
+    if (const auto* p = f.find_meta("clip.vision.patch_size")) {
+        v.patch_size = meta_as_int(*p, "clip.vision.patch_size");
+    }
+    if (const auto* s = f.find_meta("clip.vision.image_size")) {
+        v.image_size = meta_as_int(*s, "clip.vision.image_size");
+    }
+    if (const auto* e = f.find_meta("clip.vision.attention.layer_norm_epsilon")) {
+        v.rms_norm_eps = meta_as_f32(*e, "clip.vision.attention.layer_norm_epsilon");
+    }
+    if (const auto* m = f.find_meta("clip.vision.spatial_merge_size")) {
+        spatial_merge_size = meta_as_int(*m, "clip.vision.spatial_merge_size");
+    }
+    // rope_theta is not in the clip metadata; Pixtral uses 1e4 (the default).
+}
+
 void Mistral3Config::validate() const {
     if (text.hidden_size <= 0 || text.intermediate_size <= 0 ||
         text.num_hidden_layers <= 0 || text.vocab_size <= 0 ||
