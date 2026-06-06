@@ -280,6 +280,76 @@ static void test_default_specials() {
     std::filesystem::remove(path, ec);
 }
 
+// Pin the exact Tekken pre-token boundaries. Each spanning token below straddles
+// a boundary the pattern forbids, so it can only form if pre-tokenization is
+// wrong — making these assertions a tight parity check on the boundary rules.
+static void test_pretokenization() {
+    constexpr int NP = 4;
+    auto bid = [](int b) { return b + NP; };
+    auto tmp = std::filesystem::temp_directory_path();
+    auto path = tmp / "brolm_tekken_pretok.json";
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "{\"config\":{\"default_num_special_tokens\":" << NP
+          << ",\"default_vocab_size\":" << (NP + 261) << ",\"version\":\"v7\"},";
+        f << "\"vocab\":[";
+        bool first = true;
+        auto v = [&](const std::string& raw, int rank) {
+            if (!first) f << ","; first = false;
+            f << "{\"rank\":" << rank << ",\"token_bytes\":\"" << b64(raw) << "\"}";
+        };
+        for (int b = 0; b < 256; ++b) v(std::string(1, static_cast<char>(b)), b);
+        v("aB", 256);   // straddles a lower->upper case boundary
+        v("'t", 257);   // apostrophe-lead + letter: a legitimate pre-token
+        v(" 3", 258);   // straddles a space->digit boundary (no fold)
+        v("ab", 259);   // a legitimate lowercase run
+        v("AB", 260);   // a legitimate uppercase run
+        f << "],";
+        f << "\"special_tokens\":["
+             "{\"rank\":0,\"token_str\":\"<unk>\"},"
+             "{\"rank\":1,\"token_str\":\"<s>\"},"
+             "{\"rank\":2,\"token_str\":\"</s>\"},"
+             "{\"rank\":3,\"token_str\":\"<pad>\"}]}";
+    }
+    auto tok = mistral::Tokenizer::load(path.string());
+    const int aB = 256 + NP, t_apos = 257 + NP, sp3 = 258 + NP, ab = 259 + NP, AB = 260 + NP;
+
+    // Lowercase / uppercase runs are single pre-tokens and merge as expected.
+    { auto ids = tok.encode("ab"); CHECK(ids.size() == 1 && ids[0] == ab); }
+    { auto ids = tok.encode("AB"); CHECK(ids.size() == 1 && ids[0] == AB); }
+
+    // Case boundary: "aB" -> "a" + "B"; the aB token must NOT form.
+    {
+        auto ids = tok.encode("aB");
+        CHECK(ids.size() == 2 && ids[0] == bid('a') && ids[1] == bid('B'));
+        CHECK(ids[0] != aB && ids[1] != aB);
+    }
+    // No special contraction rule: "don't" splits as "don" + "'t", where "'t"
+    // is the general optional-lead pattern (one non-letter char + a letter run),
+    // not a contraction special case. So "'t" is a single pre-token and merges.
+    {
+        auto ids = tok.encode("don't");
+        CHECK(ids.size() == 4);
+        CHECK(ids[0] == bid('d') && ids[1] == bid('o') && ids[2] == bid('n') &&
+              ids[3] == t_apos);
+    }
+    // Space before a digit is never folded: "a 3" -> "a" + " " + "3".
+    {
+        auto ids = tok.encode("a 3");
+        CHECK(ids.size() == 3 && ids[0] == bid('a') && ids[1] == bid(' ') &&
+              ids[2] == bid('3'));
+        for (int id : ids) CHECK(id != sp3);
+    }
+    // Space before a letter DOES fold into the word pre-token: " ab" -> " "+"ab".
+    {
+        auto ids = tok.encode(" ab");
+        CHECK(ids.size() == 2 && ids[0] == bid(' ') && ids[1] == ab);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 // Real-checkpoint smoke test, gated on BROLM_MISTRAL_DIR (skips when absent).
 static void test_real_checkpoint() {
     const char* dir = std::getenv("BROLM_MISTRAL_DIR");
@@ -319,12 +389,22 @@ static void test_real_checkpoint() {
         auto ids = tok.encode("hello", /*add_special=*/true);
         CHECK(!ids.empty() && ids.front() == tok.bos_id());
     }
+    // Empirical merge parity: a whole-word token must encode to exactly its id.
+    // " the" is rank 278 in this checkpoint, so its id = 278 + num_special_tokens.
+    {
+        auto ids = tok.encode(" the");
+        CHECK(ids.size() == 1 && ids[0] == 278 + tok.num_special_tokens());
+    }
+    // Other common whole-word tokens collapse to a single id too.
+    CHECK(tok.encode(" and").size() == 1);
+    CHECK(tok.encode(" of").size() == 1);
     std::printf("mistral_tokenizer: real checkpoint OK (%s)\n", tj.string().c_str());
 }
 
 int main() {
     test_synthetic();
     test_default_specials();
+    test_pretokenization();
     test_real_checkpoint();
 
     if (g_failures == 0) std::printf("mistral_tokenizer: OK\n");

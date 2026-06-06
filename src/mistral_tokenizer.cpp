@@ -285,91 +285,106 @@ ParsedTekken parse_tekken(const std::string& text) {
     return t;
 }
 
-// ─── pre-tokenization (Tekken / cl100k-family, ASCII approximation) ─────────
+// ─── pre-tokenization (faithful to Tekken's config.pattern, ASCII) ──────────
+//
+// Tekken's split regex (config.pattern), ordered alternatives:
+//   1. [^\r\n\p{L}\p{N}]? \p{Lu}* \p{Ll}+        letters, lower-ending
+//   2. [^\r\n\p{L}\p{N}]? \p{Lu}+ \p{Ll}*        letters, upper-only/Title
+//   3. \p{N}                                     a single digit
+//   4.  ?[^\s\p{L}\p{N}]+ [\r\n/]*               optional-space + punctuation
+//   5. \s*[\r\n]+                                whitespace ending in newline
+//   6. \s+(?!\S)                                 trailing whitespace
+//   7. \s+                                       remaining whitespace
+// We implement these exactly over ASCII (bit-for-bit token boundaries, hence
+// id parity given the exact merge + vocab). Non-ASCII bytes (>=0x80) are
+// treated as "other": not letter/digit/space, so they flow through the
+// punctuation alternative. That keeps everything lossless and round-tripping,
+// but does not yet split multibyte-letter scripts on Unicode letter
+// boundaries — that needs \p{L}/\p{Lu}/\p{Ll} property tables (future work).
+// There is deliberately NO contraction rule: Tekken's pattern has none, so
+// "don't" tokenizes as "don" + "'" + "t".
+
+inline bool pt_upper(unsigned char c)  { return c >= 'A' && c <= 'Z'; }
+inline bool pt_lower(unsigned char c)  { return c >= 'a' && c <= 'z'; }
+inline bool pt_letter(unsigned char c) { return pt_upper(c) || pt_lower(c); }
+inline bool pt_digit(unsigned char c)  { return c >= '0' && c <= '9'; }
+inline bool pt_space(unsigned char c)  {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+// The optional leading char of the letter alternatives: not a letter, not a
+// digit, not CR/LF (so it may be a space, tab, punctuation, or non-ASCII byte).
+inline bool pt_letter_lead(unsigned char c) {
+    return !pt_letter(c) && !pt_digit(c) && c != '\r' && c != '\n';
+}
+// A char of the punctuation alternative's [^\s\p{L}\p{N}] class.
+inline bool pt_punct(unsigned char c) {
+    return !pt_space(c) && !pt_letter(c) && !pt_digit(c);
+}
+
+// Length of the single Tekken pre-token beginning at text[i] (always >= 1).
+std::size_t match_token(std::string_view text, std::size_t i) {
+    const std::size_t n = text.size();
+    auto at = [&](std::size_t k) { return static_cast<unsigned char>(text[k]); };
+
+    // alt 1: [^\r\n L N]? Lu* Ll+   (optional lead tried greedily, i.e. first)
+    for (int use_lead = 1; use_lead >= 0; --use_lead) {
+        std::size_t p = i;
+        if (use_lead) { if (p < n && pt_letter_lead(at(p))) ++p; else continue; }
+        std::size_t q = p;
+        while (q < n && pt_upper(at(q))) ++q;
+        const std::size_t low = q;
+        while (q < n && pt_lower(at(q))) ++q;
+        if (q > low) return q - i;            // had >= 1 lowercase
+    }
+    // alt 2: [^\r\n L N]? Lu+ Ll*
+    for (int use_lead = 1; use_lead >= 0; --use_lead) {
+        std::size_t p = i;
+        if (use_lead) { if (p < n && pt_letter_lead(at(p))) ++p; else continue; }
+        std::size_t q = p;
+        const std::size_t up = q;
+        while (q < n && pt_upper(at(q))) ++q;
+        if (q > up) {                          // had >= 1 uppercase
+            while (q < n && pt_lower(at(q))) ++q;
+            return q - i;
+        }
+    }
+    // alt 3: a single digit.
+    if (pt_digit(at(i))) return 1;
+    // alt 4: ' '? [^\s L N]+ [\r\n/]*   (the optional lead is a literal space).
+    {
+        std::size_t p = i;
+        if (at(p) == ' ' && p + 1 < n && pt_punct(at(p + 1))) ++p;
+        const std::size_t s = p;
+        while (p < n && pt_punct(at(p))) ++p;
+        if (p > s) {
+            while (p < n && (at(p) == '\r' || at(p) == '\n' || at(p) == '/')) ++p;
+            return p - i;
+        }
+    }
+    // Whitespace alternatives. text[i] is whitespace here; find the run [i, R).
+    std::size_t R = i;
+    while (R < n && pt_space(at(R))) ++R;
+    // alt 5: \s*[\r\n]+ — if the run holds a newline, take through the last one.
+    std::size_t last_nl = std::string::npos;
+    for (std::size_t k = i; k < R; ++k) {
+        if (at(k) == '\r' || at(k) == '\n') last_nl = k;
+    }
+    if (last_nl != std::string::npos) return last_nl + 1 - i;
+    // Pure spaces/tabs. alt 6: \s+(?!\S) leaves the last char to fold into the
+    // following token when more text follows; alt 7: \s+ takes the rest.
+    if (R == n) return R - i;                  // trailing run -> whole run
+    if (R - i > 1) return (R - 1) - i;         // leave last space for folding
+    return 1;                                  // lone space before non-space
+}
 
 std::vector<std::string> pre_tokenize(std::string_view text) {
     std::vector<std::string> pieces;
     std::size_t i = 0;
     while (i < text.size()) {
-        unsigned char c = static_cast<unsigned char>(text[i]);
-
-        if (c == '\'') {
-            if (bpe::starts_with(text, i, "'re")) { pieces.emplace_back("'re"); i += 3; continue; }
-            if (bpe::starts_with(text, i, "'ve")) { pieces.emplace_back("'ve"); i += 3; continue; }
-            if (bpe::starts_with(text, i, "'ll")) { pieces.emplace_back("'ll"); i += 3; continue; }
-            if (bpe::starts_with(text, i, "'s"))  { pieces.emplace_back("'s");  i += 2; continue; }
-            if (bpe::starts_with(text, i, "'t"))  { pieces.emplace_back("'t");  i += 2; continue; }
-            if (bpe::starts_with(text, i, "'m"))  { pieces.emplace_back("'m");  i += 2; continue; }
-            if (bpe::starts_with(text, i, "'d"))  { pieces.emplace_back("'d");  i += 2; continue; }
-        }
-
-        std::size_t start = i;
-        // A single leading space folds into a following letter/punctuation run,
-        // but NOT into a digit run (cl100k digits have no leading-space form).
-        if (c == ' ') {
-            bool fold = false;
-            if (i + 1 < text.size()) {
-                unsigned char d = static_cast<unsigned char>(text[i + 1]);
-                if (!bpe::is_ascii_space(d) && !bpe::is_ascii_digit(d)) {
-                    fold = true;
-                    ++i;
-                    c = d;
-                }
-            }
-            if (!fold) {
-                pieces.emplace_back(text.substr(i, 1));
-                ++i;
-                continue;
-            }
-        } else if (bpe::is_ascii_space(c)) {
-            // Non-space whitespace (tab/newline/...) emits as its own run.
-            std::size_t j = i;
-            while (j < text.size() &&
-                   bpe::is_ascii_space(static_cast<unsigned char>(text[j])) &&
-                   text[j] != ' ') ++j;
-            pieces.emplace_back(text.substr(i, j - i));
-            i = j;
-            continue;
-        }
-
-        if (bpe::is_ascii_letter(c)) {
-            std::size_t j = i;
-            while (j < text.size() &&
-                   bpe::is_ascii_letter(static_cast<unsigned char>(text[j]))) ++j;
-            pieces.emplace_back(text.substr(start, j - start));
-            i = j;
-            continue;
-        }
-
-        if (bpe::is_ascii_digit(c)) {
-            // Tekken splits digits individually — its config pattern uses \p{N}
-            // (exactly one), not the cl100k \p{N}{1,3}. A space before a digit
-            // is never folded (see above), so start == i here.
-            pieces.emplace_back(text.substr(i, 1));
-            ++i;
-            continue;
-        }
-
-        // Punctuation run (non-space, non-letter, non-digit), breaking before a
-        // contraction so "it" + "'s" splits the way the apostrophe rule expects.
-        std::size_t j = i;
-        while (j < text.size()) {
-            unsigned char u = static_cast<unsigned char>(text[j]);
-            if (bpe::is_ascii_space(u) || bpe::is_ascii_letter(u) ||
-                bpe::is_ascii_digit(u)) break;
-            if (u == '\'' && j != i) {
-                std::string_view rest = text.substr(j);
-                if (rest.substr(0, 3) == "'re" || rest.substr(0, 3) == "'ve" ||
-                    rest.substr(0, 3) == "'ll" ||
-                    rest.substr(0, 2) == "'s"  || rest.substr(0, 2) == "'t"  ||
-                    rest.substr(0, 2) == "'m"  || rest.substr(0, 2) == "'d") {
-                    break;
-                }
-            }
-            ++j;
-        }
-        pieces.emplace_back(text.substr(start, j - start));
-        i = j;
+        std::size_t len = match_token(text, i);
+        if (len == 0) len = 1;  // defensive: match_token always returns >= 1
+        pieces.emplace_back(text.substr(i, len));
+        i += len;
     }
     return pieces;
 }

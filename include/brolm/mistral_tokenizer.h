@@ -23,14 +23,15 @@
 // list; Mistral's (e.g. Mistral-Small-3.1) omit it, so the loader falls back to
 // the canonical Tekken v7 table (ids 0..19: <unk> <s> </s> [INST] ... ).
 //
-// Pre-tokenization is an ASCII-focused approximation of the Tekken split (the
-// config.pattern regex): contraction splits, letter runs, single digits (the
-// pattern uses \p{N}, one digit per token), punctuation runs, and a single
-// leading space folded into a following letter/punctuation run (but not a digit
-// run). This matches mistral-common on lowercase English and code; the regex's
-// case-aware letter splitting and full Unicode-property classes (Tekken is
-// multilingual) are out of scope here, as they are for qwen. Tokenization stays
-// lossless and round-trips regardless.
+// Pre-tokenization implements Tekken's config.pattern faithfully over ASCII —
+// case-aware letter splitting (Lu*Ll+ | Lu+Ll*, so "HelloWorld" -> "Hello",
+// "World"), single digits (\p{N}), optional-space + punctuation runs, and the
+// whitespace/newline rules — so token boundaries (and thus ids, given the exact
+// merge + vocab) match mistral-common on ASCII text. There is NO contraction
+// rule (Tekken's pattern has none: "don't" -> "don" + "'" + "t"). Non-ASCII
+// bytes (>=0x80) are treated as "other" (punctuation class), so multibyte-letter
+// scripts are not yet split on Unicode letter boundaries — that needs \p{L}
+// property tables (future work). Tokenization stays lossless and round-trips.
 
 #include <cstdint>
 #include <string>
