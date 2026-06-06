@@ -43,6 +43,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# We check $LASTEXITCODE on `hf` ourselves (as the bash version does), so don't
+# let PowerShell turn the CLI's stderr / nonzero exits into terminating errors.
+$PSNativeCommandUseErrorActionPreference = $false
+# Force the hf CLI (Python) into UTF-8 I/O. Without this it crashes on Windows
+# consoles whose legacy codepage (cp1252) can't encode the '✓' it prints on
+# success: "'charmap' codec can't encode character '✓'".
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 
 $Repo = if ($env:REPO) { $env:REPO } else { 'mistralai/Mistral-Small-3.1-24B-Instruct-2503' }
 $Full = ($env:FULL -eq '1')
