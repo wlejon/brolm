@@ -33,6 +33,13 @@ void VLModel::load_weights(const st::File& f) {
     projector_.load_weights(f, "multi_modal_projector.");
 }
 
+void VLModel::load_weights(const bt::gguf::File& text_gguf,
+                           const bt::gguf::File& mmproj_gguf) {
+    text_.load_weights(text_gguf);        // ggml `token_embd` / `blk.*` / `output`
+    vision_.load_weights(mmproj_gguf);    // ggml `v.*`
+    projector_.load_weights(mmproj_gguf); // ggml `mm.*`
+}
+
 void VLModel::allocate_cache(int max_seq_len) { text_.allocate_cache(max_seq_len); }
 void VLModel::reset_cache() { text_.reset_cache(); }
 int  VLModel::cache_len() const { return text_.cache_len(); }

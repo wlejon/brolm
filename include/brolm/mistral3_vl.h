@@ -54,6 +54,12 @@ public:
     // projector (`multi_modal_projector.`) weights from one safetensors file.
     void load_weights(const brotensor::safetensors::File& f);
 
+    // Load from the two llama.cpp GGUFs Mistral 3.1 ships: the (quantized) text
+    // decoder gguf and the (F16) mmproj/clip gguf carrying the vision tower +
+    // projector. The text quant path is GPU-only; the mmproj is dense F16.
+    void load_weights(const brotensor::gguf::File& text_gguf,
+                      const brotensor::gguf::File& mmproj_gguf);
+
     void allocate_cache(int max_seq_len);
     void reset_cache();
     int  cache_len() const;
