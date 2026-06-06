@@ -100,6 +100,7 @@ endif()
 target_sources(brolm PRIVATE
     src/version.cpp
     src/detail/byte_level_bpe.cpp
+    src/detail/dense_decoder.cpp
     src/tokenizer_clip.cpp
     src/tokenizer_t5.cpp
     src/qwen_tokenizer.cpp
