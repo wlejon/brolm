@@ -106,6 +106,7 @@ target_sources(brolm PRIVATE
     src/qwen_tokenizer.cpp
     src/mistral_tokenizer.cpp
     src/mistral3_config.cpp
+    src/mistral3_text.cpp
     src/whisper_tokenizer.cpp
     src/clip.cpp
     src/t5.cpp
