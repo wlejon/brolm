@@ -134,12 +134,13 @@ void DenseDecoder::load_weights(const brolm::detail::weights::Source& src) {
 
 void DenseDecoder::allocate_cache(int max_seq_len) {
     if (max_seq_len <= 0) fail("allocate_cache: max_seq_len must be positive");
-    const int n_q = cfg_.num_attention_heads;
-    const int cache_cols = n_q * cfg_.head_dim;
+    const int n_kv = cfg_.num_key_value_heads;
+    const int cache_cols = n_kv * cfg_.head_dim;
     const bt::Dtype dt = brolm::compute_dtype();
     const bt::Device dev = bt::default_device();
     for (Layer& L : layers_) {
-        // KV cache stores K/V already expanded to n_q heads (see GQA notes).
+        // KV cache stores true n_kv-width K/V; flash_attention_decode does the
+        // GQA head-mapping internally, so no per-head widening is needed.
         brolm::detail::resize_like(L.K_cache, max_seq_len, cache_cols, dt, dev);
         brolm::detail::resize_like(L.V_cache, max_seq_len, cache_cols, dt, dev);
     }
@@ -148,35 +149,6 @@ void DenseDecoder::allocate_cache(int max_seq_len) {
 }
 
 void DenseDecoder::reset_cache() { cache_len_ = 0; }
-
-// ─── GQA head expansion ──────────────────────────────────────────────────────
-//
-// flash_attention_decode takes a single num_heads and requires K/V cache cols
-// to equal Q cols. With n_kv < n_q, K and V must be widened from n_kv heads to
-// n_q heads before they are appended to the cache: with group = n_q / n_kv,
-// query head h reads KV head h / group.
-//
-// Implemented as a per-(row, query-head) copy_d2d. This is a non-optimal path
-// — correctness over speed; a fused gather kernel would be the optimisation.
-
-void DenseDecoder::expand_kv_heads_(const bt::Tensor& src, bt::Tensor& dst) {
-    const int HD   = cfg_.head_dim;
-    const int n_q  = cfg_.num_attention_heads;
-    const int n_kv = cfg_.num_key_value_heads;
-    const int group = n_q / n_kv;
-    const int L = src.rows;             // src: (L, n_kv*HD)
-    const int q_dim = n_q * HD;
-
-    brolm::detail::resize_like(dst, L, q_dim, src.dtype, src.device);
-    for (int r = 0; r < L; ++r) {
-        for (int h = 0; h < n_q; ++h) {
-            const int kv_h = h / group;
-            const int src_off = r * (n_kv * HD) + kv_h * HD;
-            const int dst_off = r * q_dim + h * HD;
-            bt::copy_d2d(src, src_off, dst, dst_off, HD);
-        }
-    }
-}
 
 // ─── forward ─────────────────────────────────────────────────────────────────
 
@@ -277,18 +249,16 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out) {
         bt::rope_forward(*q_attn, HD, n_q,  seq_offset, cfg_.rope_theta, *q_attn);
         bt::rope_forward(*k_attn, HD, n_kv, seq_offset, cfg_.rope_theta, *k_attn);
 
-        // GQA: widen k/v from n_kv heads to n_q heads, then append the
-        // n_q-head-width K/V to the cache.
-        expand_kv_heads_(*k_attn, k_exp_);
-        expand_kv_heads_(v_, v_exp_);
-        bt::kv_cache_append(k_exp_, v_exp_, cache_len_,
+        // GQA: append the n_kv-width K/V straight to the cache. No widening —
+        // flash_attention_decode maps query head h to KV head h/(n_q/n_kv).
+        bt::kv_cache_append(*k_attn, v_, cache_len_,
                             layer.K_cache, layer.V_cache);
 
         // Causal flash-attention against the populated cache. valid_len is the
         // total cache length after the append; the op applies causal masking
         // and the 1/sqrt(head_dim) scale internally.
         bt::flash_attention_decode(*q_attn, layer.K_cache, layer.V_cache,
-                                   cache_len_ + L, n_q, attn_);
+                                   cache_len_ + L, n_q, n_kv, attn_);
 
         detail::linear_batched(layer.Wo, /*bias=*/nullptr, attn_, proj_);
         bt::add_inplace(h_, proj_);

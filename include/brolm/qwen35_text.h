@@ -33,10 +33,8 @@
 //     k = per_head_rmsnorm(k, k_norm.weight, head_dim)
 //     q = mrope_partial(q, rotary_dim, t,h,w, sections)   partial M-RoPE
 //     k = mrope_partial(k, rotary_dim, t,h,w, sections)
-//     k_exp = expand_kv_heads(k, n_kv -> n_q)
-//     v_exp = expand_kv_heads(v, n_kv -> n_q)
-//     kv_cache_append(k_exp, v_exp, cache_len, K_cache, V_cache)
-//     attn = flash_attention_decode(q, K_cache, V_cache, cache_len + L, n_q)
+//     kv_cache_append(k, v, cache_len, K_cache, V_cache)   n_kv-width cache
+//     attn = flash_attention_decode(q, K_cache, V_cache, cache_len + L, n_q, n_kv)
 //     attn = attn * sigmoid(gate)            ← attn_output_gate (PRE-o_proj)
 //     attn = o_proj(attn)                           (L, hidden)
 //   h = residual + attn
@@ -210,9 +208,6 @@ private:
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix);
 
-    // GQA head expansion: (L, n_kv*head_dim) -> (L, n_q*head_dim).
-    void expand_kv_heads_(const brotensor::Tensor& src, brotensor::Tensor& dst);
-
     // Run the MLP sub-layer in place on h_.
     void mlp_block_(const MLP& mlp, int L);
 
@@ -242,7 +237,6 @@ private:
     brotensor::Tensor gate_;        // attn output gate, (L, n_q*head_dim)
     brotensor::Tensor qn_, kn_;     // QK-normed q/k
     brotensor::Tensor q_rot_, k_rot_;     // rotary subrange (L, n_q*rotary_dim) / (L, n_kv*rotary_dim)
-    brotensor::Tensor k_exp_, v_exp_;     // GQA-expanded
     brotensor::Tensor attn_;
     brotensor::Tensor gate_sig_;    // sigmoid(gate)
     brotensor::Tensor proj_;        // o_proj / down_proj output

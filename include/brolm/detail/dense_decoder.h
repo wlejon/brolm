@@ -6,9 +6,10 @@
 // Both are the same pre-norm, GQA, SwiGLU, plain-1-D-RoPE causal decoder; the
 // one architectural axis that varies is per-head QK-norm (Qwen3 applies a
 // per-head RMSNorm to q/k, Mistral does not). DenseDecoderConfig::use_qk_norm
-// selects it. Everything else — GQA head expansion, the HF rotate_half →
-// interleaved-pair RoPE weight permute, SwiGLU MLP, RMSNorm, the KV cache, and
-// the tie/untie lm_head rule — is identical across both families.
+// selects it. Everything else — GQA (handled natively by
+// flash_attention_decode), the HF rotate_half → interleaved-pair RoPE weight
+// permute, SwiGLU MLP, RMSNorm, the KV cache, and the tie/untie lm_head rule —
+// is identical across both families.
 //
 // This is an internal primitive: the public model classes (brolm::qwen::
 // Qwen3Model, brolm::mistral::MistralModel) own a DenseDecoder and supply only
@@ -29,10 +30,9 @@
 //       k = per_head_rmsnorm(k, k_norm.weight, head_dim)
 //     q = rope(q, head_dim, n_q,  seq_offset, rope_theta)
 //     k = rope(k, head_dim, n_kv, seq_offset, rope_theta)
-//     k_exp = expand_kv_heads(k, n_kv -> n_q)        GQA head expansion
-//     v_exp = expand_kv_heads(v, n_kv -> n_q)
-//     kv_cache_append(k_exp, v_exp, cache_len, K_cache, V_cache)
-//     attn = flash_attention_decode(q, K_cache, V_cache, cache_len + L, n_q)
+//     kv_cache_append(k, v, cache_len, K_cache, V_cache)   n_kv-width cache
+//     attn = flash_attention_decode(q, K_cache, V_cache, cache_len + L, n_q, n_kv)
+//                                                    GQA mapping inside the op
 //     attn = o_proj(attn)                            (L, hidden), no bias
 //   h = residual + attn
 //   residual = h
@@ -133,14 +133,9 @@ private:
         brotensor::Tensor q_norm, k_norm;          // (head_dim,) — QK-norm only
         brotensor::Tensor post_attn_ln;            // (hidden,)
         brotensor::Tensor gate_W, up_W, down_W;    // MLP projections
-        // Per-layer KV cache, expanded to n_q heads: (max_seq, n_q*head_dim).
+        // Per-layer KV cache at true KV width: (max_seq, n_kv*head_dim).
         brotensor::Tensor K_cache, V_cache;
     };
-
-    // GQA head expansion: copy each KV head's head_dim block out to the group
-    // of query heads it serves. `src` is (L, n_kv*head_dim); `dst` becomes
-    // (L, n_q*head_dim).
-    void expand_kv_heads_(const brotensor::Tensor& src, brotensor::Tensor& dst);
 
     // Run all decoder layers + final norm + lm_head over the residual stream
     // already populated in h_ (L rows at the compute dtype), writing
@@ -166,7 +161,6 @@ private:
     brotensor::Tensor norm_;           // rms_norm output
     brotensor::Tensor q_, k_, v_;      // projected q/k/v
     brotensor::Tensor qn_, kn_;        // QK-normed q/k (distinct from q_/k_)
-    brotensor::Tensor k_exp_, v_exp_;  // GQA-expanded k/v
     brotensor::Tensor attn_;           // flash-attention output
     brotensor::Tensor proj_;           // o_proj / down_proj output
     brotensor::Tensor gate_, up_;      // MLP gate / up

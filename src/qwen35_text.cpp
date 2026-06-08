@@ -487,8 +487,8 @@ void TextModel::load_weights_impl_(
 
 std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
     if (max_seq <= 0) fail("make_cache: max_seq must be positive");
-    const int n_q = cfg_.num_attention_heads;
-    const int cache_cols = n_q * cfg_.head_dim;
+    const int n_kv = cfg_.num_key_value_heads;
+    const int cache_cols = n_kv * cfg_.head_dim;  // true KV width; decode does GQA
     const bt::Dtype dt = brolm::compute_dtype();
     const bt::Device dev = bt::default_device();
 
@@ -518,27 +518,6 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
         }
     }
     return out;
-}
-
-// ─── GQA head expansion ────────────────────────────────────────────────────
-
-void TextModel::expand_kv_heads_(const bt::Tensor& src, bt::Tensor& dst) {
-    const int HD   = cfg_.head_dim;
-    const int n_q  = cfg_.num_attention_heads;
-    const int n_kv = cfg_.num_key_value_heads;
-    const int group = n_q / n_kv;
-    const int L = src.rows;             // src: (L, n_kv*HD)
-    const int q_dim = n_q * HD;
-
-    brolm::detail::resize_like(dst, L, q_dim, src.dtype, src.device);
-    for (int r = 0; r < L; ++r) {
-        for (int h = 0; h < n_q; ++h) {
-            const int kv_h = h / group;
-            const int src_off = r * (n_kv * HD) + kv_h * HD;
-            const int dst_off = r * q_dim + h * HD;
-            bt::copy_d2d(src, src_off, dst, dst_off, HD);
-        }
-    }
 }
 
 // ─── partial M-RoPE ────────────────────────────────────────────────────────
@@ -749,14 +728,13 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             apply_partial_mrope_(qn_, n_q,  L, pos_t, pos_h, pos_w);
             apply_partial_mrope_(kn_, n_kv, L, pos_t, pos_h, pos_w);
 
-            // GQA: widen k/v to n_q heads, append to cache.
-            expand_kv_heads_(kn_, k_exp_);
-            expand_kv_heads_(v_,  v_exp_);
-            bt::kv_cache_append(k_exp_, v_exp_, kvc.len, kvc.k, kvc.v);
+            // GQA: append the n_kv-width k/v straight to the cache; the decode
+            // op maps query head h to KV head h/(n_q/n_kv).
+            bt::kv_cache_append(kn_, v_, kvc.len, kvc.k, kvc.v);
 
             // Causal attention against the populated cache.
             bt::flash_attention_decode(qn_, kvc.k, kvc.v,
-                                       kvc.len + L, n_q, attn_);
+                                       kvc.len + L, n_q, n_kv, attn_);
             kvc.len += L;
 
             // attn_output_gate: attn = attn * sigmoid(gate) BEFORE o_proj.
