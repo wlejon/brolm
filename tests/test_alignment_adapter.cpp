@@ -109,6 +109,18 @@ int main() {
 
         bt::Tensor text_emb, pooled, d_text, d_pool;
 
+        // brotensor's mse_vec_* loss ops are FP32-by-design (loss is upcast for
+        // numerical headroom — see brotensor src/cuda/loss.cu). The adapter
+        // emits the compute dtype, which is FP16 on the GPU path, so the loss is
+        // computed in FP32: targets are upcast once, and each step upcasts the
+        // adapter's outputs and casts the FP32 gradient back to the compute
+        // dtype before backward. On CPU (compute dtype FP32) every cast is a
+        // no-op copy.
+        bt::Tensor tgt_text32, tgt_pool32;
+        bt::cast(tgt_text, tgt_text32, bt::Dtype::FP32);
+        bt::cast(tgt_pool, tgt_pool32, bt::Dtype::FP32);
+        bt::Tensor te32, p32, d_text32, d_pool32;
+
         const int steps = 200;
         float initial_loss = 0.0f, final_loss = 0.0f;
         std::vector<float> checkpoints;
@@ -117,16 +129,20 @@ int main() {
             adapter.zero_grads();
             adapter.forward(H, text_emb, pooled);
 
-            const float loss_text = bt::mse_vec_forward(text_emb, tgt_text);
-            const float loss_pool = bt::mse_vec_forward(pooled, tgt_pool);
+            bt::cast(text_emb, te32, bt::Dtype::FP32);
+            bt::cast(pooled,   p32,  bt::Dtype::FP32);
+            const float loss_text = bt::mse_vec_forward(te32, tgt_text32);
+            const float loss_pool = bt::mse_vec_forward(p32,  tgt_pool32);
             const float loss = loss_text + loss_pool;
 
             if (it == 0) initial_loss = loss;
             final_loss = loss;
             if (it % 40 == 0) checkpoints.push_back(loss);
 
-            bt::mse_vec_backward(text_emb, tgt_text, d_text);
-            bt::mse_vec_backward(pooled, tgt_pool, d_pool);
+            bt::mse_vec_backward(te32, tgt_text32, d_text32);
+            bt::mse_vec_backward(p32,  tgt_pool32, d_pool32);
+            bt::cast(d_text32, d_text, brolm::compute_dtype());
+            bt::cast(d_pool32, d_pool, brolm::compute_dtype());
             adapter.backward(d_text, d_pool, /*dH_out=*/nullptr);
             adapter.step(/*lr=*/1e-2f);
         }
@@ -175,12 +191,20 @@ int main() {
         bt::Tensor tgt_text = bdtest::bd_upload(tt, L, cfg.d_cond);
         bt::Tensor tgt_pool = bdtest::bd_upload(tp, 1, cfg.d_cond);
 
-        bt::Tensor text_emb, pooled, d_text, d_pool;
+        // FP32 loss on the compute-dtype outputs (see test 2's note).
+        bt::Tensor tgt_text32, tgt_pool32;
+        bt::cast(tgt_text, tgt_text32, bt::Dtype::FP32);
+        bt::cast(tgt_pool, tgt_pool32, bt::Dtype::FP32);
+        bt::Tensor text_emb, pooled, d_text, d_pool, te32, p32, d_text32, d_pool32;
         for (int it = 0; it < 30; ++it) {
             trained.zero_grads();
             trained.forward(H, text_emb, pooled);
-            bt::mse_vec_backward(text_emb, tgt_text, d_text);
-            bt::mse_vec_backward(pooled, tgt_pool, d_pool);
+            bt::cast(text_emb, te32, bt::Dtype::FP32);
+            bt::cast(pooled,   p32,  bt::Dtype::FP32);
+            bt::mse_vec_backward(te32, tgt_text32, d_text32);
+            bt::mse_vec_backward(p32,  tgt_pool32, d_pool32);
+            bt::cast(d_text32, d_text, brolm::compute_dtype());
+            bt::cast(d_pool32, d_pool, brolm::compute_dtype());
             trained.backward(d_text, d_pool, nullptr);
             trained.step(1e-2f);
         }

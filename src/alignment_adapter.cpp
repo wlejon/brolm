@@ -23,23 +23,24 @@ namespace {
     throw std::runtime_error("AlignmentAdapter: " + msg);
 }
 
-// Build a parameter tensor at the compute dtype, deterministically
-// xavier-uniform initialised. xavier_init is CPU/FP32-only (it runs before
-// training, on the host), so init on a CPU FP32 staging tensor, then upload
-// host-side to the compute dtype + default device. This yields byte-identical
-// weights for a given seed on either backend.
+// Build an FP32 parameter tensor, deterministically xavier-uniform
+// initialised. The adapter is a trainable module, so its master weights,
+// gradients, and Adam state are kept in FP32 regardless of the compute dtype
+// (FP16 master weights + FP16 Adam underflow/diverge to NaN). xavier_init is
+// CPU/FP32-only; init on a CPU FP32 staging tensor, then migrate to the default
+// device as FP32. This yields byte-identical weights for a given seed.
 bt::Tensor make_xavier(int rows, int cols, uint64_t& rng) {
     bt::Tensor stage = bt::Tensor::zeros_on(bt::Device::CPU, rows, cols,
                                             bt::Dtype::FP32);
     bt::xavier_init(stage, rng);
-    return detail::upload_host(stage.host_f32(), rows, cols);
+    return bt::Tensor::from_host(stage.host_f32(), rows, cols);
 }
 
-// Zero-filled parameter-shaped tensor at the compute dtype on the default
-// device — used for biases, grad buffers, and Adam m/v state.
+// Zero-filled FP32 parameter-shaped tensor on the default device — used for
+// biases, grad buffers, and Adam m/v state (all FP32, see make_xavier).
 bt::Tensor make_zeros(int rows, int cols) {
     return bt::Tensor::zeros_on(bt::default_device(), rows, cols,
-                                compute_dtype());
+                                bt::Dtype::FP32);
 }
 
 // Download a tensor to a host FP32 vector regardless of compute dtype.
@@ -118,8 +119,11 @@ void AlignmentAdapter::forward(const bt::Tensor& H,
     const int dm = cfg_.d_model;
     seq_len_ = L;
 
-    // Cache the input for the backward pass.
-    H_ = H.clone();
+    // Master weights are FP32; cast the compute-dtype input up so the whole
+    // forward runs in FP32, and cast the two outputs back to the compute dtype
+    // at the end (the public I/O contract — diffusion consumers read them at
+    // compute_dtype). H_ is the FP32 input cache for backward.
+    bt::cast(H, H_, bt::Dtype::FP32);
 
     // A_pre = H @ W1^T + b1   (batched linear: Y[l] = W1 @ H[l] + b1).
     detail::linear_batched(W1_, &b1_, H_, A_pre_);
@@ -127,17 +131,21 @@ void AlignmentAdapter::forward(const bt::Tensor& H,
     // A = silu(A_pre).
     bt::silu_forward(A_pre_, A_);
 
-    // text_embeddings = A @ W_text^T + b_text.
-    detail::linear_batched(W_text_, &b_text_, A_, text_embeddings);
+    // text_embeddings = A @ W_text^T + b_text   (computed in FP32, cast below).
+    detail::linear_batched(W_text_, &b_text_, A_, text_f32_);
 
     // p = mean_pool_rows(A)  -> (d_model, 1).
     bt::masked_mean_pool_forward(A_, /*d_mask=*/nullptr, p_);
 
     // pooled = p^T @ W_pool^T + b_pool. Stage p as a 1-row (1, d_model)
     // matrix so the batched linear (which wants (B, in_dim)) runs with B = 1.
-    detail::resize_like(pooled_in_, 1, dm, compute_dtype(), A_.device);
+    detail::resize_like(pooled_in_, 1, dm, bt::Dtype::FP32, A_.device);
     bt::copy_d2d(p_, /*src_off=*/0, pooled_in_, /*dst_off=*/0, /*count=*/dm);
-    detail::linear_batched(W_pool_, &b_pool_, pooled_in_, pooled);
+    detail::linear_batched(W_pool_, &b_pool_, pooled_in_, pooled_f32_);
+
+    // Cast the FP32 results to the compute dtype for the caller.
+    bt::cast(text_f32_,   text_embeddings, compute_dtype());
+    bt::cast(pooled_f32_, pooled,          compute_dtype());
 }
 
 // ─── backward ──────────────────────────────────────────────────────────────
@@ -160,15 +168,20 @@ void AlignmentAdapter::backward(const bt::Tensor& d_text_embeddings,
         fail("backward: d_pooled must be (1, d_cond)");
     }
 
+    // Master weights are FP32; the upstream grads arrive at the compute dtype,
+    // so cast them up to FP32 for the FP32 backward.
+    bt::cast(d_pooled,          dpool_f32_, bt::Dtype::FP32);
+    bt::cast(d_text_embeddings, dtext_f32_, bt::Dtype::FP32);
+
     // ── pooled head: pooled = pooled_in @ W_pool^T + b_pool ──────────────
     // linear_backward_batched accumulates dW_pool / db_pool, overwrites the
     // input grad d_pooled_in (a (1, d_model) row).
-    detail::resize_like(d_pooled_in_, 1, dm, compute_dtype(), A_.device);
-    bt::linear_backward_batched(W_pool_, pooled_in_, d_pooled,
+    detail::resize_like(d_pooled_in_, 1, dm, bt::Dtype::FP32, A_.device);
+    bt::linear_backward_batched(W_pool_, pooled_in_, dpool_f32_,
                                 d_pooled_in_, dW_pool_, db_pool_);
 
     // dp = grad w.r.t. the pooled-row vector p, reshaped (1,d_model)->(d_model,1).
-    detail::resize_like(dp_, dm, 1, compute_dtype(), A_.device);
+    detail::resize_like(dp_, dm, 1, bt::Dtype::FP32, A_.device);
     bt::copy_d2d(d_pooled_in_, /*src_off=*/0, dp_, /*dst_off=*/0, /*count=*/dm);
 
     // Backprop the mean-pool: dA_pool (L, d_model), overwritten by the op.
@@ -176,7 +189,7 @@ void AlignmentAdapter::backward(const bt::Tensor& d_text_embeddings,
 
     // ── text head: text_embeddings = A @ W_text^T + b_text ───────────────
     // Accumulates dW_text / db_text, overwrites dA_text (L, d_model).
-    bt::linear_backward_batched(W_text_, A_, d_text_embeddings,
+    bt::linear_backward_batched(W_text_, A_, dtext_f32_,
                                 dA_text_, dW_text_, db_text_);
 
     // ── sum the two contributions to dA ──────────────────────────────────
@@ -187,14 +200,13 @@ void AlignmentAdapter::backward(const bt::Tensor& d_text_embeddings,
     bt::silu_backward(A_pre_, dA_, dA_pre_);
 
     // ── first linear: A_pre = H @ W1^T + b1 ──────────────────────────────
-    // Accumulates dW1 / db1. dX target is dH_out when requested, else a
-    // throwaway scratch (the op always overwrites its dX argument).
-    bt::Tensor* dx = dH_out;
-    if (dx == nullptr) {
-        detail::resize_like(dummy_dx_, L, din, compute_dtype(), A_.device);
-        dx = &dummy_dx_;
-    }
+    // Accumulates dW1 / db1. The input-grad dX is computed in FP32; when the
+    // caller wants it (dH_out), cast the FP32 result back to the compute dtype,
+    // else write to a throwaway FP32 scratch.
+    bt::Tensor* dx = (dH_out != nullptr) ? &dH_f32_ : &dummy_dx_;
+    detail::resize_like(*dx, L, din, bt::Dtype::FP32, A_.device);
     bt::linear_backward_batched(W1_, H_, dA_pre_, *dx, dW1_, db1_);
+    if (dH_out != nullptr) bt::cast(dH_f32_, *dH_out, compute_dtype());
 }
 
 // ─── zero_grads / step ─────────────────────────────────────────────────────
@@ -268,12 +280,13 @@ void AlignmentAdapter::load_weights(const st::File& f,
     const int dm  = cfg_.d_model;
     const int dc  = cfg_.d_cond;
 
-    st::upload_compute_checked(need(f, prefix + "W1"),     dm, din, W1_,     "W1");
-    st::upload_compute_checked(need(f, prefix + "b1"),     dm, 1,   b1_,     "b1");
-    st::upload_compute_checked(need(f, prefix + "W_text"), dc, dm,  W_text_, "W_text");
-    st::upload_compute_checked(need(f, prefix + "b_text"), dc, 1,   b_text_, "b_text");
-    st::upload_compute_checked(need(f, prefix + "W_pool"), dc, dm,  W_pool_, "W_pool");
-    st::upload_compute_checked(need(f, prefix + "b_pool"), dc, 1,   b_pool_, "b_pool");
+    // Master weights are FP32 (saved as F32); upload preserves the F32 dtype.
+    st::upload(need(f, prefix + "W1"),     dm, din, W1_);
+    st::upload(need(f, prefix + "b1"),     dm, 1,   b1_);
+    st::upload(need(f, prefix + "W_text"), dc, dm,  W_text_);
+    st::upload(need(f, prefix + "b_text"), dc, 1,   b_text_);
+    st::upload(need(f, prefix + "W_pool"), dc, dm,  W_pool_);
+    st::upload(need(f, prefix + "b_pool"), dc, 1,   b_pool_);
 }
 
 }  // namespace brolm

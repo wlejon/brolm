@@ -26,8 +26,12 @@
 //   p               = mean_pool_rows(A)        (d_model, 1)
 //   pooled          = p^T @ W_pool^T + b_pool  (1, d_cond)
 //
-// All parameters and activations are allocated at brolm::compute_dtype()
-// (FP32 on the CPU backend, FP16 on a GPU backend).
+// Precision: this is a trainable module, so its master weights, gradients, and
+// Adam state are kept in FP32 on every backend (FP16 master weights + FP16 Adam
+// underflow and diverge to NaN). The forward runs in FP32 internally; only its
+// public I/O is at brolm::compute_dtype() — the input H is cast up to FP32 and
+// the two outputs (text_embeddings, pooled) are cast back to the compute dtype
+// (FP32 on CPU, FP16 on a GPU backend), matching what diffusion consumers read.
 
 #include "brotensor/tensor.h"
 
@@ -103,7 +107,7 @@ public:
 private:
     AlignmentAdapterConfig cfg_;
 
-    // ── Parameters (each at compute_dtype()) ──
+    // ── Parameters (each FP32 — master weights, see file header) ──
     brotensor::Tensor W1_;       // (d_model, d_in)
     brotensor::Tensor b1_;       // (d_model, 1)
     brotensor::Tensor W_text_;   // (d_cond, d_model)
@@ -122,14 +126,19 @@ private:
     brotensor::Tensor mW_pool_, vW_pool_, mb_pool_, vb_pool_;
     int adam_step_ = 0;
 
-    // ── Forward caches (needed by backward) ──
-    brotensor::Tensor H_;        // (L, d_in)      input
+    // ── Forward caches (needed by backward; all FP32) ──
+    brotensor::Tensor H_;        // (L, d_in)      input, cast up to FP32
     brotensor::Tensor A_pre_;    // (L, d_model)   pre-activation
     brotensor::Tensor A_;        // (L, d_model)   silu(A_pre)
     brotensor::Tensor p_;        // (d_model, 1)   mean-pooled rows of A
     int seq_len_ = 0;
 
-    // ── Per-call scratch (kept alive to avoid realloc) ──
+    // ── Per-call scratch (kept alive to avoid realloc; all FP32) ──
+    brotensor::Tensor text_f32_;   // (L, d_cond)   FP32 text output pre-cast
+    brotensor::Tensor pooled_f32_; // (1, d_cond)   FP32 pooled output pre-cast
+    brotensor::Tensor dtext_f32_;  // (L, d_cond)   upstream d_text cast to FP32
+    brotensor::Tensor dpool_f32_;  // (1, d_cond)   upstream d_pooled cast to FP32
+    brotensor::Tensor dH_f32_;     // (L, d_in)     FP32 dH before cast to dH_out
     brotensor::Tensor dA_;         // (L, d_model)  summed dA contribution
     brotensor::Tensor dA_text_;    // (L, d_model)  text-head contribution to dA
     brotensor::Tensor dA_pool_;    // (L, d_model)  pool-head contribution to dA
