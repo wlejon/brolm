@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -72,6 +73,7 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
     t.unk_id_ = model->get_int("unk_id", 2);
 
     const auto& entries = vocab->as_array();
+    t.id_to_piece_.assign(entries.size(), std::string());
     int eos_id = -1;
     int pad_id = -1;
     double min_score = std::numeric_limits<double>::infinity();
@@ -87,6 +89,7 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
         const int32_t id = static_cast<int32_t>(i);
 
         t.vocab_.emplace(piece, Tokenizer::Entry{id, score});
+        t.id_to_piece_[i] = piece;
         if (!piece.empty() && piece.size() > max_bytes) {
             max_bytes = piece.size();
         }
@@ -184,6 +187,58 @@ std::vector<int32_t> Tokenizer::tokenize(std::string_view text) const {
     }
     std::reverse(ids.begin(), ids.end());
     return ids;
+}
+
+// ─── decode ────────────────────────────────────────────────────────────────
+
+std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
+    // A piece "<0xNN>" is a SentencePiece byte-fallback token: it stands for
+    // the single raw byte 0xNN. Returns -1 when `p` is not such a token.
+    auto byte_fallback = [](const std::string& p) -> int {
+        if (p.size() != 6 || p[0] != '<' || p[1] != '0' ||
+            (p[2] != 'x' && p[2] != 'X') || p[5] != '>') {
+            return -1;
+        }
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int hi = hex(p[3]), lo = hex(p[4]);
+        if (hi < 0 || lo < 0) return -1;
+        return (hi << 4) | lo;
+    };
+
+    // Concatenate the raw piece bytes (metaspace still embedded).
+    std::string raw;
+    for (int32_t id : ids) {
+        if (id < 0 || static_cast<std::size_t>(id) >= id_to_piece_.size())
+            continue;
+        const std::string& p = id_to_piece_[static_cast<std::size_t>(id)];
+        const int b = byte_fallback(p);
+        if (b >= 0) raw.push_back(static_cast<char>(b));
+        else        raw += p;
+    }
+
+    // Replace every metaspace (U+2581) with an ASCII space.
+    std::string out;
+    out.reserve(raw.size());
+    const std::size_t ms = sizeof(kMetaspace) - 1;   // 3 bytes
+    for (std::size_t i = 0; i < raw.size();) {
+        if (i + ms <= raw.size() &&
+            std::memcmp(raw.data() + i, kMetaspace, ms) == 0) {
+            out.push_back(' ');
+            i += ms;
+        } else {
+            out.push_back(raw[i]);
+            ++i;
+        }
+    }
+
+    // Strip the single leading space from add_prefix_space.
+    if (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    return out;
 }
 
 // ─── encode ────────────────────────────────────────────────────────────────

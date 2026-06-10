@@ -36,6 +36,15 @@ public:
     // Unigram pieces only — no eos, no padding.
     std::vector<int32_t> tokenize(std::string_view text) const;
 
+    // Detokenize a sequence of piece ids back to text (the inverse of
+    // tokenize). SentencePiece convention: the metaspace U+2581 becomes a
+    // space and the single leading space (add_prefix_space) is stripped;
+    // byte-fallback pieces "<0xNN>" decode to their raw byte. Ids outside the
+    // vocab are skipped, so a caller can pass an ASR id stream that excludes
+    // blank/pad. This is what the Parakeet STT driver uses to turn the model's
+    // token ids into a transcript.
+    std::string decode(const std::vector<int32_t>& ids) const;
+
     std::size_t vocab_count() const { return vocab_.size(); }
     int pad_id() const { return pad_id_; }
     int eos_id() const { return eos_id_; }
@@ -47,6 +56,8 @@ private:
     // piece-string -> {id, log-prob score}.
     struct Entry { int32_t id; double score; };
     std::unordered_map<std::string, Entry> vocab_;
+    // id -> piece-string, for decode().
+    std::vector<std::string> id_to_piece_;
 
     int pad_id_ = 0;
     int eos_id_ = 1;
