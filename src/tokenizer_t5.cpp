@@ -65,41 +65,55 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
                                  "'model' object");
     }
     const json::Value* vocab = model->find("vocab");
-    if (!vocab || !vocab->is_array()) {
-        throw std::runtime_error("t5::Tokenizer: model has no 'vocab' array");
+    if (!vocab || !(vocab->is_array() || vocab->is_object())) {
+        throw std::runtime_error("t5::Tokenizer: model has no 'vocab' "
+                                 "array or object");
     }
 
     Tokenizer t;
     t.unk_id_ = model->get_int("unk_id", 2);
 
-    const auto& entries = vocab->as_array();
-    t.id_to_piece_.assign(entries.size(), std::string());
     int eos_id = -1;
     int pad_id = -1;
     double min_score = std::numeric_limits<double>::infinity();
     std::size_t max_bytes = 1;
 
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        const auto& pair = entries[i];
-        if (!pair.is_array() || pair.as_array().size() < 2) {
-            throw std::runtime_error("t5::Tokenizer: malformed vocab entry");
-        }
-        const std::string& piece = pair.as_array()[0].as_string();
-        const double score = pair.as_array()[1].as_number();
-        const int32_t id = static_cast<int32_t>(i);
-
+    // Register one (piece, id, score) entry into the vocab + id->piece map.
+    auto add_piece = [&](const std::string& piece, int32_t id, double score) {
         t.vocab_.emplace(piece, Tokenizer::Entry{id, score});
-        t.id_to_piece_[i] = piece;
-        if (!piece.empty() && piece.size() > max_bytes) {
-            max_bytes = piece.size();
-        }
+        if (static_cast<std::size_t>(id) >= t.id_to_piece_.size())
+            t.id_to_piece_.resize(static_cast<std::size_t>(id) + 1);
+        t.id_to_piece_[static_cast<std::size_t>(id)] = piece;
+        if (!piece.empty() && piece.size() > max_bytes) max_bytes = piece.size();
         if (score < min_score) min_score = score;
-        if (piece == "</s>") eos_id = static_cast<int>(i);
-        if (piece == "<pad>") pad_id = static_cast<int>(i);
-    }
+        if (piece == "</s>") eos_id = id;
+        if (piece == "<pad>") pad_id = id;
+    };
 
-    if (entries.empty()) {
-        throw std::runtime_error("t5::Tokenizer: empty vocab");
+    if (vocab->is_array()) {
+        // SentencePiece Unigram: vocab is [[piece, log-prob], ...], id = index.
+        const auto& entries = vocab->as_array();
+        if (entries.empty())
+            throw std::runtime_error("t5::Tokenizer: empty vocab");
+        t.id_to_piece_.assign(entries.size(), std::string());
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const auto& pair = entries[i];
+            if (!pair.is_array() || pair.as_array().size() < 2)
+                throw std::runtime_error("t5::Tokenizer: malformed vocab entry");
+            add_piece(pair.as_array()[0].as_string(),
+                      static_cast<int32_t>(i), pair.as_array()[1].as_number());
+        }
+    } else {
+        // HF BPE (SentencePiece exported as BPE, e.g. NeMo Parakeet): vocab is
+        // a {piece: id} object with no per-piece scores. encode()/tokenize()'s
+        // Unigram Viterbi is not meaningful here (scores are 0), but decode()
+        // — the inverse id->piece metaspace join the ASR drivers need — is
+        // exact, which is the supported operation for this vocab shape.
+        const auto& members = vocab->as_object();
+        if (members.empty())
+            throw std::runtime_error("t5::Tokenizer: empty vocab");
+        for (const auto& m : members)
+            add_piece(m.first, static_cast<int32_t>(m.second.as_number()), 0.0);
     }
 
     t.eos_id_ = (eos_id >= 0) ? eos_id : 1;
