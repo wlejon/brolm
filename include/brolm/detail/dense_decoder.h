@@ -101,13 +101,25 @@ public:
     // Reset the cache length to 0, keeping the allocation.
     void reset_cache();
 
+    // Roll the cache length back to `len` (0 <= len <= cache_len). The next
+    // forward then appends at [len, len + L), overwriting any rows previously
+    // written past `len` — no buffer invalidation is needed because those rows
+    // are dead until rewritten, and RoPE positions restart from `len`. This is
+    // the speculative-draft seam: draft K tokens, inspect, truncate_cache back,
+    // and continue from `len` reproduces the never-drafted continuation exactly.
+    // Throws if len is negative or exceeds the current cache_len.
+    void truncate_cache(int len);
+
     int cache_len() const { return cache_len_; }
 
     // Append L tokens at absolute positions [cache_len, cache_len + L), run the
     // decoder, and write `logits_out` := (L, vocab_size) at the compute dtype.
     // Advances cache_len by L. brotensor::init() must have been called once
-    // before any forward.
-    void forward(const int32_t* ids, int L, brotensor::Tensor& logits_out);
+    // before any forward. When `hidden_out` is non-null it receives the
+    // (L, hidden_size) post-final-norm hidden states (the rows lm_head consumes)
+    // — the control/bridge readout needs the last row alongside the logits.
+    void forward(const int32_t* ids, int L, brotensor::Tensor& logits_out,
+                 brotensor::Tensor* hidden_out = nullptr);
 
     // Embedding lookup only: write `out` := (L, hidden_size) input embeddings
     // for `ids` at the compute dtype. Does NOT touch the KV cache. Used by
@@ -119,9 +131,12 @@ public:
     // token ids — `embeds` must be (L, hidden_size) at the compute dtype (e.g.
     // the output of embed_tokens with selected rows overwritten by image
     // embeddings). Appends at [cache_len, cache_len + L), writes
-    // `logits_out` := (L, vocab_size), and advances cache_len by L.
+    // `logits_out` := (L, vocab_size), and advances cache_len by L. When
+    // `hidden_out` is non-null it receives the (L, hidden_size) post-final-norm
+    // hidden states, exactly as forward() above.
     void forward_embeds(const brotensor::Tensor& embeds, int L,
-                        brotensor::Tensor& logits_out);
+                        brotensor::Tensor& logits_out,
+                        brotensor::Tensor* hidden_out = nullptr);
 
     const DenseDecoderConfig& config() const { return cfg_; }
 
@@ -141,7 +156,10 @@ private:
     // already populated in h_ (L rows at the compute dtype), writing
     // `logits_out` := (L, vocab_size) and advancing cache_len by L. Shared by
     // forward() (h_ from embedding lookup) and forward_embeds() (h_ supplied).
-    void run_layers_(int L, brotensor::Tensor& logits_out);
+    // When `hidden_out` is non-null it receives a clone of the (L, hidden_size)
+    // post-final-norm hidden states (the lm_head input).
+    void run_layers_(int L, brotensor::Tensor& logits_out,
+                     brotensor::Tensor* hidden_out);
 
     DenseDecoderConfig cfg_;
 

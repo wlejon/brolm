@@ -150,6 +150,17 @@ void DenseDecoder::allocate_cache(int max_seq_len) {
 
 void DenseDecoder::reset_cache() { cache_len_ = 0; }
 
+void DenseDecoder::truncate_cache(int len) {
+    if (len < 0) fail("truncate_cache: len must be non-negative");
+    if (len > cache_len_) {
+        fail("truncate_cache: len exceeds current cache_len");
+    }
+    // The cached K/V rows past `len` are left in place; they are dead until the
+    // next forward overwrites them at [len, len + L). RoPE positions derive from
+    // cache_len_ at forward time, so they correctly restart from `len`.
+    cache_len_ = len;
+}
+
 // ─── forward ─────────────────────────────────────────────────────────────────
 
 void DenseDecoder::embed_tokens(const int32_t* ids, int L, bt::Tensor& out) {
@@ -163,7 +174,8 @@ void DenseDecoder::embed_tokens(const int32_t* ids, int L, bt::Tensor& out) {
     out = out.clone();
 }
 
-void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out) {
+void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out,
+                           bt::Tensor* hidden_out) {
     if (!ids) fail("forward: ids pointer is null");
     if (L <= 0) fail("forward: L must be positive");
     if (embed_tokens_.size() == 0) fail("forward: weights not loaded");
@@ -178,11 +190,12 @@ void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out) {
         embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
     h_ = h_.clone();
 
-    run_layers_(L, logits_out);
+    run_layers_(L, logits_out, hidden_out);
 }
 
 void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
-                                  bt::Tensor& logits_out) {
+                                  bt::Tensor& logits_out,
+                                  bt::Tensor* hidden_out) {
     if (L <= 0) fail("forward_embeds: L must be positive");
     if (embed_tokens_.size() == 0) fail("forward_embeds: weights not loaded");
     if (max_seq_len_ == 0) fail("forward_embeds: cache not allocated");
@@ -196,10 +209,11 @@ void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
     // Own a stable residual stream in h_ (the layer loop mutates it in place).
     h_ = embeds.clone();
 
-    run_layers_(L, logits_out);
+    run_layers_(L, logits_out, hidden_out);
 }
 
-void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out) {
+void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
+                               bt::Tensor* hidden_out) {
     const int HD   = cfg_.head_dim;
     const int n_q  = cfg_.num_attention_heads;
     const int n_kv = cfg_.num_key_value_heads;
@@ -285,6 +299,10 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out) {
 
     // Final norm + LM head.
     bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+    if (hidden_out) {
+        // norm_ is reused scratch across calls; hand the caller stable storage.
+        *hidden_out = norm_.clone();
+    }
     detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
 
     cache_len_ += L;

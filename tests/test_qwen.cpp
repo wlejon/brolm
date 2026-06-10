@@ -246,6 +246,96 @@ int main() {
                         static_cast<double>(max_rel));
             CHECK(max_rel < 1e-4f);
         }
+
+        // ── 4. embed_tokens / forward_embeds splice seam ──────────────────
+        // forward(ids) must be bit-identical to forward_embeds(embed_tokens(ids)):
+        // the token-id path is just an embedding lookup feeding the same layers.
+        {
+            qwen::Qwen3Model m_ids(cfg);
+            m_ids.load_weights(file, "");
+            m_ids.allocate_cache(16);
+            bt::Tensor logits_ids, hidden_ids;
+            m_ids.forward(seq.data(), Lseq, logits_ids, &hidden_ids);
+            bt::sync_all();
+            CHECK(hidden_ids.rows == Lseq);
+            CHECK(hidden_ids.cols == H);
+
+            qwen::Qwen3Model m_emb(cfg);
+            m_emb.load_weights(file, "");
+            m_emb.allocate_cache(16);
+            bt::Tensor embeds;
+            m_emb.embed_tokens(seq.data(), Lseq, embeds);
+            CHECK(embeds.rows == Lseq);
+            CHECK(embeds.cols == H);
+            bt::Tensor logits_emb, hidden_emb;
+            m_emb.forward_embeds(embeds, Lseq, logits_emb, &hidden_emb);
+            bt::sync_all();
+
+            CHECK(bdtest::bd_download(logits_ids) == bdtest::bd_download(logits_emb));
+            CHECK(bdtest::bd_download(hidden_ids) == bdtest::bd_download(hidden_emb));
+
+            // hidden_out is the lm_head input: feeding it through is implicit,
+            // but at least confirm it is finite and the right shape.
+            int nf = 0;
+            for (float v : bdtest::bd_download(hidden_ids))
+                if (!bdtest::bd_finite(v)) ++nf;
+            CHECK(nf == 0);
+        }
+
+        // ── 5. speculative-draft rollback (truncate_cache) ────────────────
+        // Draft some tokens into the cache, roll back, and continue: the
+        // continuation must be bit-identical to one that never drafted.
+        {
+            const std::vector<int32_t> cont = {9, 22, 4};   // real continuation
+            const std::vector<int32_t> draft = {40, 13};    // speculative junk
+
+            // Reference: prefill, then decode the real continuation, no drafts.
+            std::vector<std::vector<float>> ref_logits;
+            {
+                qwen::Qwen3Model m(cfg);
+                m.load_weights(file, "");
+                m.allocate_cache(32);
+                bt::Tensor l;
+                m.forward(seq.data(), Lseq, l);
+                for (int32_t id : cont) {
+                    bt::Tensor s;
+                    m.forward(&id, 1, s);
+                    bt::sync_all();
+                    ref_logits.push_back(bdtest::bd_download(s));
+                }
+            }
+
+            // Drafted: prefill, draft a couple tokens, truncate back to the
+            // post-prefill length, then decode the real continuation.
+            {
+                qwen::Qwen3Model m(cfg);
+                m.load_weights(file, "");
+                m.allocate_cache(32);
+                bt::Tensor l;
+                m.forward(seq.data(), Lseq, l);
+                const int anchor = m.cache_len();
+                CHECK(anchor == Lseq);
+
+                for (int32_t id : draft) {
+                    bt::Tensor s;
+                    m.forward(&id, 1, s);
+                }
+                bt::sync_all();
+                CHECK(m.cache_len() == Lseq + static_cast<int>(draft.size()));
+
+                m.truncate_cache(anchor);
+                CHECK(m.cache_len() == anchor);
+
+                bool all_match = true;
+                for (std::size_t t = 0; t < cont.size(); ++t) {
+                    bt::Tensor s;
+                    m.forward(&cont[t], 1, s);
+                    bt::sync_all();
+                    if (bdtest::bd_download(s) != ref_logits[t]) all_match = false;
+                }
+                CHECK(all_match);
+            }
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "qwen test threw: %s\n", e.what());
         ++g_failures;

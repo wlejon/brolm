@@ -98,6 +98,14 @@ public:
     // Reset the cache length to 0, keeping the allocation.
     void reset_cache() { core_.reset_cache(); }
 
+    // Roll the cache length back to `len` (0 <= len <= cache_len). The next
+    // forward appends at [len, len + L), overwriting any rows written past
+    // `len`; RoPE positions restart from `len`. This is the speculative-draft
+    // rollback seam: draft K tokens, inspect, truncate_cache(len), continue —
+    // bit-identical to the never-drafted continuation. Throws if len is out of
+    // range.
+    void truncate_cache(int len) { core_.truncate_cache(len); }
+
     int cache_len() const { return core_.cache_len(); }
 
     // Append L tokens at absolute positions [cache_len, cache_len + L), run the
@@ -105,9 +113,31 @@ public:
     // Advances cache_len by L. Prefill = one call with the whole prompt;
     // decode = a call with L == 1.
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
+    // When `hidden_out` is non-null it receives the (L, hidden_size)
+    // post-final-norm hidden states (the lm_head input) — the control readout
+    // and any bridge training need the last row alongside the logits.
     // brotensor::init() must have been called once before any forward.
-    void forward(const int32_t* ids, int L, brotensor::Tensor& logits_out) {
-        core_.forward(ids, L, logits_out);
+    void forward(const int32_t* ids, int L, brotensor::Tensor& logits_out,
+                 brotensor::Tensor* hidden_out = nullptr) {
+        core_.forward(ids, L, logits_out, hidden_out);
+    }
+
+    // Embedding lookup only: write `out` := (L, hidden_size) input embeddings
+    // for `ids` at the compute dtype. Does NOT touch the KV cache. Lets a
+    // bridge harness splice continuous (non-text) embeddings into the input
+    // stream before running forward_embeds — the same seam the VL models use.
+    void embed_tokens(const int32_t* ids, int L, brotensor::Tensor& out) {
+        core_.embed_tokens(ids, L, out);
+    }
+
+    // Like forward(), but starts from precomputed input embeddings rather than
+    // token ids — `embeds` must be (L, hidden_size) at the compute dtype (e.g.
+    // embed_tokens() output with selected rows overwritten by spliced
+    // embeddings). forward(ids,...) == forward_embeds(embed_tokens(ids),...).
+    void forward_embeds(const brotensor::Tensor& embeds, int L,
+                        brotensor::Tensor& logits_out,
+                        brotensor::Tensor* hidden_out = nullptr) {
+        core_.forward_embeds(embeds, L, logits_out, hidden_out);
     }
 
     const Qwen3Config& config() const { return cfg_; }
