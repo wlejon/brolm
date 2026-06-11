@@ -12,10 +12,18 @@
 //   * "full_attention" (F) — standard softmax GQA attention with an output
 //                            gate (`attn_output_gate=true`). Implemented here.
 //
-//   * "linear_attention" (L) — Gated DeltaNet (Mamba-2-family) recurrence.
-//                              Stubbed as identity passthrough in this chunk;
-//                              the tensors are loaded into `LinearAttnLayer`
-//                              but unused. Stage 3b wires the recurrence.
+//   * "linear_attention" (L) — Gated DeltaNet (Mamba-2-family) recurrence:
+//                              depthwise causal conv1d over the q||k||v stream
+//                              + gated delta-rule state update, FP32
+//                              end-to-end (the recurrence and conv-update
+//                              kernels are FP32-only; the block casts at its
+//                              boundaries). Prefill (T > 1) runs the chunked
+//                              rule + one bulk conv pass; decode (T == 1)
+//                              runs the per-step rule + streaming conv update
+//                              against the same persistent state, so the two
+//                              paths reproduce one continuous recurrence.
+//                              See linear_attn block in qwen35_text.cpp for
+//                              the full per-token math.
 //
 // Full-attention block (one F layer, residual stream `h` of width hidden_size):
 //
@@ -89,11 +97,17 @@ struct FullAttnKVCache {
 //               (qkv_channels == 3 * num_heads * head_dim). Read + overwritten
 //               in place by brotensor::causal_conv1d_update.
 //
+//   len       : number of tokens absorbed into the state since the last
+//               reset — maintained by forward(). truncate_cache() uses it to
+//               detect (and reject) genuine rollback of linear-attention
+//               state, which is impossible without per-token snapshots.
+//
 // `initialized` is true once make_cache() has zeroed both buffers. Allocated
 // only for linear-attention layer slots; full-attention slots leave it false.
 struct LinearAttnState {
     brotensor::Tensor recurrent;
     brotensor::Tensor conv_state;
+    int len = 0;
     bool initialized = false;
 };
 
@@ -122,8 +136,23 @@ public:
         const std::string& prefix = "model.language_model.");
 
     // Allocate per-layer caches sized for `max_seq` tokens. Full-attn layers
-    // get K/V; linear-attn slots are left empty in this chunk.
+    // get K/V at the compute dtype; linear-attn slots get zero-filled FP32
+    // recurrent + conv-state buffers (their size is independent of max_seq).
     std::vector<LayerCache> make_cache(int max_seq) const;
+
+    // Roll the per-layer caches back to `len` tokens — the speculative-decode
+    // rollback seam (draft K tokens, inspect, truncate, continue).
+    //
+    // Full-attention layers truncate their KV length (len must not exceed the
+    // current one). Linear-attention layers CANNOT roll back: the Gated
+    // DeltaNet recurrent state and conv shift register are lossy running
+    // summaries with no per-token history, so any truncation to a length
+    // other than the tokens already absorbed (LinearAttnState::len) THROWS
+    // std::runtime_error rather than silently decoding from a state that
+    // still contains the rolled-back tokens. With the hybrid [L,L,L,F]
+    // schedule this means truncate_cache is only usable as a full-stack
+    // no-op check until linear-state snapshotting exists.
+    void truncate_cache(std::vector<LayerCache>& cache, int len) const;
 
     // Run the decoder over `token_ids` (length T) at the per-token M-RoPE
     // positions (mrope_t/h/w each length T). For pure-text decoding pass the
@@ -175,8 +204,9 @@ private:
         brotensor::Tensor k_norm;   // (head_dim,)
     };
 
-    // Per-layer weight bundle for a linear_attention layer. Tensors are loaded
-    // so the safetensors check succeeds, but they are unused in Stage 3a.
+    // Per-layer weight bundle for a linear_attention layer. Every tensor is
+    // uploaded as FP32 regardless of the pipeline compute dtype — the whole
+    // linear-attn block runs FP32 (see the loader note in qwen35_text.cpp).
     struct LinearAttnLayer {
         brotensor::Tensor A_log;
         brotensor::Tensor conv1d;
@@ -260,6 +290,8 @@ private:
 
     // Linear-attention scratch (see qwen35_text.cpp linear_attn_block_).
     brotensor::Tensor lin_qkv_;        // (T, 3*num_heads*head_dim)
+    brotensor::Tensor lin_qkv_ncl_;    // (1, C*T) NCL transpose for prefill conv
+    brotensor::Tensor lin_conv_ncl_;   // (1, C*T) NCL conv output (prefill)
     brotensor::Tensor lin_qkv_conv_;   // (T, 3*num_heads*head_dim) after conv + silu
     brotensor::Tensor lin_q_, lin_k_, lin_v_;   // (T, num_heads*head_dim) each
     brotensor::Tensor lin_a_raw_;      // (T, num_heads) FP32

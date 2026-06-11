@@ -408,15 +408,10 @@ void TextModel::load_weights_impl_(
             L.full.q_norm = brolm::detail::upload_host(qn_perm.data(), HD, 1);
             L.full.k_norm = brolm::detail::upload_host(kn_perm.data(), HD, 1);
         } else {
-            // Linear-attn layer — load tensors so the safetensors check holds
-            // and Stage 3b can read them. Forward path stubs to identity.
+            // Linear-attn layer (Gated DeltaNet). Shapes are taken from the
+            // safetensors views directly (no per-tensor shape check) to stay
+            // robust to future config drift.
             const std::string lp = p + "linear_attn.";
-            // Shapes derived from cfg_. All Linear at this point only loaded.
-            // (We don't strictly need to load these for Stage 3a, but the spec
-            // requires the loader to accept them — so resolve each tensor by
-            // name and copy its bytes through upload_compute. Shapes use
-            // safetensors view->shape directly via upload_compute (no shape
-            // check) to stay robust to future config drift.)
             // Force-upload every linear-attn tensor as FP32 regardless of the
             // pipeline compute dtype. The Gated DeltaNet recurrence
             // (gated_delta_rule_step) and causal_conv1d_update kernels are
@@ -514,10 +509,48 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
                                                    bt::Dtype::FP32);
             c.lin.conv_state = bt::Tensor::zeros_on(dev, 1, conv_st_cols,
                                                     bt::Dtype::FP32);
+            c.lin.len = 0;
             c.lin.initialized = true;
         }
     }
     return out;
+}
+
+void TextModel::truncate_cache(std::vector<LayerCache>& cache, int len) const {
+    if (len < 0) fail("truncate_cache: len must be non-negative");
+    if (cache.size() != static_cast<std::size_t>(cfg_.num_hidden_layers)) {
+        fail("truncate_cache: cache size mismatch");
+    }
+    // Validate everything BEFORE mutating anything, so a throw leaves the
+    // cache untouched. Linear-attention layers fold every absorbed token into
+    // a fixed-size running state (S and the conv shift register) — there is
+    // no per-token history to truncate back to, so any genuine rollback must
+    // fail loudly rather than silently decode from a state that still
+    // contains the rolled-back tokens.
+    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        const LayerCache& c = cache[static_cast<std::size_t>(i)];
+        if (cfg_.layer_types[static_cast<std::size_t>(i)] == LayerType::Linear) {
+            if (c.lin.len != len) {
+                fail("truncate_cache: cannot roll back linear-attention state "
+                     "at layer " + std::to_string(i) + " (state holds " +
+                     std::to_string(c.lin.len) + " tokens, requested " +
+                     std::to_string(len) + "). Gated DeltaNet state is a "
+                     "lossy running summary with no per-token snapshots; "
+                     "speculative rollback across linear layers is "
+                     "unsupported — re-prefill instead.");
+            }
+        } else if (len > c.full.len) {
+            fail("truncate_cache: len " + std::to_string(len) +
+                 " exceeds current cache len " + std::to_string(c.full.len) +
+                 " at layer " + std::to_string(i));
+        }
+    }
+    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        LayerCache& c = cache[static_cast<std::size_t>(i)];
+        if (cfg_.layer_types[static_cast<std::size_t>(i)] == LayerType::Full) {
+            c.full.len = len;
+        }
+    }
 }
 
 // ─── partial M-RoPE ────────────────────────────────────────────────────────
@@ -753,10 +786,9 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             // (https://raw.githubusercontent.com/huggingface/transformers/main/
             //  src/transformers/models/qwen3_next/modeling_qwen3_next.py).
             //
-            // Per-step rule, applied serially over the T new tokens (also when
-            // T > 1 in prefill — this is a known perf tradeoff vs. HF's
-            // chunked WY/UT formulation; see the note at the top of this
-            // function for Stage 5 follow-up):
+            // Per-token rule (prefill T > 1 runs it via the chunked WY/UT
+            // formulation, decode T == 1 via the streaming step — identical
+            // math against the same persistent state, see delta_rule.h):
             //
             //   x      = rms_norm(h, in_norm)                  [already done]
             //   qkv    = in_proj_qkv @ x                       (T, 3*H*D_k)
@@ -765,7 +797,7 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             //   z      = in_proj_z @ x                         (T, H*D_v)
             //   a_raw  = in_proj_a @ x + dt_bias               (T, H) FP32
             //   b_raw  = in_proj_b @ x                         (T, H) FP32
-            //   O, S'  = gated_delta_rule_step(q,k,v,a_raw,b_raw,log_A,S)
+            //   O, S'  = gated_delta_rule(q,k,v,a_raw,b_raw,log_A,S)
             //     (per HF: g = -A_log.exp() * softplus(a + dt_bias);
             //              beta = sigmoid(b); applied inside brotensor's op.)
             //   O'     = rms_norm_per_head(O, norm.weight)     [per HF: norm
@@ -802,36 +834,33 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             // 1) in_proj_qkv -> (L, qkv_ch)
             detail::linear_batched(layer.lin.in_proj_qkv, nullptr, *lin_x, lin_qkv_);
 
-            // 2) Depthwise causal conv1d with state, then SiLU (HF activation).
-            //    brotensor's causal_conv1d_update lays X out as (N, C * L_step)
-            //    with the L_step samples per channel CONTIGUOUS (channel-major).
-            //    Our `lin_qkv_` is (T, C) token-major, so the obvious bulk call
-            //    would reorder the layout. We instead apply the op per token
-            //    (L_step=1) — each call is a length-C row, which matches both
-            //    layouts trivially and keeps the recurrence-equivalence
-            //    between prefill (T>1) and decode (T=1) exact.
-            //
-            //    Perf note: this serial-per-token pass is O(T * C * kL); a
-            //    chunked-parallel implementation matching HF's `causal_conv1d_fn`
-            //    would be a Stage 5 follow-up. For the prefill lengths brolm
-            //    targets (hundreds of tokens) the difference is negligible.
-            brolm::detail::resize_like(lin_qkv_conv_, L, qkv_ch,
-                                       bt::Dtype::FP32, lin_qkv_.device);
-            {
-                bt::Tensor row_in, row_out;
-                for (int t = 0; t < L; ++t) {
-                    row_in = bt::Tensor::view(lin_qkv_.device,
-                        static_cast<char*>(lin_qkv_.data) +
-                            static_cast<std::size_t>(t) * qkv_ch * sizeof(float),
-                        1, qkv_ch, bt::Dtype::FP32);
-                    bt::causal_conv1d_update(row_in, layer.lin.conv1d,
-                                             /*bias=*/nullptr,
-                                             /*N=*/1, /*C=*/qkv_ch, /*L_step=*/1,
-                                             /*kL=*/kK, /*dilation=*/1,
-                                             c.lin.conv_state, row_out);
-                    // Copy row_out (1, qkv_ch) into lin_qkv_conv_ at row t.
-                    bt::copy_d2d(row_out, 0, lin_qkv_conv_, t * qkv_ch, qkv_ch);
-                }
+            // 2) Depthwise causal conv1d against the rolling conv_state, then
+            //    SiLU (HF activation). brotensor's causal_conv1d_update lays X
+            //    out as (N, C * L_step) with the L_step samples per channel
+            //    CONTIGUOUS (channel-major / NCL); `lin_qkv_` is (T, C)
+            //    token-major. For decode (T == 1) the two layouts coincide, so
+            //    the op runs directly on the projected row. For prefill we
+            //    transpose to NCL, run ONE bulk update over all T tokens, and
+            //    transpose back. Either way causal_conv1d_update consumes the
+            //    existing conv_state as left context and leaves the last
+            //    (kL-1) samples in it, so prefill-then-decode reproduces one
+            //    continuous causal conv over the whole stream.
+            if (L == 1) {
+                bt::causal_conv1d_update(lin_qkv_, layer.lin.conv1d,
+                                         /*bias=*/nullptr,
+                                         /*N=*/1, /*C=*/qkv_ch, /*L_step=*/1,
+                                         /*kL=*/kK, /*dilation=*/1,
+                                         c.lin.conv_state, lin_qkv_conv_);
+            } else {
+                bt::sequence_to_nchw(lin_qkv_, /*N=*/1, /*C=*/qkv_ch,
+                                     /*H=*/1, /*W=*/L, lin_qkv_ncl_);
+                bt::causal_conv1d_update(lin_qkv_ncl_, layer.lin.conv1d,
+                                         /*bias=*/nullptr,
+                                         /*N=*/1, /*C=*/qkv_ch, /*L_step=*/L,
+                                         /*kL=*/kK, /*dilation=*/1,
+                                         c.lin.conv_state, lin_conv_ncl_);
+                bt::nchw_to_sequence(lin_conv_ncl_, /*N=*/1, /*C=*/qkv_ch,
+                                     /*H=*/1, /*W=*/L, lin_qkv_conv_);
             }
             bt::silu_forward(lin_qkv_conv_, lin_qkv_conv_);
 
@@ -883,11 +912,23 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             bt::scale_inplace(lin_q_, 1.0f / std::sqrt(static_cast<float>(lin_d_k)));
 
             // 8) Recurrence: updates c.lin.recurrent in place; writes O.
-            bt::gated_delta_rule_step(lin_q_, lin_k_, lin_v_,
-                                       lin_a_raw_, lin_beta_, lin_log_A_,
-                                       /*num_heads=*/lin_h,
-                                       /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
-                                       c.lin.recurrent, lin_O_);
+            //    Prefill takes the chunked WY/UT path, decode the per-step
+            //    rule — the contract of both is the identical per-token
+            //    recurrence (delta_rule.h), so the split is purely perf.
+            if (L == 1) {
+                bt::gated_delta_rule_step(lin_q_, lin_k_, lin_v_,
+                                          lin_a_raw_, lin_beta_, lin_log_A_,
+                                          /*num_heads=*/lin_h,
+                                          /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
+                                          c.lin.recurrent, lin_O_);
+            } else {
+                bt::gated_delta_rule_chunked(lin_q_, lin_k_, lin_v_,
+                                             lin_a_raw_, lin_beta_, lin_log_A_,
+                                             /*num_heads=*/lin_h,
+                                             /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
+                                             c.lin.recurrent, lin_O_);
+            }
+            c.lin.len += L;
 
             // 9) Per-head RMSNorm with norm.weight (size value_head_dim), then
             //    multiply by silu(z). Order: HF's Qwen3NextRMSNormGated does

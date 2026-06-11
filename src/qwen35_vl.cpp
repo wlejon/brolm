@@ -381,6 +381,7 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
         if (lc.lin.initialized) {
             lc.lin.recurrent.zero();
             lc.lin.conv_state.zero();
+            lc.lin.len = 0;
         }
     }
 

@@ -6,8 +6,7 @@
 //     logits against the prefill's last row.
 // (c) Real checkpoint — gated on BROLM_QWEN35_DIR. Loads
 //     model.language_model.* from the real 0.8B safetensors and runs a short
-//     prefill. Linear layers are stubbed-as-identity in this chunk so the
-//     output is not numerically meaningful; we only assert shape and finiteness.
+//     prefill; asserts shape/finiteness and a sane next-token distribution.
 
 #include "brolm/qwen35_config.h"
 #include "brolm/qwen35_text.h"
@@ -267,13 +266,12 @@ void run_synthetic() {
         // Prefill-vs-decode equivalence is an algebraic identity: carrying the
         // conv shift-register and the gated-delta recurrence state forward
         // token-by-token gives the same result whether the 6 tokens arrive as
-        // one batch or as a 5-token prefill followed by a 1-token decode. On the
-        // FP32 CPU path it holds exactly (max abs error 0). On the FP16/BF16 GPU
-        // path the two evaluation orders round differently — the FP16 residual
-        // stream, attention, and lm_head accumulate a per-logit gap on the order
-        // of FP16 unit roundoff (~5e-4), which a pure relative metric blows up
-        // on near-zero logits. Compare with an absolute+relative bound sized to
-        // the compute dtype.
+        // one batch or as a 5-token prefill followed by a 1-token decode.
+        // Numerically the two paths round differently (prefill runs the
+        // chunked WY/UT delta rule, decode the per-step rule; on GPU the FP16
+        // residual stream, attention, and lm_head add unit-roundoff gaps
+        // ~5e-4 that a pure relative metric blows up on near-zero logits), so
+        // compare with an absolute+relative bound sized to the compute dtype.
         const bool is_fp32 = (brolm::compute_dtype() == bt::Dtype::FP32);
         const float atol = is_fp32 ? 1e-5f : 2e-3f;
         const float rtol = is_fp32 ? 1e-4f : 2e-2f;
@@ -295,6 +293,23 @@ void run_synthetic() {
                     static_cast<double>(max_abs),
                     static_cast<double>(worst_ratio));
         CHECK(worst_ratio <= 1.0f);
+
+        // truncate_cache: rolling back to the CURRENT length (6 tokens) is a
+        // no-op and must succeed; any other target must throw, because the
+        // linear-attention layers' running state cannot be truncated.
+        try {
+            model.truncate_cache(cache, 6);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "truncate_cache(6) threw: %s\n", e.what());
+            ++g_failures;
+        }
+        bool threw = false;
+        try {
+            model.truncate_cache(cache, 5);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "qwen35_text synthetic threw: %s\n", e.what());
         ++g_failures;
