@@ -530,10 +530,44 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
 // pos_t/h/w must be already in length L. The peak position across the three
 // streams determines the per-axis table height.
 
-void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L,
-                                     const std::vector<int32_t>& pos_t,
-                                     const std::vector<int32_t>& pos_h,
-                                     const std::vector<int32_t>& pos_w) {
+void TextModel::prepare_mrope_(const std::vector<int32_t>& pos_t,
+                               const std::vector<int32_t>& pos_h,
+                               const std::vector<int32_t>& pos_w, int L) {
+    const int rd = rotary_dim_;
+    if (rd == 0) return;
+
+    int max_pos = 0;
+    auto upd = [&](const std::vector<int32_t>& v) {
+        for (int32_t p : v) if (p > max_pos) max_pos = p;
+    };
+    upd(pos_t); upd(pos_h); upd(pos_w);
+
+    // (Re)build the per-axis tables only when the cached ones are too short.
+    // Bucketed growth: a decode loop advances max_pos by one per token, and
+    // rebuilding per token is the per-layer host-rebuild pathology this cache
+    // exists to kill. rope_apply_mrope indexes rows by position, so taller
+    // tables serve smaller positions unchanged.
+    if (max_pos > mrope_tbl_max_pos_) {
+        const int cap = std::max({max_pos, 2 * mrope_tbl_max_pos_, 1023});
+        // Per-axis global inv_freq indices follow HF's apply_interleaved_mrope.
+        MRopePairing pairing = mrope_pairing(d_t_, d_h_, d_w_);
+        build_axis_tables(cap, d_t_, rd, cfg_.rope.rope_theta,
+                          pairing.t_pairs, mrope_cos_t_, mrope_sin_t_);
+        build_axis_tables(cap, d_h_, rd, cfg_.rope.rope_theta,
+                          pairing.h_pairs, mrope_cos_h_, mrope_sin_h_);
+        build_axis_tables(cap, d_w_, rd, cfg_.rope.rope_theta,
+                          pairing.w_pairs, mrope_cos_w_, mrope_sin_w_);
+        mrope_tbl_max_pos_ = cap;
+    }
+
+    // brotensor's mrope op accepts host pointers on CPU, device on CUDA/Metal.
+    // Upload each stream once per forward; every layer reads the same buffers.
+    pos_t_dev_ = make_idx_device(pos_t.data(), L);
+    pos_h_dev_ = make_idx_device(pos_h.data(), L);
+    pos_w_dev_ = make_idx_device(pos_w.data(), L);
+}
+
+void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L) {
     const int HD = cfg_.head_dim;
     const int rd = rotary_dim_;
     if (rd == 0) return;
@@ -546,60 +580,28 @@ void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L,
     bt::Tensor& scratch = (num_heads == cfg_.num_attention_heads) ? q_rot_ : k_rot_;
     brolm::detail::resize_like(scratch, L, rot_cols, qk.dtype, qk.device);
 
-    // Copy rotary subrange from qk -> scratch (per head, per row).
-    for (int r = 0; r < L; ++r) {
-        for (int h = 0; h < num_heads; ++h) {
-            const int src_off = r * (num_heads * HD) + h * HD;
-            const int dst_off = r * rot_cols + h * rd;
-            bt::copy_d2d(qk, src_off, scratch, dst_off, rd);
-        }
-    }
-
-    // Build per-axis tables for the maximum position present.
-    int max_pos = 0;
-    auto upd = [&](const std::vector<int32_t>& v) {
-        for (int32_t p : v) if (p > max_pos) max_pos = p;
-    };
-    upd(pos_t); upd(pos_h); upd(pos_w);
-
-    bt::Tensor cos_t, sin_t, cos_h_tbl, sin_h_tbl, cos_w, sin_w;
-    // Per-axis global inv_freq indices follow HF's apply_interleaved_mrope.
-    MRopePairing pairing = mrope_pairing(d_t_, d_h_, d_w_);
-    build_axis_tables(max_pos, d_t_, rd, cfg_.rope.rope_theta,
-                      pairing.t_pairs, cos_t, sin_t);
-    build_axis_tables(max_pos, d_h_, rd, cfg_.rope.rope_theta,
-                      pairing.h_pairs, cos_h_tbl, sin_h_tbl);
-    build_axis_tables(max_pos, d_w_, rd, cfg_.rope.rope_theta,
-                      pairing.w_pairs, cos_w, sin_w);
-
-    // brotensor's mrope op accepts host pointers on CPU, device on CUDA/Metal.
-    // We stage on host then optionally migrate. For simplicity match the
-    // qwen.cpp convention: build device-resident int32 buffers via make_idx_device.
-    bt::Tensor pos_t_dev = make_idx_device(pos_t.data(), L);
-    bt::Tensor pos_h_dev = make_idx_device(pos_h.data(), L);
-    bt::Tensor pos_w_dev = make_idx_device(pos_w.data(), L);
+    // Rotary subrange qk -> scratch: the first rd columns of each head, one
+    // strided device copy over L*num_heads rows (was a copy_d2d per row per
+    // head).
+    bt::copy_d2d_strided(qk, 0, HD, scratch, 0, rd,
+                         /*width=*/rd, /*height=*/L * num_heads);
 
     bt::rope_apply_mrope(
         scratch,
-        cos_t, sin_t,
-        cos_h_tbl, sin_h_tbl,
-        cos_w, sin_w,
-        static_cast<const int32_t*>(pos_t_dev.data),
-        static_cast<const int32_t*>(pos_h_dev.data),
-        static_cast<const int32_t*>(pos_w_dev.data),
+        mrope_cos_t_, mrope_sin_t_,
+        mrope_cos_h_, mrope_sin_h_,
+        mrope_cos_w_, mrope_sin_w_,
+        static_cast<const int32_t*>(pos_t_dev_.data),
+        static_cast<const int32_t*>(pos_h_dev_.data),
+        static_cast<const int32_t*>(pos_w_dev_.data),
         /*head_dim=*/rd,
         /*num_heads=*/num_heads,
         /*d_t=*/d_t_, /*d_h=*/d_h_, /*d_w=*/d_w_,
         scratch);
 
-    // Copy rotated subrange back into qk.
-    for (int r = 0; r < L; ++r) {
-        for (int h = 0; h < num_heads; ++h) {
-            const int dst_off = r * (num_heads * HD) + h * HD;
-            const int src_off = r * rot_cols + h * rd;
-            bt::copy_d2d(scratch, src_off, qk, dst_off, rd);
-        }
-    }
+    // Rotated subrange back into qk; pass-through columns untouched.
+    bt::copy_d2d_strided(scratch, 0, rd, qk, 0, HD,
+                         /*width=*/rd, /*height=*/L * num_heads);
 }
 
 // ─── MLP block ─────────────────────────────────────────────────────────────
@@ -684,6 +686,10 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
         pos_w[static_cast<std::size_t>(i)] = static_cast<int32_t>(mrope_w[static_cast<std::size_t>(i)]);
     }
 
+    // Stage the M-RoPE position streams + tables once for the whole layer
+    // stack.
+    prepare_mrope_(pos_t, pos_h, pos_w, L);
+
     // Initialise the residual stream from the supplied embeddings. Clone so we
     // don't mutate the caller's tensor across the layer stack.
     h_ = embeds.clone();
@@ -722,8 +728,8 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             headnorm(k_, n_kv, layer.full.k_norm, kn_);
 
             // Partial M-RoPE on q and k.
-            apply_partial_mrope_(qn_, n_q,  L, pos_t, pos_h, pos_w);
-            apply_partial_mrope_(kn_, n_kv, L, pos_t, pos_h, pos_w);
+            apply_partial_mrope_(qn_, n_q,  L);
+            apply_partial_mrope_(kn_, n_kv, L);
 
             // GQA: append the n_kv-width k/v straight to the cache; the decode
             // op maps query head h to KV head h/(n_q/n_kv).
@@ -835,11 +841,12 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             brolm::detail::resize_like(lin_q_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
             brolm::detail::resize_like(lin_k_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
             brolm::detail::resize_like(lin_v_, L, vdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
-            for (int r = 0; r < L; ++r) {
-                bt::copy_d2d(lin_qkv_conv_, r * qkv_ch + 0 * kdim, lin_q_, r * kdim, kdim);
-                bt::copy_d2d(lin_qkv_conv_, r * qkv_ch + 1 * kdim, lin_k_, r * kdim, kdim);
-                bt::copy_d2d(lin_qkv_conv_, r * qkv_ch + 2 * kdim, lin_v_, r * vdim, vdim);
-            }
+            bt::copy_d2d_strided(lin_qkv_conv_, 0 * kdim, qkv_ch,
+                                 lin_q_, 0, kdim, kdim, L);
+            bt::copy_d2d_strided(lin_qkv_conv_, 1 * kdim, qkv_ch,
+                                 lin_k_, 0, kdim, kdim, L);
+            bt::copy_d2d_strided(lin_qkv_conv_, 2 * kdim, qkv_ch,
+                                 lin_v_, 0, vdim, vdim, L);
 
             // 4) z = in_proj_z @ x  (T, H*D_v)
             detail::linear_batched(layer.lin.in_proj_z, nullptr, *lin_x, lin_z_);

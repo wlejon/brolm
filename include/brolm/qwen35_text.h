@@ -211,14 +211,20 @@ private:
     // Run the MLP sub-layer in place on h_.
     void mlp_block_(const MLP& mlp, int L);
 
-    // Build the per-axis sin/cos tables for the maximum position that appears
-    // in the current call, then apply partial M-RoPE in place on `qk` viewed
-    // as (L, num_heads * head_dim). Only dims [0, rotary_dim) per head are
-    // rotated; pass-through dims are untouched.
-    void apply_partial_mrope_(brotensor::Tensor& qk, int num_heads, int L,
-                              const std::vector<int32_t>& pos_t,
-                              const std::vector<int32_t>& pos_h,
-                              const std::vector<int32_t>& pos_w);
+    // Per-forward M-RoPE setup: upload the three position streams once and
+    // make sure the cached per-axis cos/sin tables (members below) cover the
+    // call's peak position. Tables only depend on the model's rope geometry,
+    // so they are built to a bucketed capacity and reused across forwards —
+    // the per-layer / per-token host rebuild they replace dominated decode.
+    void prepare_mrope_(const std::vector<int32_t>& pos_t,
+                        const std::vector<int32_t>& pos_h,
+                        const std::vector<int32_t>& pos_w, int L);
+
+    // Apply partial M-RoPE in place on `qk` viewed as (L, num_heads *
+    // head_dim), using the tables + position streams prepare_mrope_ staged.
+    // Only dims [0, rotary_dim) per head are rotated; pass-through dims are
+    // untouched.
+    void apply_partial_mrope_(brotensor::Tensor& qk, int num_heads, int L);
 
     Qwen35Config::Text cfg_;
     int rotary_dim_ = 0;
@@ -242,6 +248,15 @@ private:
     brotensor::Tensor proj_;        // o_proj / down_proj output
     brotensor::Tensor mlp_gate_, mlp_up_;   // mlp_gate_ becomes the SwiGLU
                                             // activation in place
+
+    // M-RoPE state staged by prepare_mrope_: per-axis cos/sin tables cached
+    // to `mrope_tbl_max_pos_` (inclusive), and the call's device-resident
+    // int32 position streams.
+    brotensor::Tensor mrope_cos_t_, mrope_sin_t_;
+    brotensor::Tensor mrope_cos_h_, mrope_sin_h_;
+    brotensor::Tensor mrope_cos_w_, mrope_sin_w_;
+    int mrope_tbl_max_pos_ = -1;
+    brotensor::Tensor pos_t_dev_, pos_h_dev_, pos_w_dev_;
 
     // Linear-attention scratch (see qwen35_text.cpp linear_attn_block_).
     brotensor::Tensor lin_qkv_;        // (T, 3*num_heads*head_dim)
