@@ -200,6 +200,31 @@ void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out,
     run_layers_(L, logits_out, hidden_out);
 }
 
+void DenseDecoder::forward_last(const int32_t* ids, int L,
+                                bt::Tensor& logits_out) {
+    if (!ids) fail("forward_last: ids pointer is null");
+    if (L <= 0) fail("forward_last: L must be positive");
+    if (embed_tokens_.size() == 0) fail("forward_last: weights not loaded");
+    if (max_seq_len_ == 0) fail("forward_last: cache not allocated");
+    if (cache_len_ + L > max_seq_len_) {
+        fail("forward_last: cache_len + L exceeds allocated cache capacity");
+    }
+
+    {
+        profile::ScopedStage ps(profile::Stage::idx_upload);
+        ids_dev_ = make_idx_device(ids, L);
+    }
+    {
+        profile::ScopedStage ps(profile::Stage::embed);
+        bt::embedding_lookup_forward(
+            embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
+        h_ = h_.clone();
+    }
+
+    run_layers_(L, logits_out, /*hidden_out=*/nullptr,
+                /*logits_last_row_only=*/true);
+}
+
 void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
                                   bt::Tensor& logits_out,
                                   bt::Tensor* hidden_out) {
@@ -220,7 +245,8 @@ void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
 }
 
 void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
-                               bt::Tensor* hidden_out) {
+                               bt::Tensor* hidden_out,
+                               bool logits_last_row_only) {
     const int HD   = cfg_.head_dim;
     const int n_q  = cfg_.num_attention_heads;
     const int n_kv = cfg_.num_key_value_heads;
@@ -323,22 +349,16 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
             detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, up_);
         }
 
-        // swiglu_forward expects (L, 2*F) = concat(gate, up) along columns and
-        // computes silu(gate) * up.
+        // SwiGLU without the concat staging: gate <- silu(gate) * up, in
+        // place (silu_forward allows aliasing), then down-project.
         {
             prof::ScopedStage ps(PStage::swiglu);
-            const int F = cfg_.intermediate_size;
-            brolm::detail::resize_like(swiglu_in_, L, 2 * F, gate_.dtype,
-                                       gate_.device);
-            for (int r = 0; r < L; ++r) {
-                bt::copy_d2d(gate_, r * F, swiglu_in_, r * (2 * F), F);
-                bt::copy_d2d(up_,   r * F, swiglu_in_, r * (2 * F) + F, F);
-            }
-            bt::swiglu_forward(swiglu_in_, mlp_act_);
+            bt::silu_forward(gate_, gate_);
+            bt::mul_inplace(gate_, up_);
         }
         {
             prof::ScopedStage ps(PStage::mlp_proj);
-            detail::linear_batched(layer.down_W, /*bias=*/nullptr, mlp_act_,
+            detail::linear_batched(layer.down_W, /*bias=*/nullptr, gate_,
                                    proj_);
         }
         {
@@ -359,7 +379,23 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
     }
     {
         prof::ScopedStage ps(PStage::lm_head);
-        detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
+        if (logits_last_row_only && L > 1) {
+            // lm_head over the final row only — a (1, hidden) view into the
+            // contiguous row-major norm_ buffer.
+            bt::Tensor last = bt::Tensor::view(
+                norm_.device,
+                static_cast<char*>(norm_.data) +
+                    static_cast<std::size_t>(L - 1) *
+                        static_cast<std::size_t>(norm_.cols) *
+                        static_cast<std::size_t>(
+                            bt::dtype_size_bytes(norm_.dtype)),
+                1, norm_.cols, norm_.dtype);
+            detail::linear_batched(lm_head_, /*bias=*/nullptr, last,
+                                   logits_out);
+        } else {
+            detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_,
+                                   logits_out);
+        }
     }
 
     cache_len_ += L;

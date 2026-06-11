@@ -37,25 +37,27 @@ namespace {
     throw std::runtime_error("qwen35::VLM: " + msg);
 }
 
-// Download the last (vocab,) row of a (T, vocab) logits tensor as FP32.
+// Download the last (vocab,) row of a (T, vocab) logits tensor as FP32. Only
+// the final row crosses the bus — a (1, vocab) view into the row-major buffer.
 std::vector<float> last_row_fp32(const bt::Tensor& logits) {
-    const std::size_t n = static_cast<std::size_t>(logits.size());
-    std::vector<float> all;
-    if (logits.dtype == bt::Dtype::FP16) {
+    bt::Tensor last = bt::Tensor::view(
+        logits.device,
+        static_cast<char*>(logits.data) +
+            static_cast<std::size_t>(logits.rows - 1) *
+                static_cast<std::size_t>(logits.cols) *
+                static_cast<std::size_t>(bt::dtype_size_bytes(logits.dtype)),
+        1, logits.cols, logits.dtype);
+    const std::size_t n = static_cast<std::size_t>(last.size());
+    if (last.dtype == bt::Dtype::FP16) {
         std::vector<std::uint16_t> bits(n);
-        logits.copy_to_host_fp16(bits.data());
-        all.resize(n);
+        last.copy_to_host_fp16(bits.data());
+        std::vector<float> out(n);
         for (std::size_t i = 0; i < n; ++i) {
-            all[i] = bt::fp16_bits_to_fp32(bits[i]);
+            out[i] = bt::fp16_bits_to_fp32(bits[i]);
         }
-    } else {
-        all = logits.to_host_vector();
+        return out;
     }
-    const std::size_t vocab = static_cast<std::size_t>(logits.cols);
-    const std::size_t rows  = static_cast<std::size_t>(logits.rows);
-    const std::size_t base  = (rows - 1) * vocab;
-    return std::vector<float>(all.begin() + static_cast<std::ptrdiff_t>(base),
-                              all.begin() + static_cast<std::ptrdiff_t>(base + vocab));
+    return last.to_host_vector();
 }
 
 // Quick check for NaN / Inf in a logits row — used by the synthetic test

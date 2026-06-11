@@ -51,12 +51,18 @@ int argmax(const float* logits, int vocab) {
 
 std::vector<float> last_row_fp32(const brotensor::Tensor& logits) {
     profile::ScopedStage ps(profile::Stage::logits_download);
-    std::vector<float> all = download_fp32(logits);
-    const std::size_t vocab = static_cast<std::size_t>(logits.cols);
-    const std::size_t rows  = static_cast<std::size_t>(logits.rows);
-    const std::size_t base  = (rows - 1) * vocab;
-    return std::vector<float>(all.begin() + static_cast<std::ptrdiff_t>(base),
-                              all.begin() + static_cast<std::ptrdiff_t>(base + vocab));
+    if (logits.rows == 1) return download_fp32(logits);
+    // Download only the final row — a (1, vocab) view into the contiguous
+    // row-major buffer. The intermediate rows never cross the bus.
+    brotensor::Tensor last = brotensor::Tensor::view(
+        logits.device,
+        static_cast<char*>(logits.data) +
+            static_cast<std::size_t>(logits.rows - 1) *
+                static_cast<std::size_t>(logits.cols) *
+                static_cast<std::size_t>(
+                    brotensor::dtype_size_bytes(logits.dtype)),
+        1, logits.cols, logits.dtype);
+    return download_fp32(last);
 }
 
 int sample_token(const float* logits, int vocab, const SamplingParams& p,

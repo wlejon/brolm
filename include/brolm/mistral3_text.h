@@ -101,6 +101,15 @@ public:
         core_.forward(ids, L, logits_out);
     }
 
+    // Like forward(), but `logits_out` := (1, vocab_size) — logits for the
+    // last appended token only. The KV cache still ingests all L tokens. The
+    // generate loop's prefill path: a sampler never reads the L-1
+    // intermediate logit rows, and at prompt lengths the skipped lm_head rows
+    // dominate the whole forward (vocab >> hidden).
+    void forward_last(const int32_t* ids, int L, brotensor::Tensor& logits_out) {
+        core_.forward_last(ids, L, logits_out);
+    }
+
     // Embedding lookup only: `out` := (L, hidden_size) input embeddings, no KV
     // cache touched. The VL path uses this to build the input stream before
     // overwriting [IMG] rows with projector embeddings.

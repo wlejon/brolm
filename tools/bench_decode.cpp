@@ -107,13 +107,13 @@ int main(int argc, char** argv) {
     {
         model.allocate_cache(prefill_n + decode_n);
         bt::Tensor logits;
-        model.forward(prompt.data(), std::min(prefill_n, 8), logits);
+        model.forward_last(prompt.data(), std::min(prefill_n, 8), logits);
         std::mt19937_64 rng(0);
         std::vector<float> row = brolm::detail::last_row_fp32(logits);
         int32_t next = static_cast<int32_t>(
             brolm::detail::sample_token(row.data(), cfg.vocab_size, greedy, rng));
         for (int t = 0; t < 4; ++t) {
-            model.forward(&next, 1, logits);
+            model.forward_last(&next, 1, logits);
             row  = brolm::detail::last_row_fp32(logits);
             next = static_cast<int32_t>(brolm::detail::sample_token(
                 row.data(), cfg.vocab_size, greedy, rng));
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
         // Prefill: one forward over the whole prompt, then sample.
         bt::Tensor logits;
         const double t0 = now_ms();
-        model.forward(prompt.data(), prefill_n, logits);
+        model.forward_last(prompt.data(), prefill_n, logits);
         std::vector<float> row = brolm::detail::last_row_fp32(logits);
         int32_t next = static_cast<int32_t>(brolm::detail::sample_token(
             row.data(), cfg.vocab_size, greedy, rng));
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
         // Decode: token-by-token, greedy.
         const double t1 = now_ms();
         for (int t = 0; t < decode_n; ++t) {
-            model.forward(&next, 1, logits);
+            model.forward_last(&next, 1, logits);
             row  = brolm::detail::last_row_fp32(logits);
             next = static_cast<int32_t>(brolm::detail::sample_token(
                 row.data(), cfg.vocab_size, greedy, rng));

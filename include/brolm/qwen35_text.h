@@ -240,7 +240,8 @@ private:
     brotensor::Tensor attn_;
     brotensor::Tensor gate_sig_;    // sigmoid(gate)
     brotensor::Tensor proj_;        // o_proj / down_proj output
-    brotensor::Tensor mlp_gate_, mlp_up_, swiglu_in_, mlp_act_;
+    brotensor::Tensor mlp_gate_, mlp_up_;   // mlp_gate_ becomes the SwiGLU
+                                            // activation in place
 
     // Linear-attention scratch (see qwen35_text.cpp linear_attn_block_).
     brotensor::Tensor lin_qkv_;        // (T, 3*num_heads*head_dim)

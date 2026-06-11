@@ -46,7 +46,9 @@ int sample_token(const float* logits, int vocab, const SamplingParams& p,
                  std::mt19937_64& rng);
 
 // Download the last (vocab,) logits row from a (L, vocab) tensor to host as
-// FP32 (FP16 compute tensors are converted). Used by the generate loop to feed
+// FP32 (FP16 compute tensors are converted). Only the final row crosses the
+// PCIe bus — at Qwen vocab sizes a whole-tensor prefill download would move
+// hundreds of MB to use one row. Used by the generate loop to feed
 // `sample_token` after each forward.
 std::vector<float> last_row_fp32(const brotensor::Tensor& logits);
 
@@ -59,10 +61,12 @@ struct GenerateOptions {
 };
 
 // Autoregressive generation over any model exposing `config().vocab_size`,
-// `allocate_cache(int)`, and `forward(const int32_t*, int, Tensor&)`. Sizes +
-// resets the model's KV-cache for (prompt + max_new_tokens), prefills
-// `prompt_ids` in one forward, then decodes token by token. Returns ONLY the
-// newly generated ids (prompt excluded).
+// `allocate_cache(int)`, and `forward_last(const int32_t*, int, Tensor&)`.
+// Sizes + resets the model's KV-cache for (prompt + max_new_tokens), prefills
+// `prompt_ids` in one forward, then decodes token by token. forward_last is
+// used throughout: the sampler only ever consumes the final token's logits,
+// so the lm_head matmul over the prompt's intermediate rows is skipped.
+// Returns ONLY the newly generated ids (prompt excluded).
 //
 // When `stop_on_eos`, generation halts as soon as `eos_id` is sampled, and the
 // eos token is NOT included in the returned vector. A negative `eos_id`
@@ -91,11 +95,11 @@ std::vector<int32_t> generate(Model& model,
 
     std::mt19937_64 rng(opts.sampling.seed);
 
-    // Prefill: one forward of the whole prompt. Sample the first new token from
-    // the LAST logits row.
+    // Prefill: one forward of the whole prompt. Only the last token's logits
+    // are computed — the sampler never reads the intermediate rows.
     brotensor::Tensor logits;
-    model.forward(prompt_ids.data(), static_cast<int>(prompt_ids.size()),
-                  logits);
+    model.forward_last(prompt_ids.data(), static_cast<int>(prompt_ids.size()),
+                       logits);
     std::vector<float> row = last_row_fp32(logits);
     int next = sample_token(row.data(), vocab, opts.sampling, rng);
 
@@ -108,7 +112,7 @@ std::vector<int32_t> generate(Model& model,
     // Decode loop: feed one token at a time, sample the next.
     while (static_cast<int>(generated.size()) < opts.max_new_tokens) {
         int32_t cur = generated.back();
-        model.forward(&cur, 1, logits);
+        model.forward_last(&cur, 1, logits);
         row = last_row_fp32(logits);
         next = sample_token(row.data(), vocab, opts.sampling, rng);
         if (stop && next == eos_id) break;

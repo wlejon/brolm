@@ -605,18 +605,15 @@ void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L,
 // ─── MLP block ─────────────────────────────────────────────────────────────
 
 void TextModel::mlp_block_(const MLP& mlp, int L) {
-    const int Fm = cfg_.intermediate_size;
+    (void)L;
     detail::linear_batched(mlp.gate_W, /*bias=*/nullptr, norm_, mlp_gate_);
     detail::linear_batched(mlp.up_W,   /*bias=*/nullptr, norm_, mlp_up_);
 
-    brolm::detail::resize_like(swiglu_in_, L, 2 * Fm, mlp_gate_.dtype,
-                               mlp_gate_.device);
-    for (int r = 0; r < L; ++r) {
-        bt::copy_d2d(mlp_gate_, r * Fm, swiglu_in_, r * (2 * Fm), Fm);
-        bt::copy_d2d(mlp_up_,   r * Fm, swiglu_in_, r * (2 * Fm) + Fm, Fm);
-    }
-    bt::swiglu_forward(swiglu_in_, mlp_act_);
-    detail::linear_batched(mlp.down_W, /*bias=*/nullptr, mlp_act_, proj_);
+    // SwiGLU without concat staging: gate <- silu(gate) * up, in place
+    // (silu_forward allows aliasing), then down-project.
+    bt::silu_forward(mlp_gate_, mlp_gate_);
+    bt::mul_inplace(mlp_gate_, mlp_up_);
+    detail::linear_batched(mlp.down_W, /*bias=*/nullptr, mlp_gate_, proj_);
     bt::add_inplace(h_, proj_);
 }
 

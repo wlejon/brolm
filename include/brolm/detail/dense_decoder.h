@@ -121,6 +121,15 @@ public:
     void forward(const int32_t* ids, int L, brotensor::Tensor& logits_out,
                  brotensor::Tensor* hidden_out = nullptr);
 
+    // Like forward(), but `logits_out` := (1, vocab_size) — logits for the
+    // LAST of the L appended tokens only. The KV cache still ingests all L
+    // tokens, so generation continues exactly as after forward(); only the
+    // lm_head matmul over the L-1 intermediate rows (which a sampler never
+    // reads) is skipped. This is the prefill fast path of the generate loop:
+    // at large L the full-row lm_head costs more than the rest of the layer
+    // stack combined (vocab >> hidden).
+    void forward_last(const int32_t* ids, int L, brotensor::Tensor& logits_out);
+
     // Embedding lookup only: write `out` := (L, hidden_size) input embeddings
     // for `ids` at the compute dtype. Does NOT touch the KV cache. Used by
     // multimodal callers that need to splice non-text embeddings (e.g. image
@@ -158,8 +167,11 @@ private:
     // forward() (h_ from embedding lookup) and forward_embeds() (h_ supplied).
     // When `hidden_out` is non-null it receives a clone of the (L, hidden_size)
     // post-final-norm hidden states (the lm_head input).
+    // When `logits_last_row_only`, lm_head consumes only the final row of the
+    // post-final-norm hidden states and logits_out is (1, vocab_size).
     void run_layers_(int L, brotensor::Tensor& logits_out,
-                     brotensor::Tensor* hidden_out);
+                     brotensor::Tensor* hidden_out,
+                     bool logits_last_row_only = false);
 
     DenseDecoderConfig cfg_;
 
@@ -181,9 +193,8 @@ private:
     brotensor::Tensor qn_, kn_;        // QK-normed q/k (distinct from q_/k_)
     brotensor::Tensor attn_;           // flash-attention output
     brotensor::Tensor proj_;           // o_proj / down_proj output
-    brotensor::Tensor gate_, up_;      // MLP gate / up
-    brotensor::Tensor swiglu_in_;      // concat(gate, up) for swiglu_forward
-    brotensor::Tensor mlp_act_;        // swiglu output
+    brotensor::Tensor gate_, up_;      // MLP gate / up; gate_ becomes the
+                                       // SwiGLU activation in place
 };
 
 }  // namespace brolm::detail
