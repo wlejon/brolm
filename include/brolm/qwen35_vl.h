@@ -43,6 +43,7 @@
 #include "brolm/qwen35_vision.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -108,6 +109,24 @@ public:
     // in a tokenizer.decode() call.
     std::vector<int> generate_tokens(const std::string& prompt,
                                      const std::vector<ImageInput>& images);
+
+    // Per-token streaming/cancel hook: invoked once per newly generated token,
+    // in decode order, synchronously on the generating thread (stop tokens are
+    // never delivered). Return false to halt generation after this token —
+    // the tokens emitted so far are returned. Empty = no streaming.
+    using TokenCallback = std::function<bool(int token_id)>;
+
+    // generate_tokens with a streaming/cancel hook.
+    std::vector<int> generate_tokens(const std::string& prompt,
+                                     const std::vector<ImageInput>& images,
+                                     const TokenCallback& on_token);
+
+    // Adjust the sampling/budget knobs between generate() calls (the
+    // architectural part of VLMConfig is fixed at construction; these are the
+    // per-call fields). An embedder driving repeated generations through one
+    // loaded model uses this instead of reconstructing.
+    void set_generation(int max_new_tokens, float temperature, int top_k,
+                        float top_p, uint64_t seed);
 
     // Accessors. The tokenizer's underlying Qwen3 BPE handle is exposed so
     // callers can encode/decode arbitrary text outside the generate() path.

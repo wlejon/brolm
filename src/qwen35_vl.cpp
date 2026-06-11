@@ -302,6 +302,21 @@ bt::Tensor run_vision_one_(VisionTower& tower,
 
 std::vector<int> VLM::generate_tokens(const std::string& prompt,
                                       const std::vector<ImageInput>& images) {
+    return generate_tokens(prompt, images, TokenCallback{});
+}
+
+void VLM::set_generation(int max_new_tokens, float temperature, int top_k,
+                         float top_p, uint64_t seed) {
+    cfg_.max_new_tokens = max_new_tokens;
+    cfg_.temperature    = temperature;
+    cfg_.top_k          = top_k;
+    cfg_.top_p          = top_p;
+    cfg_.seed           = seed;
+}
+
+std::vector<int> VLM::generate_tokens(const std::string& prompt,
+                                      const std::vector<ImageInput>& images,
+                                      const TokenCallback& on_token) {
     if (!tokenizer_ || !text_ || !vision_) {
         fail("generate_tokens called before load_from_directory");
     }
@@ -411,6 +426,7 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
     while (steps_remaining > 0 && !stop_token(next)) {
         generated.push_back(next);
         --steps_remaining;
+        if (on_token && !on_token(next)) break;   // streaming / early stop
         if (steps_remaining == 0) break;
 
         // Embed the just-sampled token and forward one step.
