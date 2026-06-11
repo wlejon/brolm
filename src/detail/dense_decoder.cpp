@@ -2,6 +2,7 @@
 
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/profile.h"
 #include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
@@ -185,10 +186,16 @@ void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out,
     }
 
     // Embedding lookup -> own a stable residual stream in h_.
-    ids_dev_ = make_idx_device(ids, L);
-    bt::embedding_lookup_forward(
-        embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
-    h_ = h_.clone();
+    {
+        profile::ScopedStage ps(profile::Stage::idx_upload);
+        ids_dev_ = make_idx_device(ids, L);
+    }
+    {
+        profile::ScopedStage ps(profile::Stage::embed);
+        bt::embedding_lookup_forward(
+            embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
+        h_ = h_.clone();
+    }
 
     run_layers_(L, logits_out, hidden_out);
 }
@@ -237,13 +244,22 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         dst.cols = num_heads * HD;
     };
 
+    namespace prof = profile;
+    using PStage   = profile::Stage;
+
     for (Layer& layer : layers_) {
         // ── self-attention sub-layer ──────────────────────────────────────
-        bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+        {
+            prof::ScopedStage ps(PStage::rms_norm);
+            bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+        }
 
-        detail::linear_batched(layer.Wq, /*bias=*/nullptr, norm_, q_);
-        detail::linear_batched(layer.Wk, /*bias=*/nullptr, norm_, k_);
-        detail::linear_batched(layer.Wv, /*bias=*/nullptr, norm_, v_);
+        {
+            prof::ScopedStage ps(PStage::qkv_proj);
+            detail::linear_batched(layer.Wq, /*bias=*/nullptr, norm_, q_);
+            detail::linear_batched(layer.Wk, /*bias=*/nullptr, norm_, k_);
+            detail::linear_batched(layer.Wv, /*bias=*/nullptr, norm_, v_);
+        }
 
         // QK-norm (Qwen3): per-head RMSNorm over head_dim into distinct
         // buffers. Mistral has none — q_/k_ feed RoPE directly. `q_attn`/
@@ -252,6 +268,7 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         bt::Tensor* q_attn = &q_;
         bt::Tensor* k_attn = &k_;
         if (cfg_.use_qk_norm) {
+            prof::ScopedStage ps(PStage::qk_norm);
             headnorm(q_, n_q,  layer.q_norm, qn_);
             headnorm(k_, n_kv, layer.k_norm, kn_);
             q_attn = &qn_;
@@ -260,50 +277,90 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
 
         // RoPE on q/k. Weights were permuted at load so this interleaved-pair
         // rotation reproduces HF's rotate_half.
-        bt::rope_forward(*q_attn, HD, n_q,  seq_offset, cfg_.rope_theta, *q_attn);
-        bt::rope_forward(*k_attn, HD, n_kv, seq_offset, cfg_.rope_theta, *k_attn);
+        {
+            prof::ScopedStage ps(PStage::rope);
+            bt::rope_forward(*q_attn, HD, n_q,  seq_offset, cfg_.rope_theta,
+                             *q_attn);
+            bt::rope_forward(*k_attn, HD, n_kv, seq_offset, cfg_.rope_theta,
+                             *k_attn);
+        }
 
         // GQA: append the n_kv-width K/V straight to the cache. No widening —
         // flash_attention_decode maps query head h to KV head h/(n_q/n_kv).
-        bt::kv_cache_append(*k_attn, v_, cache_len_,
-                            layer.K_cache, layer.V_cache);
+        {
+            prof::ScopedStage ps(PStage::kv_append);
+            bt::kv_cache_append(*k_attn, v_, cache_len_,
+                                layer.K_cache, layer.V_cache);
+        }
 
         // Causal flash-attention against the populated cache. valid_len is the
         // total cache length after the append; the op applies causal masking
         // and the 1/sqrt(head_dim) scale internally.
-        bt::flash_attention_decode(*q_attn, layer.K_cache, layer.V_cache,
-                                   cache_len_ + L, n_q, n_kv, attn_);
+        {
+            prof::ScopedStage ps(PStage::attention);
+            bt::flash_attention_decode(*q_attn, layer.K_cache, layer.V_cache,
+                                       cache_len_ + L, n_q, n_kv, attn_);
+        }
 
-        detail::linear_batched(layer.Wo, /*bias=*/nullptr, attn_, proj_);
-        bt::add_inplace(h_, proj_);
+        {
+            prof::ScopedStage ps(PStage::o_proj);
+            detail::linear_batched(layer.Wo, /*bias=*/nullptr, attn_, proj_);
+        }
+        {
+            prof::ScopedStage ps(PStage::residual_add);
+            bt::add_inplace(h_, proj_);
+        }
 
         // ── MLP sub-layer (SwiGLU) ────────────────────────────────────────
-        bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
+        {
+            prof::ScopedStage ps(PStage::rms_norm);
+            bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
+        }
 
-        detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, gate_);
-        detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, up_);
+        {
+            prof::ScopedStage ps(PStage::mlp_proj);
+            detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, gate_);
+            detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, up_);
+        }
 
         // swiglu_forward expects (L, 2*F) = concat(gate, up) along columns and
         // computes silu(gate) * up.
-        const int F = cfg_.intermediate_size;
-        brolm::detail::resize_like(swiglu_in_, L, 2 * F, gate_.dtype,
-                                   gate_.device);
-        for (int r = 0; r < L; ++r) {
-            bt::copy_d2d(gate_, r * F, swiglu_in_, r * (2 * F), F);
-            bt::copy_d2d(up_,   r * F, swiglu_in_, r * (2 * F) + F, F);
+        {
+            prof::ScopedStage ps(PStage::swiglu);
+            const int F = cfg_.intermediate_size;
+            brolm::detail::resize_like(swiglu_in_, L, 2 * F, gate_.dtype,
+                                       gate_.device);
+            for (int r = 0; r < L; ++r) {
+                bt::copy_d2d(gate_, r * F, swiglu_in_, r * (2 * F), F);
+                bt::copy_d2d(up_,   r * F, swiglu_in_, r * (2 * F) + F, F);
+            }
+            bt::swiglu_forward(swiglu_in_, mlp_act_);
         }
-        bt::swiglu_forward(swiglu_in_, mlp_act_);
-        detail::linear_batched(layer.down_W, /*bias=*/nullptr, mlp_act_, proj_);
-        bt::add_inplace(h_, proj_);
+        {
+            prof::ScopedStage ps(PStage::mlp_proj);
+            detail::linear_batched(layer.down_W, /*bias=*/nullptr, mlp_act_,
+                                   proj_);
+        }
+        {
+            prof::ScopedStage ps(PStage::residual_add);
+            bt::add_inplace(h_, proj_);
+        }
     }
 
     // Final norm + LM head.
-    bt::rms_norm_forward(h_, final_norm_, eps, norm_);
-    if (hidden_out) {
-        // norm_ is reused scratch across calls; hand the caller stable storage.
-        *hidden_out = norm_.clone();
+    {
+        prof::ScopedStage ps(PStage::final_norm);
+        bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+        if (hidden_out) {
+            // norm_ is reused scratch across calls; hand the caller stable
+            // storage.
+            *hidden_out = norm_.clone();
+        }
     }
-    detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
+    {
+        prof::ScopedStage ps(PStage::lm_head);
+        detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
+    }
 
     cache_len_ += L;
 }

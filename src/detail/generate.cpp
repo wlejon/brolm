@@ -4,6 +4,8 @@
 
 #include "brolm/detail/generate.h"
 
+#include "brolm/detail/profile.h"
+
 #include "brotensor/tensor.h"
 
 #include <algorithm>
@@ -48,6 +50,7 @@ int argmax(const float* logits, int vocab) {
 }  // namespace
 
 std::vector<float> last_row_fp32(const brotensor::Tensor& logits) {
+    profile::ScopedStage ps(profile::Stage::logits_download);
     std::vector<float> all = download_fp32(logits);
     const std::size_t vocab = static_cast<std::size_t>(logits.cols);
     const std::size_t rows  = static_cast<std::size_t>(logits.rows);
@@ -58,6 +61,7 @@ std::vector<float> last_row_fp32(const brotensor::Tensor& logits) {
 
 int sample_token(const float* logits, int vocab, const SamplingParams& p,
                  std::mt19937_64& rng) {
+    profile::ScopedStage ps(profile::Stage::sample);
     if (vocab <= 0) return 0;
 
     // Greedy: argmax of the raw logits.

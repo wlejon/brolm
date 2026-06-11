@@ -102,6 +102,7 @@ target_sources(brolm PRIVATE
     src/detail/byte_level_bpe.cpp
     src/detail/dense_decoder.cpp
     src/detail/generate.cpp
+    src/detail/profile.cpp
     src/tokenizer_clip.cpp
     src/tokenizer_t5.cpp
     src/qwen_tokenizer.cpp
