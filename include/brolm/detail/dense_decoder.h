@@ -53,11 +53,17 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace brolm::detail::weights { class Source; }
 
 namespace brolm::detail {
+
+// CUDA-graph decode session (defined in dense_decoder.cpp). Holds the
+// persistent fixed-shape buffers + captured graph for the single-token
+// forward_last step; absent / inert on CPU builds.
+struct DecodeGraphSession;
 
 // Architectural dimensions of a dense causal decoder. Every public model class
 // translates its typed HF config into this struct.
@@ -82,8 +88,9 @@ public:
 
     DenseDecoder(const DenseDecoder&)            = delete;
     DenseDecoder& operator=(const DenseDecoder&) = delete;
-    DenseDecoder(DenseDecoder&&) noexcept            = default;
-    DenseDecoder& operator=(DenseDecoder&&) noexcept = default;
+    // Defaulted in dense_decoder.cpp — DecodeGraphSession is incomplete here.
+    DenseDecoder(DenseDecoder&&) noexcept;
+    DenseDecoder& operator=(DenseDecoder&&) noexcept;
 
     // Load every weight through the container-agnostic Source. Names follow the
     // HF convention (`model.embed_tokens.weight`,
@@ -173,6 +180,15 @@ private:
                      brotensor::Tensor* hidden_out,
                      bool logits_last_row_only = false);
 
+    // Graph-captured single-token decode (CUDA only). try_graph_step_ runs
+    // one forward_last(ids, 1, ...) step through the captured session and
+    // returns true, or returns false (CPU backend, BROLM_NO_GRAPH,
+    // BROLM_PROFILE, or capture unavailable) so the caller falls back to the
+    // eager path. invalidate_graph_ drops the session whenever weights or
+    // cache storage are replaced.
+    bool try_graph_step_(int32_t token, brotensor::Tensor& logits_out);
+    void invalidate_graph_();
+
     DenseDecoderConfig cfg_;
 
     // Weights.
@@ -195,6 +211,10 @@ private:
     brotensor::Tensor proj_;           // o_proj / down_proj output
     brotensor::Tensor gate_, up_;      // MLP gate / up; gate_ becomes the
                                        // SwiGLU activation in place
+
+    // CUDA-graph decode session; null until the first graph-eligible
+    // forward_last after weights + cache are in place.
+    std::unique_ptr<DecodeGraphSession> graph_;
 };
 
 }  // namespace brolm::detail
