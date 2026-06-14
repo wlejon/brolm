@@ -110,6 +110,7 @@ target_sources(brolm PRIVATE
     src/nllb_config.cpp
     src/detail/nllb_ops.cpp
     src/nllb_encoder.cpp
+    src/nllb_decoder.cpp
     src/qwen_tokenizer.cpp
     src/mistral_tokenizer.cpp
     src/mistral3_config.cpp

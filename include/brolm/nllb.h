@@ -91,4 +91,66 @@ private:
     brotensor::Tensor Qh_, Kh_, Vh_, Attnh_, Yconcat_;   // mha caches
 };
 
+// Decoder: causal self-attention + cross-attention over the encoder memory +
+// ReLU FFN, with a tied lm_head. set_encoder_memory() projects and caches the
+// cross-attention K/V once per source (shared across all decode steps and beam
+// hypotheses); forward_logits() then recomputes the decoder over a generated
+// prefix and returns the last token's logits. (A growing self-attention KV
+// cache is the next optimization; recompute keeps the first version simple and
+// backend-portable.)
+class Decoder {
+public:
+    explicit Decoder(const NllbConfig& cfg);
+    ~Decoder();
+
+    Decoder(const Decoder&) = delete;
+    Decoder& operator=(const Decoder&) = delete;
+    Decoder(Decoder&&) noexcept = default;
+    Decoder& operator=(Decoder&&) noexcept = default;
+
+    void load_weights(const brotensor::safetensors::File& f,
+                      const std::string& prefix = "");
+    void load_weights(
+        const std::vector<const brotensor::safetensors::File*>& shards,
+        const std::string& prefix = "");
+
+    // Project and cache the cross-attention K/V from the (Lk, d_model) encoder
+    // output. Call once per source before decoding; reused across beams.
+    void set_encoder_memory(const brotensor::Tensor& enc_out);
+
+    // Run the decoder over the length-T int32 prefix `dec_ids` (host pointer;
+    // starts with the decoder_start </s> then the forced target-language BOS).
+    // Writes the last position's (1, vocab_size) logits to `logits` at the
+    // compute dtype. set_encoder_memory() must have run.
+    void forward_logits(const std::int32_t* dec_ids, int T,
+                        brotensor::Tensor& logits);
+
+    const NllbConfig& config() const { return cfg_; }
+
+private:
+    struct Layer {
+        brotensor::Tensor sa_ln_w, sa_ln_b;       // self_attn_layer_norm
+        brotensor::Tensor sWq, sWk, sWv, sWo;
+        brotensor::Tensor sbq, sbk, sbv, sbo;
+        brotensor::Tensor ca_ln_w, ca_ln_b;       // encoder_attn_layer_norm
+        brotensor::Tensor cWq, cWk, cWv, cWo;
+        brotensor::Tensor cbq, cbk, cbv, cbo;
+        brotensor::Tensor ff_ln_w, ff_ln_b;       // final_layer_norm
+        brotensor::Tensor fc1_w, fc1_b, fc2_w, fc2_b;
+        brotensor::Tensor K_enc, V_enc;           // cached cross-attn K/V (Lk,D)
+    };
+
+    void load_weights_impl_(const brolm::detail::weights::Source& src);
+
+    NllbConfig cfg_;
+    brotensor::Tensor token_embed_;               // (vocab_size, d_model), tied
+    brotensor::Tensor final_logits_bias_;         // (1, vocab) or empty
+    std::vector<Layer> layers_;
+    brotensor::Tensor dec_ln_w_, dec_ln_b_;       // final decoder layer_norm
+    int enc_len_ = 0;
+
+    // Per-call scratch.
+    brotensor::Tensor ids_dev_, x_, xln_, Q_, K_, V_, attn_, proj_, h1_, xn_;
+};
+
 }  // namespace brolm::nllb
