@@ -66,11 +66,16 @@ include/brolm/
     json.h                 — minimal JSON reader for HF config files
   tokenizer.h              — CLIP BPE
   tokenizer_t5.h           — T5 SentencePiece Unigram
+  tokenizer_nllb.h         — NLLB-200 SPM Unigram + FLORES-200 language codes
+  detail/spm_unigram.h     — shared SentencePiece Unigram core (T5, NLLB)
   qwen_tokenizer.h         — Qwen3 byte-level BPE
   qwen35_tokenizer.h       — Qwen3.5-VL (Qwen3 BPE + 33 vision/think/tool specials)
   whisper_tokenizer.h      — Whisper byte-level BPE + lang/task/timestamp specials
   clip.h, clip_image.h, clip_score.h
   t5.h
+  nllb_config.h, nllb.h     — NLLB-200 (M2M-100) encoder-decoder translation
+                              (encoder + decoder w/ cross-attn + beam search +
+                              Translator); sinusoidal positions, LayerNorm, ReLU
   qwen.h, qwen_generate.h
   qwen35_config.h, qwen35_preprocessor.h, qwen35_vision.h,
   qwen35_text.h, qwen35_vl.h
