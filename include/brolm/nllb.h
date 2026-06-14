@@ -153,4 +153,22 @@ private:
     brotensor::Tensor ids_dev_, x_, xln_, Q_, K_, V_, attn_, proj_, h1_, xn_;
 };
 
+// Beam-search decoding options. Defaults follow common NLLB practice
+// (num_beams 5, max_length 200, no length penalty).
+struct BeamOptions {
+    int   num_beams      = 5;
+    int   max_new_tokens = 200;   // cap on generated target tokens
+    float length_penalty = 1.0f;  // score / length^penalty at final selection
+};
+
+// Beam search over a prepared Decoder (set_encoder_memory() already called for
+// the source). `start_ids` is the forced decoder prefix
+// [decoder_start_token (</s>), tgt_lang]. Returns the best hypothesis as the
+// full decoder token sequence [</s>, tgt_lang, t1, ..., eos]; pass it to
+// nllb::Tokenizer::decode (skip_special) to recover the translation text.
+// Deterministic — no sampling.
+std::vector<std::int32_t> beam_search(
+    Decoder& dec, const std::vector<std::int32_t>& start_ids, int eos_id,
+    const BeamOptions& opts = {});
+
 }  // namespace brolm::nllb
