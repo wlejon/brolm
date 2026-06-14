@@ -62,15 +62,11 @@ void Encoder::load_weights_impl_(const brolm::detail::weights::Source& src) {
         fail("missing token embedding 'model.shared.weight'");
     }
 
-    // mha_forward wants FP32 projection biases regardless of compute dtype.
-    auto load_bias_fp32 = [&](const std::string& name, int n, bt::Tensor& dst) {
-        bt::Tensor tmp;
-        src.upload_compute_checked(name, n, 1, tmp, name);
-        if (brolm::compute_dtype() == bt::Dtype::FP16) {
-            bt::cast(tmp, dst, bt::Dtype::FP32);
-        } else {
-            dst = tmp;
-        }
+    // self_attention_bias_forward dispatches on the activation dtype and wants
+    // its projection biases at that same compute dtype (FP16 on GPU, FP32 on
+    // CPU) — load them like every other dense tensor.
+    auto load_bias = [&](const std::string& name, int n, bt::Tensor& dst) {
+        src.upload_compute_checked(name, n, 1, dst, name);
     };
 
     for (int i = 0; i < cfg_.encoder_layers; ++i) {
@@ -83,10 +79,10 @@ void Encoder::load_weights_impl_(const brolm::detail::weights::Source& src) {
         src.upload_compute_checked(sa + "k_proj.weight", D, D, Lr.Wk, sa + "k");
         src.upload_compute_checked(sa + "v_proj.weight", D, D, Lr.Wv, sa + "v");
         src.upload_compute_checked(sa + "out_proj.weight", D, D, Lr.Wo, sa + "o");
-        load_bias_fp32(sa + "q_proj.bias", D, Lr.bq);
-        load_bias_fp32(sa + "k_proj.bias", D, Lr.bk);
-        load_bias_fp32(sa + "v_proj.bias", D, Lr.bv);
-        load_bias_fp32(sa + "out_proj.bias", D, Lr.bo);
+        load_bias(sa + "q_proj.bias", D, Lr.bq);
+        load_bias(sa + "k_proj.bias", D, Lr.bk);
+        load_bias(sa + "v_proj.bias", D, Lr.bv);
+        load_bias(sa + "out_proj.bias", D, Lr.bo);
 
         src.upload_compute_checked(p + "self_attn_layer_norm.weight", D, 1,
                                    Lr.sa_ln_w, "sa_ln.w");
@@ -134,13 +130,18 @@ void Encoder::forward(const std::int32_t* ids, int L, bt::Tensor& enc_out) {
         bt::add_inplace(x_, pos);
     }
 
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(D / H));
     for (auto& Lr : layers_) {
-        // self-attention (bidirectional, no mask for a single unpadded source)
+        // self-attention (bidirectional, no mask for a single unpadded source).
+        // self_attention_bias_forward with attn_bias=null is plain biased MHA,
+        // dispatched on the activation dtype — so the FP16 GPU path produces an
+        // FP16 output that adds straight back into the residual stream (the
+        // FP32-only mha_forward could not).
         brolm::detail::layernorm_batched(x_, Lr.sa_ln_w, Lr.sa_ln_b, n_, eps);
-        bt::mha_forward(n_, Lr.Wq, Lr.Wk, Lr.Wv, Lr.Wo,
-                        &Lr.bq, &Lr.bk, &Lr.bv, &Lr.bo,
-                        /*d_mask=*/nullptr, H,
-                        Qh_, Kh_, Vh_, Attnh_, Yconcat_, attn_);
+        bt::self_attention_bias_forward(n_, Lr.Wq, Lr.Wk, Lr.Wv, Lr.Wo,
+                                        &Lr.bq, &Lr.bk, &Lr.bv, &Lr.bo,
+                                        /*d_mask=*/nullptr, /*attn_bias=*/nullptr,
+                                        H, attn_scale, attn_);
         bt::add_inplace(x_, attn_);
 
         // feed-forward (ReLU)

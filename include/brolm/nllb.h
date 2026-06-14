@@ -74,7 +74,7 @@ private:
     struct Layer {
         brotensor::Tensor sa_ln_w, sa_ln_b;       // self_attn_layer_norm
         brotensor::Tensor Wq, Wk, Wv, Wo;         // (D,D)
-        brotensor::Tensor bq, bk, bv, bo;         // (D,1) FP32 (mha contract)
+        brotensor::Tensor bq, bk, bv, bo;         // (D,1) at compute dtype
         brotensor::Tensor ff_ln_w, ff_ln_b;       // final_layer_norm (FFN pre-norm)
         brotensor::Tensor fc1_w, fc1_b;           // (ffn,D),(ffn,1)
         brotensor::Tensor fc2_w, fc2_b;           // (D,ffn),(D,1)
@@ -89,7 +89,6 @@ private:
 
     // Per-call scratch (kept alive to avoid realloc).
     brotensor::Tensor ids_dev_, x_, n_, attn_, h1_, ff_out_;
-    brotensor::Tensor Qh_, Kh_, Vh_, Attnh_, Yconcat_;   // mha caches
 };
 
 // Per-hypothesis self-attention KV cache for incremental decoding. Holds one
