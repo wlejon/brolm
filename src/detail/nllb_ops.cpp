@@ -13,24 +13,6 @@ namespace brolm::nllb::detail {
 
 namespace bt = ::brotensor;
 
-void layer_norm(const bt::Tensor& X, const bt::Tensor& gamma,
-                const bt::Tensor& beta, bt::Tensor& Y, float eps) {
-    if (brolm::compute_dtype() == bt::Dtype::FP16) {
-        bt::layernorm_forward_inference_batched_fp16(X, gamma, beta, Y, eps);
-    } else {
-        bt::layernorm_forward_inference_batched(X, gamma, beta, Y, eps);
-    }
-}
-
-void linear(const bt::Tensor& W, const bt::Tensor& bias,
-            const bt::Tensor& X, bt::Tensor& Y) {
-    if (brolm::compute_dtype() == bt::Dtype::FP16) {
-        bt::linear_forward_batched_fp16(W, &bias, X, Y);
-    } else {
-        bt::linear_forward_batched(W, bias, X, Y);
-    }
-}
-
 bt::Tensor to_compute(const float* host, int r, int c) {
     bt::Tensor f32 = bt::Tensor::from_host(host, r, c).to(bt::default_device());
     if (brolm::compute_dtype() == bt::Dtype::FP16) {

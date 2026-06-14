@@ -2,29 +2,16 @@
 
 // Internal compute helpers shared by the NLLB-200 encoder and decoder.
 //
-// These wrap the backend dtype split (FP32 on CPU, FP16 on a GPU) for the
-// handful of ops the M2M-100 blocks need beyond the dtype-dispatching attention
-// kernels: LayerNorm-with-bias, batched Linear-with-bias, the computed
-// sinusoidal position table, and the int32 id upload. Keeping them in one place
-// stops the encoder and decoder from re-deriving the same dispatch.
+// These cover the NLLB-specific pieces the M2M-100 blocks need on top of the
+// shared brolm::detail dtype helpers (linear_batched / layernorm_batched) and
+// the dtype-polymorphic attention kernels: the computed sinusoidal position
+// table, an FP32-host upload at the compute dtype, and the int32 id upload.
 
 #include "brotensor/tensor.h"
 
 #include <cstdint>
 
 namespace brolm::nllb::detail {
-
-// Y = LayerNorm(X) * gamma + beta over each length-D row of the (R,D) X.
-// Dispatches FP32 / FP16 on the active compute dtype.
-void layer_norm(const brotensor::Tensor& X,
-                const brotensor::Tensor& gamma,
-                const brotensor::Tensor& beta,
-                brotensor::Tensor& Y, float eps);
-
-// Y[b,:] = W * X[b,:] + bias over the (B,in) X. W is (out,in), bias (out,1).
-// Dispatches FP32 / FP16 on the active compute dtype.
-void linear(const brotensor::Tensor& W, const brotensor::Tensor& bias,
-            const brotensor::Tensor& X, brotensor::Tensor& Y);
 
 // Upload an FP32 host (R,C) buffer to the active device at the compute dtype
 // (casting to FP16 when the backend is FP16).

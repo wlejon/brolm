@@ -136,7 +136,7 @@ void Encoder::forward(const std::int32_t* ids, int L, bt::Tensor& enc_out) {
 
     for (auto& Lr : layers_) {
         // self-attention (bidirectional, no mask for a single unpadded source)
-        detail::layer_norm(x_, Lr.sa_ln_w, Lr.sa_ln_b, n_, eps);
+        brolm::detail::layernorm_batched(x_, Lr.sa_ln_w, Lr.sa_ln_b, n_, eps);
         bt::mha_forward(n_, Lr.Wq, Lr.Wk, Lr.Wv, Lr.Wo,
                         &Lr.bq, &Lr.bk, &Lr.bv, &Lr.bo,
                         /*d_mask=*/nullptr, H,
@@ -144,14 +144,14 @@ void Encoder::forward(const std::int32_t* ids, int L, bt::Tensor& enc_out) {
         bt::add_inplace(x_, attn_);
 
         // feed-forward (ReLU)
-        detail::layer_norm(x_, Lr.ff_ln_w, Lr.ff_ln_b, n_, eps);
-        detail::linear(Lr.fc1_w, Lr.fc1_b, n_, h1_);
+        brolm::detail::layernorm_batched(x_, Lr.ff_ln_w, Lr.ff_ln_b, n_, eps);
+        brolm::detail::linear_batched(Lr.fc1_w, &Lr.fc1_b, n_, h1_);
         bt::relu_forward_batched(h1_, h1_);
-        detail::linear(Lr.fc2_w, Lr.fc2_b, h1_, ff_out_);
+        brolm::detail::linear_batched(Lr.fc2_w, &Lr.fc2_b, h1_, ff_out_);
         bt::add_inplace(x_, ff_out_);
     }
 
-    detail::layer_norm(x_, enc_ln_w_, enc_ln_b_, enc_out, eps);
+    brolm::detail::layernorm_batched(x_, enc_ln_w_, enc_ln_b_, enc_out, eps);
 }
 
 }  // namespace brolm::nllb
