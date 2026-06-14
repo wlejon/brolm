@@ -112,6 +112,7 @@ target_sources(brolm PRIVATE
     src/nllb_encoder.cpp
     src/nllb_decoder.cpp
     src/nllb_beam.cpp
+    src/nllb.cpp
     src/qwen_tokenizer.cpp
     src/mistral_tokenizer.cpp
     src/mistral3_config.cpp

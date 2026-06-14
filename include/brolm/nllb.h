@@ -26,6 +26,7 @@
 // alongside it.
 
 #include "brolm/nllb_config.h"
+#include "brolm/tokenizer_nllb.h"
 
 #include "brotensor/tensor.h"
 
@@ -170,5 +171,44 @@ struct BeamOptions {
 std::vector<std::int32_t> beam_search(
     Decoder& dec, const std::vector<std::int32_t>& start_ids, int eos_id,
     const BeamOptions& opts = {});
+
+// End-to-end translator: tokenizer + config + encoder + decoder + beam search.
+// The high-level entry point — load a converted NLLB checkpoint directory and
+// translate text between FLORES-200 language codes.
+class Translator {
+public:
+    // Load from a directory holding config.json, tokenizer.json, and
+    // model.safetensors (the output of scripts/convert-nllb.py). Throws
+    // std::runtime_error on any missing/unparseable file.
+    static Translator load(const std::string& model_dir);
+
+    // Translate `text` from `src_lang` into `tgt_lang` (FLORES-200 codes such
+    // as "eng_Latn", "fra_Latn"). Throws if a code is unknown.
+    std::string translate(const std::string& text,
+                          const std::string& src_lang,
+                          const std::string& tgt_lang,
+                          const BeamOptions& opts = {});
+
+    // Lower-level: translate an already-tokenized source (the output of
+    // Tokenizer::encode_source) into the raw target hypothesis token ids
+    // [</s>, tgt_lang, t1, ..., eos]. Useful for streaming drivers that manage
+    // their own segmentation.
+    std::vector<std::int32_t> translate_ids(
+        const std::vector<std::int32_t>& src_ids, const std::string& tgt_lang,
+        const BeamOptions& opts = {});
+
+    const Tokenizer& tokenizer() const { return tok_; }
+    const NllbConfig& config() const { return cfg_; }
+
+private:
+    Translator(NllbConfig cfg, Tokenizer tok)
+        : cfg_(cfg), tok_(std::move(tok)), enc_(cfg_), dec_(cfg_) {}
+
+    NllbConfig cfg_;
+    Tokenizer  tok_;
+    Encoder    enc_;
+    Decoder    dec_;
+    brotensor::Tensor enc_out_;   // per-call scratch
+};
 
 }  // namespace brolm::nllb
