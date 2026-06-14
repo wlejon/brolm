@@ -13,10 +13,11 @@
 // for English prompts metaspace is the part that matters. Segmentation is a
 // Unigram Viterbi over the transformed UTF-8 string.
 
+#include "brolm/detail/spm_unigram.h"
+
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace brolm::t5 {
@@ -45,7 +46,7 @@ public:
     // token ids into a transcript.
     std::string decode(const std::vector<int32_t>& ids) const;
 
-    std::size_t vocab_count() const { return vocab_.size(); }
+    std::size_t vocab_count() const { return model_.size(); }
     int pad_id() const { return pad_id_; }
     int eos_id() const { return eos_id_; }
     int unk_id() const { return unk_id_; }
@@ -53,20 +54,11 @@ public:
 private:
     Tokenizer() = default;
 
-    // piece-string -> {id, log-prob score}.
-    struct Entry { int32_t id; double score; };
-    std::unordered_map<std::string, Entry> vocab_;
-    // id -> piece-string, for decode().
-    std::vector<std::string> id_to_piece_;
+    brolm::detail::spm::Unigram model_;
 
     int pad_id_ = 0;
     int eos_id_ = 1;
     int unk_id_ = 2;
-
-    // Longest vocab piece byte-length — caps the Viterbi scan window.
-    std::size_t max_piece_bytes_ = 1;
-    // Smallest vocab score — the unk-fallback penalty is derived from it.
-    double min_vocab_score_ = 0.0;
 };
 
 }  // namespace brolm::t5

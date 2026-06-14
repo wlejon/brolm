@@ -100,6 +100,7 @@ endif()
 target_sources(brolm PRIVATE
     src/version.cpp
     src/detail/byte_level_bpe.cpp
+    src/detail/spm_unigram.cpp
     src/detail/dense_decoder.cpp
     src/detail/generate.cpp
     src/detail/profile.cpp
