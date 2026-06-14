@@ -1,13 +1,21 @@
 #pragma once
 
-// SentencePiece Unigram tokenizer for NLLB-200 (M2M-100 architecture).
+// SentencePiece-style metaspace BPE tokenizer for NLLB-200 (M2M-100 arch).
 //
-// Parsed from a HuggingFace `tokenizer.json`: the Unigram `model.vocab`
-// supplies the base subword pieces (shared brolm::detail::spm::Unigram core),
-// and the top-level `added_tokens` array supplies the special tokens
-// (<s>, <pad>, </s>, <unk>, <mask>) and the 200+ FLORES-200 language codes
-// (e.g. "eng_Latn", "fra_Latn"). Language codes and specials are decode-only:
-// they are inserted explicitly, never segmented out of normal text.
+// Parsed from a HuggingFace `tokenizer.json`. Despite the SentencePiece origin,
+// the fast tokenizer NLLB ships is a **BPE** model (not Unigram): `model.vocab`
+// is a token->id map and `model.merges` is the ranked merge list. Tokenization
+// is GPT-2-family BPE run over SentencePiece "metaspace" pieces — spaces are
+// replaced by U+2581 ('▁'), a leading space is prepended (add_prefix_space),
+// and the merge loop runs on the resulting Unicode codepoints (NOT byte-level
+// remapped, unlike CLIP/Qwen). The shared `brolm::detail::bpe` core supplies
+// the merge loop; this class adds the metaspace pre-tokenization and the
+// vocab/merge/added-token tables.
+//
+// The top-level `added_tokens` array supplies the specials (<s>, <pad>, </s>,
+// <unk>, <mask>) and the 200+ FLORES-200 language codes (e.g. "eng_Latn",
+// "fra_Latn"). Language codes and specials are inserted explicitly, never
+// segmented out of normal text, and are dropped on decode(skip_special).
 //
 // Sequence framing (the post-April-2023 NLLB default, which prefixes the
 // SOURCE language for better zero-shot transfer):
@@ -15,8 +23,14 @@
 //   decoder start : </s>  [tgt_lang]          (decoder_start_token_id then the
 //                                              forced target-language BOS)
 // Generation then produces target pieces and stops at </s>.
+//
+// Normalization caveat: HF runs a SentencePiece "Precompiled" charsmap
+// (≈ NFKC) before metaspace. brolm applies metaspace directly without that
+// normalization, so ASCII/Latin source text tokenizes bit-exactly to HF, but
+// inputs needing NFKC folding (full-width forms, compatibility characters) may
+// differ. This is the one known tokenizer parity gap.
 
-#include "brolm/detail/spm_unigram.h"
+#include "brolm/detail/byte_level_bpe.h"
 
 #include <cstdint>
 #include <string>
@@ -34,11 +48,11 @@ public:
     static Tokenizer load(const std::string& tokenizer_json_path);
 
     // Encoder input ids for translating `text` FROM `src_lang`:
-    //   [src_lang]  Unigram pieces...  </s>
+    //   [src_lang]  BPE pieces...  </s>
     std::vector<int32_t> encode_source(std::string_view text,
                                        const std::string& src_lang) const;
 
-    // Unigram pieces only — no language code, no eos. Useful for tests and for
+    // BPE pieces only — no language code, no eos. Useful for tests and for
     // callers that build their own framing.
     std::vector<int32_t> tokenize(std::string_view text) const;
 
@@ -67,16 +81,25 @@ public:
     int pad_id() const { return pad_id_; }
     int eos_id() const { return eos_id_; }
     int unk_id() const { return unk_id_; }
-    std::size_t vocab_count() const { return model_.size(); }
+    std::size_t vocab_count() const { return vocab_.size(); }
 
 private:
     Tokenizer() = default;
 
-    brolm::detail::spm::Unigram model_;
-    // All added tokens (specials + language codes): content -> id.
+    // Metaspace pre-tokenize `text` then BPE-merge each word, appending ids.
+    void encode_text_(std::string_view text, std::vector<int32_t>& out) const;
+
+    // Base BPE tables (from model.vocab / model.merges).
+    std::unordered_map<std::string, int32_t> vocab_;       // piece  -> id
+    std::unordered_map<int32_t, std::string> vocab_inv_;   // id     -> piece
+    std::unordered_map<std::string, int32_t> merge_ranks_; // "a\x01b" -> rank
+
+    // Added tokens (specials + language codes): content -> id.
     std::unordered_map<std::string, int32_t> added_;
     // Subset that are language codes ("eng_Latn", ...): content -> id.
     std::unordered_map<std::string, int32_t> lang_ids_;
+    // id -> added-token content (for decode without skip_special).
+    std::unordered_map<int32_t, std::string> added_inv_;
     // Ids dropped by decode(skip_special=true): every added token.
     std::unordered_set<int32_t> special_ids_;
 

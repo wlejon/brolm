@@ -1,9 +1,9 @@
-// NLLB-200 (M2M-100) SentencePiece Unigram tokenizer smoke test.
+// NLLB-200 (M2M-100) SentencePiece-metaspace BPE tokenizer smoke test.
 //
-// Writes a synthetic HF tokenizer.json with a small Unigram vocab plus an
+// Writes a synthetic HF tokenizer.json with a small BPE vocab + merges plus an
 // added_tokens array carrying the specials (<s>/<pad>/</s>/<unk>) and two
-// FLORES-200 language codes, then verifies language-code lookup, the source /
-// decoder sequence framing, and skip-special decoding.
+// FLORES-200 language codes, then verifies language-code lookup, metaspace BPE
+// merging, the source / decoder sequence framing, and skip-special decoding.
 
 #include "brolm/tokenizer_nllb.h"
 
@@ -24,10 +24,13 @@ static int g_failures = 0;
     } \
 } while (0)
 
-// Base Unigram vocab (index = id): specials at the front (so </s> == 2, as in
-// real NLLB), then the metaspace pieces. Language codes live ONLY in
-// added_tokens at high ids — the case that matters for NLLB.
-//   0:<s> 1:<pad> 2:</s> 3:<unk> 4:▁ 5:▁a 6:a 7:cat 8:▁cat 9:c 10:at
+// Base BPE vocab (piece -> id): specials at the front (so </s> == 2, as in real
+// NLLB), then the metaspace pieces and the single symbols the merges build from.
+// Language codes live ONLY in added_tokens at high ids — the case that matters
+// for NLLB.
+//   0:<s> 1:<pad> 2:</s> 3:<unk> 4:▁ 5:▁a 6:a 7:cat 8:▁cat 9:c 10:at 11:t 12:ca
+// merges (ranked): "▁ a"->▁a, "c a"->ca, "ca t"->cat, "▁ cat"->▁cat, so
+//   "a cat" -> metaspace ["▁a","▁cat"] -> [5, 8].
 // added_tokens: the four specials (echoing their ids) + eng_Latn=100, fra_Latn=101
 static void write_fixture(const std::filesystem::path& path) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -42,20 +45,18 @@ static void write_fixture(const std::filesystem::path& path) {
     f << "{\"id\":101,\"content\":\"fra_Latn\",\"special\":true}";
     f << "],";
     f << "\"model\":{";
-    f << "\"type\":\"Unigram\",";
-    f << "\"unk_id\":3,";
-    f << "\"vocab\":[";
-    f << "[\"<s>\",0.0],";
-    f << "[\"<pad>\",0.0],";
-    f << "[\"</s>\",0.0],";
-    f << "[\"<unk>\",0.0],";
-    f << "[\"" << M << "\",-2.0],";
-    f << "[\"" << M << "a\",-3.0],";
-    f << "[\"a\",-6.0],";
-    f << "[\"cat\",-3.5],";
-    f << "[\"" << M << "cat\",-3.0],";
-    f << "[\"c\",-7.0],";
-    f << "[\"at\",-7.0]";
+    f << "\"type\":\"BPE\",";
+    f << "\"unk_token\":\"<unk>\",";
+    f << "\"vocab\":{";
+    f << "\"<s>\":0,\"<pad>\":1,\"</s>\":2,\"<unk>\":3,";
+    f << "\"" << M << "\":4,\"" << M << "a\":5,\"a\":6,\"cat\":7,";
+    f << "\"" << M << "cat\":8,\"c\":9,\"at\":10,\"t\":11,\"ca\":12";
+    f << "},";
+    f << "\"merges\":[";
+    f << "\"" << M << " a\",";
+    f << "\"c a\",";
+    f << "\"ca t\",";
+    f << "\"" << M << " cat\"";
     f << "]";
     f << "}";
     f << "}";

@@ -116,9 +116,9 @@ void write_text(const std::filesystem::path& p, const std::string& s) {
     f << s;
 }
 
-// Tokenizer + model share vocab_size 20: specials 0-3, metaspace pieces 4-11,
-// language codes eng_Latn=18 / fra_Latn=19 (kept in range so their embeddings
-// exist). "a cat" -> [eng_Latn, ▁a, ▁cat, </s>].
+// Tokenizer + model share vocab_size 20: specials 0-3, metaspace BPE pieces
+// 4-13, language codes eng_Latn=18 / fra_Latn=19 (kept in range so their
+// embeddings exist). "a cat" -> metaspace ["▁a","▁cat"] -> [eng_Latn, 5, 8, </s>].
 void write_tokenizer(const std::filesystem::path& p) {
     const std::string M = "\xE2\x96\x81";
     std::string s = "{";
@@ -130,11 +130,12 @@ void write_tokenizer(const std::filesystem::path& p) {
     s += "{\"id\":18,\"content\":\"eng_Latn\",\"special\":true},";
     s += "{\"id\":19,\"content\":\"fra_Latn\",\"special\":true}";
     s += "],";
-    s += "\"model\":{\"type\":\"Unigram\",\"unk_id\":3,\"vocab\":[";
-    s += "[\"<s>\",0.0],[\"<pad>\",0.0],[\"</s>\",0.0],[\"<unk>\",0.0],";
-    s += "[\"" + M + "\",-2.0],[\"" + M + "a\",-3.0],[\"a\",-6.0],";
-    s += "[\"cat\",-3.5],[\"" + M + "cat\",-3.0],[\"c\",-7.0],[\"at\",-7.0],";
-    s += "[\"" + M + "t\",-7.0]";
+    s += "\"model\":{\"type\":\"BPE\",\"unk_token\":\"<unk>\",\"vocab\":{";
+    s += "\"<s>\":0,\"<pad>\":1,\"</s>\":2,\"<unk>\":3,";
+    s += "\"" + M + "\":4,\"" + M + "a\":5,\"a\":6,\"cat\":7,";
+    s += "\"" + M + "cat\":8,\"c\":9,\"at\":10,\"t\":11,\"ca\":12";
+    s += "},\"merges\":[";
+    s += "\"" + M + " a\",\"c a\",\"ca t\",\"" + M + " cat\"";
     s += "]}}";
     write_text(p, s);
 }

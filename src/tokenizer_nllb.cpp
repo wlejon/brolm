@@ -1,5 +1,6 @@
 #include "brolm/tokenizer_nllb.h"
 
+#include "brolm/detail/byte_level_bpe.h"
 #include "brolm/detail/json.h"
 
 #include <cstdint>
@@ -12,6 +13,12 @@
 namespace brolm::nllb {
 
 namespace json = ::brolm::detail::json;
+namespace bpe = ::brolm::detail::bpe;
+
+namespace {
+// SentencePiece metaspace marker U+2581 ('▁').
+const std::string kMeta = "\xE2\x96\x81";
+}  // namespace
 
 // ─── load ──────────────────────────────────────────────────────────────────
 
@@ -31,16 +38,24 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
         throw std::runtime_error("nllb::Tokenizer: tokenizer.json has no "
                                  "'model' object");
     }
+    const std::string type = model->get_string("type", "");
+    if (type != "BPE") {
+        throw std::runtime_error("nllb::Tokenizer: expected a BPE model, got '" +
+                                 type + "'");
+    }
+
     const json::Value* vocab = model->find("vocab");
-    if (!vocab || !vocab->is_array()) {
-        throw std::runtime_error("nllb::Tokenizer: model has no Unigram "
-                                 "'vocab' array");
+    if (!vocab || !vocab->is_object()) {
+        throw std::runtime_error("nllb::Tokenizer: model has no BPE 'vocab' "
+                                 "object");
+    }
+    const json::Value* merges = model->find("merges");
+    if (!merges || !merges->is_array()) {
+        throw std::runtime_error("nllb::Tokenizer: model has no 'merges' array");
     }
 
     Tokenizer t;
 
-    // Track special ids by content, preferring the added_tokens declaration
-    // (parsed below) over a model.vocab hit.
     int bos = -1, pad = -1, eos = -1, unk = -1;
     auto note_special = [&](const std::string& piece, int32_t id) {
         if      (piece == "<s>")    bos = id;
@@ -49,26 +64,48 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
         else if (piece == "<unk>")  unk = id;
     };
 
-    // --- base Unigram pieces (id = array index) -----------------------------
-    const auto& entries = vocab->as_array();
-    if (entries.empty())
+    // --- base BPE vocab (piece -> id) ---------------------------------------
+    const auto& members = vocab->as_object();
+    if (members.empty())
         throw std::runtime_error("nllb::Tokenizer: empty vocab");
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        const auto& pair = entries[i];
-        if (!pair.is_array() || pair.as_array().size() < 2)
-            throw std::runtime_error("nllb::Tokenizer: malformed vocab entry");
-        const std::string& piece = pair.as_array()[0].as_string();
-        const int32_t id = static_cast<int32_t>(i);
-        t.model_.add(piece, id, pair.as_array()[1].as_number());
-        note_special(piece, id);
+    t.vocab_.reserve(members.size() * 2);
+    t.vocab_inv_.reserve(members.size() * 2);
+    for (const auto& m : members) {
+        const int32_t id = static_cast<int32_t>(m.second.as_number());
+        t.vocab_.emplace(m.first, id);
+        t.vocab_inv_.emplace(id, m.first);
+        note_special(m.first, id);
     }
-    t.model_.finalize();
+
+    // --- merge ranks ("a b" / ["a","b"] -> "a\x01b" -> rank) ----------------
+    const auto& mg = merges->as_array();
+    t.merge_ranks_.reserve(mg.size() * 2);
+    for (std::size_t i = 0; i < mg.size(); ++i) {
+        std::string left, right;
+        if (mg[i].is_array()) {
+            const auto& pr = mg[i].as_array();
+            if (pr.size() < 2) continue;
+            left = pr[0].as_string();
+            right = pr[1].as_string();
+        } else if (mg[i].is_string()) {
+            const std::string& s = mg[i].as_string();
+            const std::size_t sp = s.find(' ');
+            if (sp == std::string::npos) continue;
+            left = s.substr(0, sp);
+            right = s.substr(sp + 1);
+        } else {
+            continue;
+        }
+        std::string key = left;
+        key += '\x01';
+        key += right;
+        t.merge_ranks_.emplace(std::move(key), static_cast<int32_t>(i));
+    }
 
     // --- added tokens: specials + FLORES-200 language codes -----------------
     //
-    // These are decode-only (never Viterbi-matched) and live at their declared
-    // ids — for NLLB the language codes sit above the base vocab (256001+).
-    // A language code is any added token that is not a "<...>" bracket-special.
+    // Decode-only — inserted explicitly via the framing helpers, never produced
+    // by BPE. A language code is any added token that is not a "<...>" special.
     const json::Value* added = root.find("added_tokens");
     if (added && added->is_array()) {
         for (const auto& e : added->as_array()) {
@@ -79,8 +116,8 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
             const std::string content = cv->as_string();
             const int32_t id = static_cast<int32_t>(iv->as_number());
 
-            t.model_.add_decode_only(content, id);
             t.added_.emplace(content, id);
+            t.added_inv_.emplace(id, content);
             t.special_ids_.insert(id);
             note_special(content, id);
             if (!content.empty() && content.front() != '<')
@@ -88,35 +125,59 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
         }
     }
 
-    // unk_id from the Unigram model (index into vocab) takes priority; fall
-    // back to the <unk> content hit, then the conventional id.
-    t.unk_id_ = model->get_int("unk_id", (unk >= 0) ? unk : 3);
+    t.unk_id_ = (unk >= 0) ? unk : 3;
     t.bos_id_ = (bos >= 0) ? bos : 0;
     t.pad_id_ = (pad >= 0) ? pad : 1;
     t.eos_id_ = (eos >= 0) ? eos : 2;
     return t;
 }
 
-// ─── public framing ─────────────────────────────────────────────────────────
+// ─── encoding ────────────────────────────────────────────────────────────────
 
-int Tokenizer::lang_id(const std::string& code) const {
-    auto it = lang_ids_.find(code);
-    if (it == lang_ids_.end())
-        throw std::runtime_error("nllb::Tokenizer: unknown language code '" +
-                                 code + "'");
-    return it->second;
+void Tokenizer::encode_text_(std::string_view text,
+                             std::vector<int32_t>& out) const {
+    // Metaspace pre-tokenization: prepend a leading marker (add_prefix_space)
+    // and replace every space with the marker, then split so each word begins
+    // with the marker. The BPE merge loop runs on the resulting Unicode
+    // codepoints directly (SentencePiece pieces, not byte-level encoded).
+    std::string ms = kMeta;
+    for (char c : text) {
+        if (c == ' ') ms += kMeta;
+        else          ms += c;
+    }
+
+    std::size_t i = 0;
+    while (i < ms.size()) {
+        std::size_t next = ms.find(kMeta, i + kMeta.size());
+        if (next == std::string::npos) next = ms.size();
+        const std::string word = ms.substr(i, next - i);
+        i = next;
+
+        const std::vector<std::string> pieces =
+            bpe::bpe_merge(word, merge_ranks_, /*append_end_of_word=*/false);
+        for (const auto& p : pieces) {
+            auto it = vocab_.find(p);
+            if (it != vocab_.end()) {
+                out.push_back(it->second);
+            } else if (out.empty() || out.back() != unk_id_) {
+                // fuse_unk: collapse a run of unknown symbols into one <unk>.
+                out.push_back(unk_id_);
+            }
+        }
+    }
 }
 
 std::vector<int32_t> Tokenizer::tokenize(std::string_view text) const {
-    return model_.tokenize(text, unk_id_);
+    std::vector<int32_t> out;
+    encode_text_(text, out);
+    return out;
 }
 
 std::vector<int32_t> Tokenizer::encode_source(std::string_view text,
                                               const std::string& src_lang) const {
     std::vector<int32_t> out;
     out.push_back(lang_id(src_lang));
-    const std::vector<int32_t> pieces = model_.tokenize(text, unk_id_);
-    out.insert(out.end(), pieces.begin(), pieces.end());
+    encode_text_(text, out);
     out.push_back(eos_id_);
     return out;
 }
@@ -126,9 +187,48 @@ std::vector<int32_t> Tokenizer::decoder_start(const std::string& tgt_lang) const
     return {eos_id_, lang_id(tgt_lang)};
 }
 
+// ─── decoding ────────────────────────────────────────────────────────────────
+
 std::string Tokenizer::decode(const std::vector<int32_t>& ids,
                               bool skip_special) const {
-    return model_.decode(ids, skip_special ? &special_ids_ : nullptr);
+    std::string pieces;
+    for (int32_t id : ids) {
+        if (skip_special && special_ids_.count(id)) continue;
+        auto it = vocab_inv_.find(id);
+        if (it != vocab_inv_.end()) {
+            pieces += it->second;
+            continue;
+        }
+        auto ai = added_inv_.find(id);
+        if (ai != added_inv_.end()) pieces += ai->second;
+    }
+
+    // Metaspace decode: marker -> space, then drop the single leading space the
+    // add_prefix_space step introduced.
+    std::string out;
+    out.reserve(pieces.size());
+    std::size_t i = 0;
+    while (i < pieces.size()) {
+        if (pieces.compare(i, kMeta.size(), kMeta) == 0) {
+            out += ' ';
+            i += kMeta.size();
+        } else {
+            out += pieces[i];
+            ++i;
+        }
+    }
+    if (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    return out;
+}
+
+// ─── language codes ──────────────────────────────────────────────────────────
+
+int Tokenizer::lang_id(const std::string& code) const {
+    auto it = lang_ids_.find(code);
+    if (it == lang_ids_.end())
+        throw std::runtime_error("nllb::Tokenizer: unknown language code '" +
+                                 code + "'");
+    return it->second;
 }
 
 }  // namespace brolm::nllb
