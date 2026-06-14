@@ -53,7 +53,6 @@ std::vector<std::int32_t> beam_search(Decoder& dec,
     if (start_ids.empty())
         throw std::runtime_error("nllb::beam_search: empty start_ids");
     const int beams = std::max(1, opts.num_beams);
-    const std::size_t start_len = start_ids.size();
 
     std::vector<Hypothesis> active = {Hypothesis{start_ids, 0.0}};
     std::vector<Hypothesis> finished;
@@ -106,10 +105,14 @@ std::vector<std::int32_t> beam_search(Decoder& dec,
     const Hypothesis* best = nullptr;
     double best_norm = -std::numeric_limits<double>::infinity();
     for (const Hypothesis& h : pool) {
-        const double gen_len =
-            std::max<double>(1.0, static_cast<double>(h.seq.size() - start_len));
+        // HF's BeamHypotheses normalizes by the FULL sequence length
+        // (hyp.shape[-1], including the forced </s> + tgt_lang prefix), not by
+        // the generated-token count — matching it is what keeps the length
+        // penalty's bias between competing hypotheses identical to transformers.
+        const double seq_len =
+            std::max<double>(1.0, static_cast<double>(h.seq.size()));
         const double norm =
-            h.score / std::pow(gen_len, static_cast<double>(opts.length_penalty));
+            h.score / std::pow(seq_len, static_cast<double>(opts.length_penalty));
         if (norm > best_norm) { best_norm = norm; best = &h; }
     }
     if (!best) return start_ids;
