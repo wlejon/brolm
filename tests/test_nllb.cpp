@@ -226,21 +226,68 @@ int main() {
         std::filesystem::remove_all(dir, ec);
     }
 
-    // ── gated real-checkpoint translation ───────────────────────────────────
+    // ── gated real-checkpoint parity vs HF transformers ─────────────────────
+    //
+    // The reference input_ids / out_ids below were produced by
+    // facebook/nllb-200-distilled-600M under transformers 5.x in FP32 with
+    // num_beams=5, length_penalty=1.0 (generate(..., forced_bos_token_id=
+    // <tgt_lang>)). brolm must reproduce BOTH the tokenization and the full beam
+    // hypothesis ([</s>, tgt_lang, ..., </s>]) exactly. All three cases are
+    // ASCII/Latin source, so they sit inside the bit-exact tokenizer envelope
+    // (no SentencePiece Precompiled normalization needed).
+    struct Parity {
+        const char* text;
+        const char* src;
+        const char* tgt;
+        std::vector<int32_t> input_ids;
+        std::vector<int32_t> out_ids;
+        const char* translation;
+    };
+    const std::vector<Parity> golden = {
+        {"Hello, world.", "eng_Latn", "fra_Latn",
+         {256047, 94124, 248079, 15697, 248075, 2},
+         {2, 256057, 17994, 141190, 96, 25601, 248075, 2},
+         "Bonjour le monde."},
+        {"The quick brown fox jumps over the lazy dog.", "eng_Latn", "fra_Latn",
+         {256047, 1617, 75149, 8610, 1254, 1931, 248153, 169768, 248066, 2415,
+          349, 82, 1328, 6658, 248075, 2},
+         {2, 256057, 1181, 7273, 1077, 1212, 24, 105439, 127, 4712, 2562, 96,
+          143251, 413, 9437, 1612, 248075, 2},
+         "Le renard brun rapide saute sur le chien paresseux."},
+        {"Good morning, how are you?", "eng_Latn", "spa_Latn",
+         {256047, 24718, 64246, 248079, 11657, 2442, 1259, 248130, 2},
+         {2, 256161, 139066, 36660, 248079, 2247, 227362, 27339, 248130, 2},
+         "Buenos días, ¿cómo estás?"},
+    };
+
     const std::string real = gated_model_dir();
     if (real.empty()) {
-        std::printf("nllb: OK (gated real-checkpoint test skipped — set "
+        std::printf("nllb: OK (gated real-checkpoint parity skipped — set "
                     "NLLB_MODEL_DIR)\n");
     } else {
         try {
             nllb::Translator tr = nllb::Translator::load(real);
-            const std::string out = tr.translate(
-                "Hello, world.", "eng_Latn", "fra_Latn");
-            std::printf("nllb: eng->fra \"Hello, world.\" => \"%s\"\n",
-                        out.c_str());
-            CHECK(!out.empty());
+            nllb::BeamOptions opts;
+            opts.num_beams = 5;
+            opts.length_penalty = 1.0f;
+            for (const Parity& g : golden) {
+                const std::vector<int32_t> in =
+                    tr.tokenizer().encode_source(g.text, g.src);
+                CHECK(in == g.input_ids);
+
+                const std::vector<int32_t> hyp =
+                    tr.translate_ids(in, g.tgt, opts);
+                CHECK(hyp == g.out_ids);
+
+                const std::string out = tr.translate(g.text, g.src, g.tgt, opts);
+                CHECK(out == g.translation);
+                std::printf("nllb parity %s->%s: \"%s\" => \"%s\" [%s]\n",
+                            g.src, g.tgt, g.text, out.c_str(),
+                            (in == g.input_ids && hyp == g.out_ids &&
+                             out == g.translation) ? "MATCH" : "MISMATCH");
+            }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "gated translation failed: %s\n", e.what());
+            std::fprintf(stderr, "gated parity failed: %s\n", e.what());
             ++g_failures;
         }
     }
