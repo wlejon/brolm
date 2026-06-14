@@ -125,6 +125,36 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
         }
     }
 
+    // --- SentencePiece Precompiled normalizer (optional) --------------------
+    //
+    // root.normalizer is either a Precompiled node directly or a Sequence
+    // wrapping one. Pull its base64 precompiled_charsmap and build the trie.
+    if (const json::Value* nz = root.find("normalizer")) {
+        const json::Value* prec = nullptr;
+        if (nz->is_object()) {
+            const std::string ty = nz->get_string("type", "");
+            if (ty == "Precompiled") {
+                prec = nz;
+            } else if (const json::Value* seq = nz->find("normalizers");
+                       seq && seq->is_array()) {
+                for (const auto& e : seq->as_array()) {
+                    if (e.is_object() && e.get_string("type", "") == "Precompiled") {
+                        prec = &e;
+                        break;
+                    }
+                }
+            }
+        }
+        if (prec) {
+            const std::string b64 = prec->get_string("precompiled_charsmap", "");
+            if (!b64.empty()) {
+                const std::string blob = bpe::base64_decode(b64);
+                t.normalizer_ =
+                    brolm::detail::spm::PrecompiledNormalizer(blob);
+            }
+        }
+    }
+
     t.unk_id_ = (unk >= 0) ? unk : 3;
     t.bos_id_ = (bos >= 0) ? bos : 0;
     t.pad_id_ = (pad >= 0) ? pad : 1;
@@ -136,12 +166,15 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
 
 void Tokenizer::encode_text_(std::string_view text,
                              std::vector<int32_t>& out) const {
-    // Metaspace pre-tokenization: prepend a leading marker (add_prefix_space)
+    // SentencePiece Precompiled normalization first (NFKC-ish folds), then
+    // metaspace pre-tokenization: prepend a leading marker (add_prefix_space)
     // and replace every space with the marker, then split so each word begins
     // with the marker. The BPE merge loop runs on the resulting Unicode
     // codepoints directly (SentencePiece pieces, not byte-level encoded).
+    const std::string normalized =
+        normalizer_.empty() ? std::string(text) : normalizer_.normalize(text);
     std::string ms = kMeta;
-    for (char c : text) {
+    for (char c : normalized) {
         if (c == ' ') ms += kMeta;
         else          ms += c;
     }

@@ -267,6 +267,38 @@ int main() {
     } else {
         try {
             nllb::Translator tr = nllb::Translator::load(real);
+
+            // Tokenization parity (input_ids only, no decode) over non-ASCII
+            // sources — French/German/Spanish accents, Cyrillic, Japanese, and a
+            // full-width + ligature + circled-digit string that exercises the
+            // SentencePiece Precompiled normalizer. Reference ids are HF's.
+            struct TokCase {
+                const char* src;
+                const char* text;             // UTF-8, fully \x-escaped
+                std::vector<int32_t> ids;
+            };
+            const std::vector<TokCase> tok_golden = {
+                {"eng_Latn", "\x48\x65\x6c\x6c\x6f\x2c\x20\x77\x6f\x72\x6c\x64\x2e",
+                 {256047, 94124, 248079, 15697, 248075, 2}},
+                {"fra_Latn", "\x56\x6f\x69\x6c\xc3\xa0\x20\x6c\x27\xc3\xa9\x74\xc3\xa9\x2c\x20\xc3\xa7\x61\x20\x76\x61\x20\xc3\xaa\x74\x72\x65\x20\x67\xc3\xa9\x6e\x69\x61\x6c\x20\x21",
+                 {256057, 174458, 55, 248116, 45755, 248079, 11475, 287, 14175, 26140, 202451, 835, 2}},
+                {"deu_Latn", "\x53\x63\x68\xc3\xb6\x6e\x65\x20\x47\x72\xc3\xbc\xc3\x9f\x65\x20\x61\x75\x73\x20\x4d\xc3\xbc\x6e\x63\x68\x65\x6e\x2c\x20\x53\x74\x72\x61\xc3\x9f\x65\x2e",
+                 {256042, 5996, 41501, 4177, 248240, 43439, 5005, 157165, 2747, 248079, 43839, 43439, 248075, 2}},
+                {"rus_Cyrl", "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82\x2c\x20\xd0\xbc\xd0\xb8\xd1\x80\x21\x20\xd0\x9a\xd0\xb0\xd0\xba\x20\xd0\xb4\xd0\xb5\xd0\xbb\xd0\xb0\x3f",
+                 {256147, 12700, 9272, 248079, 50212, 248203, 11278, 22282, 248130, 2}},
+                {"jpn_Jpan", "\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf\xe4\xb8\x96\xe7\x95\x8c\xe3\x80\x82",
+                 {256079, 9881, 177606, 248917, 122603, 253935, 2}},
+                {"eng_Latn", "\x46\x75\x6c\x6c\x2d\x77\x69\x64\x74\x68\xef\xbc\x9a\xef\xbc\xa1\xef\xbc\xa2\xef\xbc\xa3\xef\xbc\x91\xef\xbc\x92\xef\xbc\x93\x20\x61\x6e\x64\x20\xef\xac\x81\x20\x6c\x69\x67\x61\x74\x75\x72\x65\x20\xe2\x91\xa1\xe2\x91\xa2\x2e",
+                 {256047, 81042, 248105, 17263, 419, 248144, 248085, 14150, 232903, 540, 915, 6596, 36084, 27470, 2}},
+            };
+            for (const TokCase& tc : tok_golden) {
+                const std::vector<int32_t> got =
+                    tr.tokenizer().encode_source(tc.text, tc.src);
+                const bool ok = (got == tc.ids);
+                CHECK(ok);
+                std::printf("nllb tok %s: %s\n", tc.src, ok ? "MATCH" : "MISMATCH");
+            }
+
             nllb::BeamOptions opts;
             opts.num_beams = 5;
             opts.length_penalty = 1.0f;

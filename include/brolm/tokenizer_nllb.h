@@ -24,13 +24,13 @@
 //                                              forced target-language BOS)
 // Generation then produces target pieces and stops at </s>.
 //
-// Normalization caveat: HF runs a SentencePiece "Precompiled" charsmap
-// (≈ NFKC) before metaspace. brolm applies metaspace directly without that
-// normalization, so ASCII/Latin source text tokenizes bit-exactly to HF, but
-// inputs needing NFKC folding (full-width forms, compatibility characters) may
-// differ. This is the one known tokenizer parity gap.
+// Before metaspace, HF runs the SentencePiece "Precompiled" charsmap normalizer
+// (≈ NFKC plus SPM's folds); brolm applies it via detail::spm::PrecompiledNormalizer
+// loaded from tokenizer.json, so full-width forms, ligatures, and compatibility
+// characters fold exactly as in transformers.
 
 #include "brolm/detail/byte_level_bpe.h"
+#include "brolm/detail/spm_normalizer.h"
 
 #include <cstdint>
 #include <string>
@@ -88,6 +88,10 @@ private:
 
     // Metaspace pre-tokenize `text` then BPE-merge each word, appending ids.
     void encode_text_(std::string_view text, std::vector<int32_t>& out) const;
+
+    // SentencePiece Precompiled charsmap normalizer (empty if tokenizer.json
+    // carries none — then text passes through unchanged).
+    brolm::detail::spm::PrecompiledNormalizer normalizer_;
 
     // Base BPE tables (from model.vocab / model.merges).
     std::unordered_map<std::string, int32_t> vocab_;       // piece  -> id
