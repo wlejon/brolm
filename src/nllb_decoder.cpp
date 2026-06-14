@@ -201,4 +201,112 @@ void Decoder::forward_logits(const std::int32_t* dec_ids, int T,
         bt::add_inplace(logits, final_logits_bias_);
 }
 
+// ─── incremental (KV-cached) decode ──────────────────────────────────────────
+
+DecoderState Decoder::make_state(int max_len) const {
+    if (max_len <= 0) fail("make_state: max_len must be positive");
+    const int D = cfg_.d_model;
+    const int n = cfg_.decoder_layers;
+    const bt::Dtype dt = brolm::compute_dtype();
+
+    DecoderState s;
+    s.k_self.reserve(static_cast<std::size_t>(n));
+    s.v_self.reserve(static_cast<std::size_t>(n));
+    for (int l = 0; l < n; ++l) {
+        s.k_self.push_back(bt::Tensor::empty_on(bt::default_device(), max_len, D, dt));
+        s.v_self.push_back(bt::Tensor::empty_on(bt::default_device(), max_len, D, dt));
+    }
+    s.len = 0;
+    s.max_len = max_len;
+    return s;
+}
+
+DecoderState Decoder::clone_state(const DecoderState& src) const {
+    DecoderState s = make_state(src.max_len);
+    const int D = cfg_.d_model;
+    const bt::Dtype dt = brolm::compute_dtype();
+    // Copy only the valid prefix [0, src.len) — a full (max_len, D) copy would
+    // move capacity that no step has written yet. kv_cache_append over a view of
+    // the source prefix lands it at rows [0, len) of the fresh caches.
+    for (std::size_t l = 0; l < src.k_self.size(); ++l) {
+        if (src.len > 0) {
+            bt::Tensor ksrc = bt::Tensor::view(
+                src.k_self[l].device, src.k_self[l].data, src.len, D, dt);
+            bt::Tensor vsrc = bt::Tensor::view(
+                src.v_self[l].device, src.v_self[l].data, src.len, D, dt);
+            bt::kv_cache_append(ksrc, vsrc, /*cur_len=*/0, s.k_self[l], s.v_self[l]);
+        }
+    }
+    s.len = src.len;
+    return s;
+}
+
+void Decoder::decode_step(DecoderState& state, std::int32_t token,
+                          bt::Tensor& logits) {
+    if (token_embed_.size() == 0) fail("decode_step: weights not loaded");
+    if (enc_len_ == 0) fail("decode_step: set_encoder_memory not called");
+    if (state.len >= state.max_len) fail("decode_step: cache capacity exceeded");
+    if (static_cast<int>(state.k_self.size()) != cfg_.decoder_layers)
+        fail("decode_step: state not from this decoder");
+
+    const int D = cfg_.d_model;
+    const int H = cfg_.decoder_attention_heads;
+    const float eps = cfg_.layer_norm_eps;
+    const int pos = state.len;        // 0-based position of this token
+    const int valid = pos + 1;        // cache rows live after the append
+
+    // Embedding * sqrt(d_model) + the sinusoidal position for this one token.
+    ids_dev_ = detail::upload_ids(&token, 1);
+    bt::embedding_lookup_forward(
+        token_embed_, static_cast<const std::int32_t*>(ids_dev_.data), 1, x_);
+    x_ = x_.clone();
+    if (cfg_.scale_embedding)
+        bt::scale_inplace(x_, std::sqrt(static_cast<float>(D)));
+    {
+        bt::Tensor pos_emb =
+            detail::sinusoidal_positions(1, D, cfg_.pad_token_id, /*past_len=*/pos);
+        bt::add_inplace(x_, pos_emb);
+    }
+
+    for (int l = 0; l < cfg_.decoder_layers; ++l) {
+        Layer& Lr = layers_[static_cast<std::size_t>(l)];
+
+        // causal self-attention over the growing cache
+        brolm::detail::layernorm_batched(x_, Lr.sa_ln_w, Lr.sa_ln_b, xln_, eps);
+        brolm::detail::linear_batched(Lr.sWq, &Lr.sbq, xln_, Q_);
+        brolm::detail::linear_batched(Lr.sWk, &Lr.sbk, xln_, K_);
+        brolm::detail::linear_batched(Lr.sWv, &Lr.sbv, xln_, V_);
+        bt::kv_cache_append(K_, V_, pos, state.k_self[static_cast<std::size_t>(l)],
+                            state.v_self[static_cast<std::size_t>(l)]);
+        bt::flash_attention_decode(Q_, state.k_self[static_cast<std::size_t>(l)],
+                                   state.v_self[static_cast<std::size_t>(l)],
+                                   valid, H, attn_);
+        brolm::detail::linear_batched(Lr.sWo, &Lr.sbo, attn_, proj_);
+        bt::add_inplace(x_, proj_);
+
+        // cross-attention over the cached encoder K/V (single query row)
+        brolm::detail::layernorm_batched(x_, Lr.ca_ln_w, Lr.ca_ln_b, xln_, eps);
+        brolm::detail::linear_batched(Lr.cWq, &Lr.cbq, xln_, Q_);
+        bt::flash_attention_forward(Q_, Lr.K_enc, Lr.V_enc, /*d_mask=*/nullptr,
+                                    H, /*causal=*/false, attn_);
+        brolm::detail::linear_batched(Lr.cWo, &Lr.cbo, attn_, proj_);
+        bt::add_inplace(x_, proj_);
+
+        // feed-forward (ReLU)
+        brolm::detail::layernorm_batched(x_, Lr.ff_ln_w, Lr.ff_ln_b, xln_, eps);
+        brolm::detail::linear_batched(Lr.fc1_w, &Lr.fc1_b, xln_, h1_);
+        bt::relu_forward_batched(h1_, h1_);
+        brolm::detail::linear_batched(Lr.fc2_w, &Lr.fc2_b, h1_, proj_);
+        bt::add_inplace(x_, proj_);
+    }
+
+    brolm::detail::layernorm_batched(x_, dec_ln_w_, dec_ln_b_, xn_, eps);
+    // xn_ is a single (1, D) row — project straight through the tied lm_head.
+    brolm::detail::linear_batched(token_embed_, /*bias=*/nullptr, xn_, logits);
+    if (final_logits_bias_.size() > 0)
+        bt::add_inplace(logits, final_logits_bias_);
+
+    state.len = valid;
+}
+
 }  // namespace brolm::nllb

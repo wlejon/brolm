@@ -246,6 +246,41 @@ int main() {
         CHECK(maxdiff > 1.0e-6f);
     }
 
+    // The incremental KV-cached path (make_state + decode_step) must reproduce
+    // the recompute path's last-token logits bit-for-bit (FP tolerance), and
+    // clone_state must fork a cache that keeps decoding identically — this is
+    // what lets beam_search trust the cache. dec_ids = {2, 11, 8}; enc_out
+    // memory is already restored above so h1 is the matching reference.
+    {
+        nllb::DecoderState s = dec.make_state(/*max_len=*/8);
+        bt::Tensor lc;
+        // Consume all but the last token, then fork the cache before the last.
+        dec.decode_step(s, dec_ids[0], lc);
+        dec.decode_step(s, dec_ids[1], lc);
+        nllb::DecoderState forked = dec.clone_state(s);
+        dec.decode_step(forked, dec_ids[2], lc);   // logits predict token 4
+        bt::sync_all();
+        std::vector<float> hc = bdtest::bd_download(lc);
+
+        CHECK(lc.rows == 1);
+        CHECK(lc.cols == V);
+        float maxdiff = 0.0f;
+        for (std::size_t i = 0; i < h1.size(); ++i)
+            maxdiff = std::max(maxdiff, std::fabs(h1[i] - hc[i]));
+        CHECK(maxdiff < 1.0e-4f);
+
+        // The forked-from state is unchanged by the child's decode_step: feeding
+        // it the same last token reproduces the same logits.
+        bt::Tensor lc2;
+        dec.decode_step(s, dec_ids[2], lc2);
+        bt::sync_all();
+        std::vector<float> hc2 = bdtest::bd_download(lc2);
+        float forkdiff = 0.0f;
+        for (std::size_t i = 0; i < hc.size(); ++i)
+            forkdiff = std::max(forkdiff, std::fabs(hc[i] - hc2[i]));
+        CHECK(forkdiff < 1.0e-6f);
+    }
+
     std::error_code ec;
     std::filesystem::remove(path, ec);
 

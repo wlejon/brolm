@@ -92,13 +92,30 @@ private:
     brotensor::Tensor Qh_, Kh_, Vh_, Attnh_, Yconcat_;   // mha caches
 };
 
+// Per-hypothesis self-attention KV cache for incremental decoding. Holds one
+// pair of (max_len, d_model) K/V caches per decoder layer plus the number of
+// tokens already consumed. Created by Decoder::make_state, advanced one row per
+// Decoder::decode_step, and deep-copied (valid prefix only) by
+// Decoder::clone_state when a beam branches. The cross-attention K/V are NOT
+// here — those are source-fixed and live on the Decoder (set_encoder_memory).
+struct DecoderState {
+    std::vector<brotensor::Tensor> k_self;   // [decoder_layers] (max_len, D)
+    std::vector<brotensor::Tensor> v_self;   // [decoder_layers] (max_len, D)
+    int len = 0;        // tokens consumed so far (valid cache rows)
+    int max_len = 0;    // cache capacity
+};
+
 // Decoder: causal self-attention + cross-attention over the encoder memory +
 // ReLU FFN, with a tied lm_head. set_encoder_memory() projects and caches the
 // cross-attention K/V once per source (shared across all decode steps and beam
-// hypotheses); forward_logits() then recomputes the decoder over a generated
-// prefix and returns the last token's logits. (A growing self-attention KV
-// cache is the next optimization; recompute keeps the first version simple and
-// backend-portable.)
+// hypotheses).
+//
+// Two decode paths share the same weights:
+//   - forward_logits(): recomputes the whole prefix each call. Stateless and
+//     backend-trivial; used by tests and as the reference.
+//   - make_state()/decode_step(): a growing self-attention KV cache that
+//     consumes one token per call (O(1) projections/FFN per step instead of
+//     O(T)). beam_search() uses this; clone_state() forks a beam's cache.
 class Decoder {
 public:
     explicit Decoder(const NllbConfig& cfg);
@@ -125,6 +142,22 @@ public:
     // compute dtype. set_encoder_memory() must have run.
     void forward_logits(const std::int32_t* dec_ids, int T,
                         brotensor::Tensor& logits);
+
+    // Allocate an empty decode state with self-attention caches sized for up to
+    // `max_len` total decoder tokens (start prefix + generated).
+    DecoderState make_state(int max_len) const;
+
+    // Deep-copy a decode state's valid cache prefix into a fresh state of the
+    // same capacity — used when a beam forks into multiple children.
+    DecoderState clone_state(const DecoderState& src) const;
+
+    // Consume one token: append its self-attention K/V to the state's caches,
+    // run the decoder over just that row (self-attn over the cache, cross-attn
+    // over the encoder memory, ReLU FFN, tied lm_head), and write the
+    // (1, vocab_size) logits for the NEXT token. Advances state.len by 1.
+    // set_encoder_memory() must have run.
+    void decode_step(DecoderState& state, std::int32_t token,
+                     brotensor::Tensor& logits);
 
     const NllbConfig& config() const { return cfg_; }
 
