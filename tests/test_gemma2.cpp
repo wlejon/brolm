@@ -361,6 +361,126 @@ void run_real_checkpoint() {
     }
 }
 
+// ─── long-context "stacked" exercise (gated) ──────────────────────────────
+//
+// Gated on BROLM_GEMMA_DIR. Stacks a passage into a context LONGER than the
+// 4096 sliding window, then prefills it through the real 2B weights and decodes
+// past the boundary. This is the end-to-end counterpart to brotensor's split-K
+// window parity test: it proves the full model runs correctly when the sequence
+// exceeds the sliding window — RoPE positions cross 4096, the KV cache holds
+// >4096 rows, even (sliding) layers run windowed while odd layers stay global,
+// and every decode step sits past the window. Asserts finite, soft-cap-bounded
+// logits through prefill and all decode steps, plus a non-degenerate
+// continuation. forward_last keeps prefill to a single (1,vocab) logit row.
+void run_long_context() {
+    const char* dir_env = std::getenv("BROLM_GEMMA_DIR");
+    if (!dir_env) {
+        std::printf("[skip] long-context: BROLM_GEMMA_DIR not set\n");
+        return;
+    }
+    const std::filesystem::path dir = dir_env;
+    const std::filesystem::path cfg_path = dir / "config.json";
+    const std::filesystem::path tok_path = dir / "tokenizer.json";
+    if (!std::filesystem::exists(cfg_path) || !std::filesystem::exists(tok_path)) {
+        std::printf("[skip] long-context: config.json / tokenizer.json missing\n");
+        return;
+    }
+
+    try {
+        auto cfg = gm::Gemma2Config::from_safetensors_dir(dir.string());
+
+        std::vector<std::string> shard_paths;
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (entry.path().extension() == ".safetensors")
+                shard_paths.push_back(entry.path().string());
+        }
+        if (shard_paths.empty()) {
+            std::printf("[skip] long-context: no *.safetensors in %s\n", dir_env);
+            return;
+        }
+        std::vector<st::File> files;
+        files.reserve(shard_paths.size());
+        for (const auto& sp : shard_paths) files.push_back(st::File::open(sp));
+        std::vector<const st::File*> shard_ptrs;
+        for (const auto& f : files) shard_ptrs.push_back(&f);
+
+        auto tok = gm::Tokenizer::load(tok_path.string());
+
+        // Stack a passage until the context clears the sliding window with margin.
+        // One leading BOS, then repeat the body (BOS stripped) — a coherent but
+        // deliberately long "stacked" context.
+        const std::string passage =
+            "The history of the old city is long and layered. Each generation "
+            "built atop the last, leaving narrow streets that wander like rivers "
+            "and squares where markets have stood for a thousand years. Travelers "
+            "still arrive by the eastern road, as they always have, to trade in "
+            "salt and cloth and stories. ";
+        const std::vector<int32_t> body = tok.encode(passage);  // includes BOS
+        const int target = cfg.sliding_window + 512;            // e.g. 4608
+        std::vector<int32_t> ids = body;
+        while (static_cast<int>(ids.size()) < target) {
+            for (std::size_t i = 1; i < body.size(); ++i) {     // skip repeat BOS
+                ids.push_back(body[i]);
+                if (static_cast<int>(ids.size()) >= target) break;
+            }
+        }
+        const int L = static_cast<int>(ids.size());
+        std::printf("gemma2 long-context: prefill L=%d (sliding_window=%d)\n",
+                    L, cfg.sliding_window);
+        CHECK(L > cfg.sliding_window);
+
+        gm::Gemma2Model model(cfg);
+        model.load_weights(shard_ptrs);
+        model.allocate_cache(L + 16);
+
+        bt::Tensor logits;
+        model.forward_last(ids.data(), L, logits);
+        bt::sync_all();
+        CHECK(logits.rows == 1);
+        CHECK(logits.cols == cfg.vocab_size);
+
+        std::vector<float> host = bdtest::bd_download(logits);
+        int nonfinite = 0; float max_abs = 0.0f;
+        for (float v : host) {
+            if (!bdtest::bd_finite(v)) ++nonfinite;
+            if (std::fabs(v) > max_abs) max_abs = std::fabs(v);
+        }
+        CHECK(nonfinite == 0);
+        CHECK(max_abs <= cfg.final_logit_softcapping);
+        std::printf("gemma2 long-context: prefill ok — max|logit|=%.3f cache_len=%d\n",
+                    static_cast<double>(max_abs), model.cache_len());
+
+        // Decode several tokens, every one of them past the sliding window.
+        std::vector<int32_t> gen;
+        int next = argmax_row(host, 0, cfg.vocab_size);
+        for (int step = 0; step < 12; ++step) {
+            CHECK(model.cache_len() > cfg.sliding_window);
+            gen.push_back(next);
+            int32_t tok_id = next;
+            bt::Tensor step_logits;
+            model.forward(&tok_id, 1, step_logits);
+            bt::sync_all();
+            std::vector<float> sh = bdtest::bd_download(step_logits);
+            int snf = 0; float smax = 0.0f;
+            for (float v : sh) {
+                if (!bdtest::bd_finite(v)) ++snf;
+                if (std::fabs(v) > smax) smax = std::fabs(v);
+            }
+            CHECK(snf == 0);
+            CHECK(smax <= cfg.final_logit_softcapping);
+            next = argmax_row(sh, 0, cfg.vocab_size);
+        }
+        bool all_same = true;
+        for (std::size_t i = 1; i < gen.size(); ++i)
+            if (gen[i] != gen[0]) { all_same = false; break; }
+        CHECK(!all_same);
+        std::printf("gemma2 long-context: decoded = %s\n", tok.decode(gen).c_str());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "gemma2 long-context threw: %s\n", e.what());
+        ++g_failures;
+    }
+}
+
 // ─── gguf checkpoint (gated) ───────────────────────────────────────────────
 //
 // Gated on BROLM_GEMMA_GGUF (path to a gemma-2-2b .gguf). Loads config + model
@@ -455,6 +575,7 @@ int main() {
     }
     run_synthetic();
     run_real_checkpoint();
+    run_long_context();
     run_gguf_checkpoint();
     if (g_failures == 0) std::printf("gemma2: OK\n");
     else std::fprintf(stderr, "gemma2: %d failure(s)\n", g_failures);
