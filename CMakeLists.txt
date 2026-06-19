@@ -101,6 +101,7 @@ target_sources(brolm PRIVATE
     src/version.cpp
     src/detail/byte_level_bpe.cpp
     src/detail/spm_unigram.cpp
+    src/detail/spm_bpe.cpp
     src/detail/spm_normalizer.cpp
     src/detail/dense_decoder.cpp
     src/detail/generate.cpp
@@ -115,6 +116,7 @@ target_sources(brolm PRIVATE
     src/nllb_beam.cpp
     src/nllb.cpp
     src/qwen_tokenizer.cpp
+    src/gemma_tokenizer.cpp
     src/mistral_tokenizer.cpp
     src/mistral3_config.cpp
     src/mistral3_text.cpp
