@@ -4,6 +4,7 @@
 #include "brolm/detail/device.h"
 #include "brolm/detail/weights.h"
 
+#include "brotensor/gguf.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brolm::gemma {
@@ -38,7 +40,68 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
     return cpu.to(bt::default_device());
 }
 
+bool starts_with(std::string_view s, std::string_view p) {
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+
 }  // namespace
+
+// ─── HF → ggml tensor-name map (Gemma-2) ───────────────────────────────────
+//
+// HF naming:  model.embed_tokens.weight,
+//             model.layers.N.{self_attn.{q,k,v,o}_proj, input_layernorm,
+//                             post_attention_layernorm, pre_feedforward_layernorm,
+//                             post_feedforward_layernorm,
+//                             mlp.{gate,up,down}_proj}.weight,
+//             model.norm.weight, lm_head.weight.
+// ggml naming (llama.cpp Gemma-2 convention, verified against
+// gguf-py tensor_mapping.py / constants.py MODEL_ARCH.GEMMA2):
+//             token_embd.weight,
+//             blk.N.{attn_q, attn_k, attn_v, attn_output, attn_norm,
+//                    post_attention_norm, ffn_norm, post_ffw_norm,
+//                    ffn_gate, ffn_up, ffn_down}.weight,
+//             output_norm.weight, output.weight (absent when tied).
+//
+// Note the two feed-forward norms: HF pre_feedforward_layernorm maps to ggml
+// `ffn_norm` (FFN_PRE_NORM), and HF post_feedforward_layernorm maps to ggml
+// `post_ffw_norm` (FFN_POST_NORM).
+
+std::string gemma2_hf_to_ggml(std::string_view hf_name) {
+    if (hf_name == "model.embed_tokens.weight") return "token_embd.weight";
+    if (hf_name == "model.norm.weight")         return "output_norm.weight";
+    if (hf_name == "lm_head.weight")            return "output.weight";
+
+    constexpr std::string_view kLayersPrefix = "model.layers.";
+    if (!starts_with(hf_name, kLayersPrefix)) return {};
+    const auto dot = hf_name.find('.', kLayersPrefix.size());
+    if (dot == std::string_view::npos) return {};
+    const std::string_view idx = hf_name.substr(
+        kLayersPrefix.size(), dot - kLayersPrefix.size());
+    const std::string_view tail = hf_name.substr(dot + 1);
+
+    auto blk = [&](std::string_view suffix) -> std::string {
+        std::string out;
+        out.reserve(4 + idx.size() + 1 + suffix.size());
+        out.append("blk.");
+        out.append(idx);
+        out.push_back('.');
+        out.append(suffix);
+        return out;
+    };
+
+    if (tail == "self_attn.q_proj.weight")            return blk("attn_q.weight");
+    if (tail == "self_attn.k_proj.weight")            return blk("attn_k.weight");
+    if (tail == "self_attn.v_proj.weight")            return blk("attn_v.weight");
+    if (tail == "self_attn.o_proj.weight")            return blk("attn_output.weight");
+    if (tail == "input_layernorm.weight")             return blk("attn_norm.weight");
+    if (tail == "post_attention_layernorm.weight")    return blk("post_attention_norm.weight");
+    if (tail == "pre_feedforward_layernorm.weight")   return blk("ffn_norm.weight");
+    if (tail == "post_feedforward_layernorm.weight")  return blk("post_ffw_norm.weight");
+    if (tail == "mlp.gate_proj.weight")               return blk("ffn_gate.weight");
+    if (tail == "mlp.up_proj.weight")                 return blk("ffn_up.weight");
+    if (tail == "mlp.down_proj.weight")               return blk("ffn_down.weight");
+    return {};
+}
 
 // ─── ctor ────────────────────────────────────────────────────────────────────
 
@@ -58,10 +121,27 @@ void Gemma2Model::load_weights(const std::vector<const st::File*>& shards,
                                const std::string& prefix) {
     if (shards.empty()) fail("load_weights: no safetensors shards");
     brolm::detail::weights::SafetensorsSource src(shards, prefix);
-    load_weights_(src);
+    // Safetensors stores raw norm weights; fold +1 at load.
+    load_weights_(src, /*norms_prefolded=*/false);
 }
 
-void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src) {
+void Gemma2Model::load_weights(const brotensor::gguf::File& f) {
+    const std::vector<const brotensor::gguf::File*> shards = {&f};
+    load_weights(shards);
+}
+
+void Gemma2Model::load_weights(
+    const std::vector<const brotensor::gguf::File*>& shards) {
+    if (shards.empty()) fail("load_weights: no gguf shards");
+    brolm::detail::weights::GgufSource src(
+        shards, [](std::string_view hf) { return gemma2_hf_to_ggml(hf); });
+    // llama.cpp's Gemma-2 converter already baked the +1 into every norm.weight,
+    // so the gguf path must NOT fold +1 again.
+    load_weights_(src, /*norms_prefolded=*/true);
+}
+
+void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src,
+                                bool norms_prefolded) {
     const int V    = cfg_.vocab_size;
     const int H    = cfg_.hidden_size;
     const int F    = cfg_.intermediate_size;
@@ -71,13 +151,21 @@ void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src) {
     const int q_dim  = n_q  * HD;
     const int kv_dim = n_kv * HD;
 
-    // Gemma-2 RMSNorm computes `_norm(x) * (1 + weight)`. Fold the +1 into the
-    // gain once at load: read the weight to an FP32 host buffer (exact on the
-    // FP32/CPU path; the FP16/GPU path reads back the FP16 the kernel would use
-    // anyway), add 1.0f, and re-upload at the compute dtype. rms_norm_forward's
-    // plain `x * gamma` then reproduces HF exactly.
-    auto load_norm_plus1 = [&](const std::string& name, bt::Tensor& dst,
-                               const std::string& label) {
+    // Gemma-2 RMSNorm computes `_norm(x) * (1 + weight)`, so the gain handed to
+    // rms_norm_forward (which does a plain `x * gamma`) must be `1 + weight`.
+    //   - safetensors (norms_prefolded == false): HF stores the raw `weight`.
+    //     Read it to an FP32 host buffer (exact on FP32/CPU; the FP16/GPU path
+    //     reads back the FP16 the kernel would use anyway), add 1.0f, re-upload.
+    //   - gguf (norms_prefolded == true): llama.cpp's Gemma2 converter already
+    //     baked the +1 in (modify_tensors: name.endswith("norm.weight") -> +1),
+    //     so load AS-IS. Folding +1 again would double-shift every norm and
+    //     silently corrupt all outputs.
+    auto load_norm = [&](const std::string& name, bt::Tensor& dst,
+                         const std::string& label) {
+        if (norms_prefolded) {
+            src.upload_compute_dequant(name, H, 1, dst, label);
+            return;
+        }
         bt::Tensor tmp;
         src.upload_compute_dequant(name, H, 1, tmp, label);
         std::vector<float> host =
@@ -93,7 +181,7 @@ void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        load_norm_plus1(p + "input_layernorm.weight", L.input_ln,
+        load_norm(p + "input_layernorm.weight", L.input_ln,
                         "input_layernorm.weight");
 
         // RoPE permute on q/k exactly as the dense LLaMA-family decoder.
@@ -106,11 +194,11 @@ void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src) {
         src.upload_compute_checked(p + "self_attn.o_proj.weight",
                                    H, q_dim, L.Wo, "o_proj.weight");
 
-        load_norm_plus1(p + "post_attention_layernorm.weight", L.post_attn_ln,
+        load_norm(p + "post_attention_layernorm.weight", L.post_attn_ln,
                         "post_attention_layernorm.weight");
-        load_norm_plus1(p + "pre_feedforward_layernorm.weight", L.pre_ffn_ln,
+        load_norm(p + "pre_feedforward_layernorm.weight", L.pre_ffn_ln,
                         "pre_feedforward_layernorm.weight");
-        load_norm_plus1(p + "post_feedforward_layernorm.weight", L.post_ffn_ln,
+        load_norm(p + "post_feedforward_layernorm.weight", L.post_ffn_ln,
                         "post_feedforward_layernorm.weight");
 
         src.upload_compute_checked(p + "mlp.gate_proj.weight",
@@ -121,7 +209,7 @@ void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src) {
                                    H, F, L.down_W, "down_proj.weight");
     }
 
-    load_norm_plus1("model.norm.weight", final_norm_, "model.norm.weight");
+    load_norm("model.norm.weight", final_norm_, "model.norm.weight");
 
     if (src.has("lm_head.weight")) {
         src.upload_compute_checked("lm_head.weight",

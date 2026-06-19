@@ -47,13 +47,22 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brotensor::safetensors { class File; }
+namespace brotensor::gguf { class File; }
 
 namespace brolm::detail::weights { class Source; }
 
 namespace brolm::gemma {
+
+// Translate a HF-style Gemma-2 tensor name (e.g.
+// "model.layers.3.self_attn.q_proj.weight") into the ggml/llama.cpp name used
+// in a Gemma-2 .gguf checkpoint ("blk.3.attn_q.weight"). Returns an empty
+// string if the name does not match any known Gemma-2 weight. Exposed so
+// callers can build their own gguf-shard pipelines.
+std::string gemma2_hf_to_ggml(std::string_view hf_name);
 
 class Gemma2Model {
 public:
@@ -81,6 +90,17 @@ public:
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "");
+
+    // GGUF overloads. Tensor names follow the ggml/llama.cpp Gemma-2 convention
+    // (`token_embd.weight`, `blk.N.attn_q.weight`, ...); see gemma2_hf_to_ggml.
+    // llama.cpp's Gemma-2 converter already bakes the +1 into every norm.weight,
+    // so the gguf path loads norm gains AS-IS (no +1 fold — see gemma2.cpp).
+    // Quantized weights (Q4_K / Q6_K / Q8_0) keep their on-disk dtype and
+    // dispatch through brotensor's fused-dequant matmuls (GPU-only today). When
+    // tie_word_embeddings is true, `output.weight` is expected to be absent and
+    // the embedding matrix is reused.
+    void load_weights(const brotensor::gguf::File& f);
+    void load_weights(const std::vector<const brotensor::gguf::File*>& shards);
 
     // Allocate the per-layer K/V cache for sequences up to `max_seq_len`
     // tokens. Sized once; resets cache_len to 0.
@@ -135,7 +155,13 @@ private:
         brotensor::Tensor K_cache, V_cache;
     };
 
-    void load_weights_(const brolm::detail::weights::Source& src);
+    // Shared weight-load core over a container-agnostic Source. `norms_prefolded`
+    // selects how RMSNorm gains are read: false (safetensors) folds +1 into each
+    // norm at load (HF stores raw w); true (gguf) loads norms AS-IS because
+    // llama.cpp's converter already baked the +1 in. Double-folding would
+    // silently corrupt every norm.
+    void load_weights_(const brolm::detail::weights::Source& src,
+                       bool norms_prefolded);
 
     // Run all decoder layers + final norm + lm_head over the residual stream in
     // h_ (L rows at the compute dtype). Applies the embedding scale, writes

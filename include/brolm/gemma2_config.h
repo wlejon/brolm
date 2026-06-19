@@ -13,12 +13,13 @@
 // and a final tanh soft-cap on the output logits.
 //
 // Field naming follows the HF JSON key names verbatim. Defaults are the
-// gemma-2-2b values. GGUF metadata parsing is a separate follow-up: the
-// from_json / from_safetensors_dir seam here is the only config entry point
-// today, and a from_gguf static can slot in alongside it without touching the
-// model class.
+// gemma-2-2b values. Both the HF `config.json` (from_json /
+// from_safetensors_dir) and llama.cpp `.gguf` metadata (from_gguf) are config
+// entry points; the model class is agnostic to which produced the config.
 
 #include <string>
+
+namespace brotensor::gguf { class File; }
 
 namespace brolm::gemma {
 
@@ -53,6 +54,17 @@ struct Gemma2Config {
 
     // Parse from an in-memory JSON document (useful for tests).
     static Gemma2Config from_json_text(const std::string& json_text);
+
+    // Populate a Gemma2Config from the metadata of a Gemma-2 .gguf file. Reads
+    // the llama.cpp-convention keys (`gemma2.embedding_length`,
+    // `gemma2.attention.head_count`, ...) plus the tokenizer vocab length for
+    // `vocab_size`. The gguf metadata does not carry query_pre_attn_scalar; it
+    // is set to head_dim (the 2B/9B invariant the validate() assert enforces).
+    // `tie_word_embeddings` is set from whether the file contains an
+    // `output.weight` tensor (absent = tied, as llama.cpp drops lm_head for
+    // Gemma-2). Throws std::runtime_error on missing required metadata or an
+    // architecture mismatch (`general.architecture` != "gemma2").
+    static Gemma2Config from_gguf(const brotensor::gguf::File& f);
 
     // Validate cross-field invariants. Notably query_pre_attn_scalar must equal
     // head_dim: brotensor's flash_attention_decode applies the built-in

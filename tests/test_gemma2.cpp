@@ -18,6 +18,7 @@
 #include "brolm/gemma_tokenizer.h"
 #include "brolm/detail/compute.h"
 
+#include "brotensor/gguf.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -360,6 +361,89 @@ void run_real_checkpoint() {
     }
 }
 
+// ─── gguf checkpoint (gated) ───────────────────────────────────────────────
+//
+// Gated on BROLM_GEMMA_GGUF (path to a gemma-2-2b .gguf). Loads config + model
+// from the gguf container, runs a short prefill + a few greedy decode steps,
+// and asserts the same structural / no-NaN / softcap-bound invariants as the
+// safetensors checkpoint section. No gguf tokenizer yet (separate follow-up):
+// the model is driven with raw token ids.
+void run_gguf_checkpoint() {
+    const char* gguf_env = std::getenv("BROLM_GEMMA_GGUF");
+    if (!gguf_env) {
+        std::printf("[skip] BROLM_GEMMA_GGUF not set\n");
+        return;
+    }
+    if (!std::filesystem::exists(gguf_env)) {
+        std::printf("[skip] gguf not found at %s\n", gguf_env);
+        return;
+    }
+
+    try {
+        auto file = bt::gguf::File::open(gguf_env);
+        auto cfg = gm::Gemma2Config::from_gguf(file);
+        std::printf("gemma2 gguf: config hidden=%d layers=%d heads=%d/%d "
+                    "head_dim=%d vocab=%d tied=%d\n",
+                    cfg.hidden_size, cfg.num_hidden_layers,
+                    cfg.num_attention_heads, cfg.num_key_value_heads,
+                    cfg.head_dim, cfg.vocab_size,
+                    cfg.tie_word_embeddings ? 1 : 0);
+
+        gm::Gemma2Model model(cfg);
+        model.load_weights(file);
+        std::printf("gemma2 gguf: loaded weights\n");
+
+        // Drive with raw token ids (no gguf tokenizer yet). Keep them in range.
+        std::vector<int32_t> ids = {2, 651, 6037, 576, 6081, 603};
+        for (int32_t& t : ids) {
+            if (t < 0 || t >= cfg.vocab_size) t = t % cfg.vocab_size;
+        }
+        const int L = static_cast<int>(ids.size());
+
+        model.allocate_cache(L + 8);
+        bt::Tensor logits;
+        model.forward_last(ids.data(), L, logits);
+        bt::sync_all();
+
+        CHECK(logits.rows == 1);
+        CHECK(logits.cols == cfg.vocab_size);
+
+        std::vector<float> host = bdtest::bd_download(logits);
+        int nonfinite = 0; float max_abs = 0.0f;
+        for (float v : host) {
+            if (!bdtest::bd_finite(v)) ++nonfinite;
+            if (std::fabs(v) > max_abs) max_abs = std::fabs(v);
+        }
+        CHECK(nonfinite == 0);
+        CHECK(max_abs <= cfg.final_logit_softcapping);
+
+        std::vector<int32_t> gen;
+        int next = argmax_row(host, 0, cfg.vocab_size);
+        for (int step = 0; step < 8; ++step) {
+            gen.push_back(next);
+            int32_t tok = next;
+            bt::Tensor step_logits;
+            model.forward(&tok, 1, step_logits);
+            bt::sync_all();
+            std::vector<float> sh = bdtest::bd_download(step_logits);
+            int snf = 0; float smax = 0.0f;
+            for (float v : sh) {
+                if (!bdtest::bd_finite(v)) ++snf;
+                if (std::fabs(v) > smax) smax = std::fabs(v);
+            }
+            CHECK(snf == 0);
+            CHECK(smax <= cfg.final_logit_softcapping);
+            next = argmax_row(sh, 0, cfg.vocab_size);
+        }
+        std::printf("gemma2 gguf: greedy ids:");
+        for (int32_t t : gen) std::printf(" %d", t);
+        std::printf("\n");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "gemma2 gguf threw: %s\n", e.what());
+        ++g_failures;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -371,6 +455,7 @@ int main() {
     }
     run_synthetic();
     run_real_checkpoint();
+    run_gguf_checkpoint();
     if (g_failures == 0) std::printf("gemma2: OK\n");
     else std::fprintf(stderr, "gemma2: %d failure(s)\n", g_failures);
     return g_failures ? 1 : 0;
