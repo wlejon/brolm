@@ -174,11 +174,20 @@ void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src,
         dst = brolm::detail::upload_host(host.data(), H, 1);
     };
 
-    src.upload_compute_dequant("model.embed_tokens.weight",
+    // HF `Gemma2ForCausalLM` checkpoints wrap the decoder under a "model."
+    // prefix (model.embed_tokens.weight, model.layers.N..., model.norm.weight).
+    // The bare `Gemma2Model` (e.g. Sana's Gemma-2 text encoder) saves the same
+    // tensors WITHOUT that wrapper. Detect which convention this checkpoint uses
+    // from the embedding name and prefix all decoder tensors accordingly. The
+    // external `prefix` (SafetensorsSource prefix_) is still applied on top.
+    const std::string mp =
+        src.has("model.embed_tokens.weight") ? "model." : "";
+
+    src.upload_compute_dequant(mp + "embed_tokens.weight",
                                V, H, embed_tokens_, "embed_tokens.weight");
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
+        const std::string p = mp + "layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
         load_norm(p + "input_layernorm.weight", L.input_ln,
@@ -209,7 +218,7 @@ void Gemma2Model::load_weights_(const brolm::detail::weights::Source& src,
                                    H, F, L.down_W, "down_proj.weight");
     }
 
-    load_norm("model.norm.weight", final_norm_, "model.norm.weight");
+    load_norm(mp + "norm.weight", final_norm_, "norm.weight");
 
     if (src.has("lm_head.weight")) {
         src.upload_compute_checked("lm_head.weight",
