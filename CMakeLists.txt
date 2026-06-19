@@ -139,6 +139,8 @@ target_sources(brolm PRIVATE
     src/qwen35_vision.cpp
     src/qwen35_text.cpp
     src/qwen35_vl.cpp
+    src/gemma2_config.cpp
+    src/gemma2.cpp
 )
 
 # --- Install ---
