@@ -72,6 +72,35 @@ hf download "${REPO}" --local-dir "${DEST}" \
     --include "*.safetensors" \
     --include "*.safetensors.index.json"
 
+# The "*.safetensors" glob is unreliable across hf-CLI versions — some skip the
+# shards silently while still exiting 0, leaving a weightless directory. Read the
+# shard names straight out of the index and explicitly fetch any that are missing
+# (or came down truncated), so a successful exit always means a complete model.
+INDEX="${DEST}/model.safetensors.index.json"
+if [[ -f "${INDEX}" ]]; then
+    shards="$(grep -oE 'model-[0-9]+-of-[0-9]+\.safetensors' "${INDEX}" | sort -u)"
+    missing=()
+    for shard in ${shards}; do
+        # Re-fetch unless the file exists and is plausibly a real shard (>1 MiB);
+        # hf download is incremental, so present files are a no-op.
+        if [[ ! -f "${DEST}/${shard}" ]] || \
+           [[ "$(stat -c %s "${DEST}/${shard}" 2>/dev/null || echo 0)" -lt 1048576 ]]; then
+            missing+=("--include" "${shard}")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Fetching ${missing[*]} shard(s) the glob skipped..."
+        hf download "${REPO}" --local-dir "${DEST}" "${missing[@]}"
+    fi
+    # Hard-fail if any indexed shard is still absent.
+    for shard in ${shards}; do
+        if [[ ! -f "${DEST}/${shard}" ]]; then
+            echo "error: shard ${shard} missing after download — model is incomplete." >&2
+            exit 1
+        fi
+    done
+fi
+
 echo
 echo "Done. ${REPO} is in: ${DEST}"
 ls -lh "${DEST}"
