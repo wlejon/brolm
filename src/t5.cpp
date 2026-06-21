@@ -55,6 +55,15 @@ std::vector<float> download_fp32(const bt::Tensor& t) {
         }
         return out;
     }
+    if (t.dtype == bt::Dtype::BF16) {
+        std::vector<std::uint16_t> bits(n);
+        t.copy_to_host_bf16(bits.data());
+        std::vector<float> out(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i] = bt::bf16_bits_to_fp32(bits[i]);
+        }
+        return out;
+    }
     return t.to_host_vector();
 }
 
@@ -346,6 +355,31 @@ void TextEncoder::load_weights_impl_(
     src.upload_compute_checked("encoder.final_layer_norm.weight",
                                D, 1, final_ln_, "final_layer_norm");
 
+    // T5 overflows FP16: the residual stream and the gated-GELU FFN intermediate
+    // grow past the FP16 finite range (~65504) over 24 layers, so an FP16 run
+    // (the GPU compute dtype) saturates/clamps and the encoding comes out wrong
+    // (~0.4 cosine vs a reference). BF16 carries FP32's 8-bit exponent at the
+    // same 2 bytes, so it neither overflows nor costs extra memory — the
+    // standard half precision for T5. Re-cast the dense FP16 weights to BF16 so
+    // the whole forward (which inherits the weight dtype) runs in BF16. The INT8
+    // (W8A16) path keeps its FP16 activation contract, so skip it there.
+    if (bt::default_device() == bt::Device::CUDA && !do_quantize) {
+        auto to_bf16 = [](bt::Tensor& t) {
+            if (t.dtype == bt::Dtype::FP16) {
+                bt::Tensor b;
+                bt::cast(t, b, bt::Dtype::BF16);
+                t = std::move(b);
+            }
+        };
+        to_bf16(token_embed_);
+        to_bf16(final_ln_);
+        for (auto& B : blocks_) {
+            to_bf16(B.ln0); to_bf16(B.ln1);
+            to_bf16(B.Wq); to_bf16(B.Wk); to_bf16(B.Wv); to_bf16(B.Wo);
+            to_bf16(B.wi_0); to_bf16(B.wi_1); to_bf16(B.wo);
+        }
+    }
+
     pos_bias_L_ = -1;
 }
 
@@ -448,8 +482,10 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out,
     // because every sub-layer input is RMS-normed, hence scale-invariant: a
     // clamped residual still feeds an O(1) normalised input to the next
     // block. The CPU/FP32 path has no overflow and needs no clamp.
-    const bool clamp_residual =
-        (brolm::compute_dtype() == bt::Dtype::FP16);
+    // Clamp only when the residual stream is actually FP16 (T5's overflow
+    // guard). With the BF16 re-cast above the stream is BF16, which has the
+    // range to not need clamping; clamping it would needlessly clip.
+    const bool clamp_residual = (token_embed_.dtype == bt::Dtype::FP16);
     constexpr float kFp16Clamp = 64504.0f;   // finfo(fp16).max - 1000
 
     rebuild_position_bias_(L);

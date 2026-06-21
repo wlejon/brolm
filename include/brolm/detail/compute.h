@@ -57,6 +57,9 @@ inline void linear_batched(const brotensor::Tensor& W,
                            brotensor::Tensor& Y) {
     switch (W.dtype) {
         case brotensor::Dtype::FP16:
+        case brotensor::Dtype::BF16:
+            // linear_forward_batched_fp16 dispatches FP16/BF16 on the operand
+            // dtype (historical name); BF16 is the T5 compute dtype on CUDA.
             brotensor::linear_forward_batched_fp16(W, bias, X, Y);
             return;
         case brotensor::Dtype::Q4_K:
