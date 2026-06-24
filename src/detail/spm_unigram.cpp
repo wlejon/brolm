@@ -1,6 +1,7 @@
 #include "brolm/detail/spm_unigram.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
