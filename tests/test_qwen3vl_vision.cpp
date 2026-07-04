@@ -15,11 +15,13 @@
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -240,57 +242,78 @@ void test_synthetic() {
 }
 
 void test_real_checkpoint_if_present() {
+    namespace fs = std::filesystem;
     const char* dir = std::getenv("BROLM_QWEN3VL_DIR");
     if (!dir) {
         std::printf("[skip] BROLM_QWEN3VL_DIR not set (real-checkpoint VisionTower)\n");
         return;
     }
-    const std::string cfg_path = std::string(dir) + "/config.json";
-    q::Qwen3VLConfig cfg = q::Qwen3VLConfig::load(cfg_path);
+    try {
+        const std::string cfg_path = std::string(dir) + "/config.json";
+        q::Qwen3VLConfig cfg = q::Qwen3VLConfig::load(cfg_path);
 
-    std::vector<std::string> shard_paths;
-    // Prefer a single merged shard if present; otherwise the caller is
-    // expected to have exactly one (test scope keeps this simple).
-    const std::string st_path = std::string(dir) + "/model.safetensors";
-    auto f = st::File::open(st_path);
+        // Discover every model*.safetensors shard (HF's sharded checkpoints
+        // split model.visual.* across more than one file for larger models).
+        std::vector<fs::path> shard_paths;
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            const std::string name = entry.path().filename().string();
+            if (name.rfind("model", 0) == 0 && entry.path().extension() == ".safetensors")
+                shard_paths.push_back(entry.path());
+        }
+        std::sort(shard_paths.begin(), shard_paths.end());
+        if (shard_paths.empty()) {
+            std::printf("[skip] no model*.safetensors shard found in %s\n", dir);
+            return;
+        }
+        std::vector<st::File> shards;
+        shards.reserve(shard_paths.size());
+        for (const auto& p : shard_paths) shards.emplace_back(st::File::open(p.string()));
+        std::vector<const st::File*> shard_ptrs;
+        shard_ptrs.reserve(shards.size());
+        for (const auto& f : shards) shard_ptrs.push_back(&f);
 
-    q::VisionTower tower(cfg.vision, cfg.text.hidden_size);
-    tower.load_weights(f);
-    std::printf("[ok] loaded model.visual.* (incl. DeepStack mergers) from real checkpoint\n");
+        q::VisionTower tower(cfg.vision, cfg.text.hidden_size);
+        tower.load_weights(shard_ptrs);
+        std::printf("[ok] loaded model.visual.* (incl. DeepStack mergers) from real checkpoint "
+                    "(%zu shard(s))\n", shard_ptrs.size());
 
-    const int H = 224, W = 224, C = 3;
-    std::vector<float> img(static_cast<std::size_t>(C) * H * W, 1.0f);
+        const int H = 224, W = 224, C = 3;
+        std::vector<float> img(static_cast<std::size_t>(C) * H * W, 1.0f);
 
-    q::PreprocessConfig pcfg;
-    pcfg.patch_size          = cfg.vision.patch_size;
-    pcfg.temporal_patch_size = cfg.vision.temporal_patch_size;
-    pcfg.merge_size          = cfg.vision.spatial_merge_size;
-    auto pre = q::preprocess_image(img.data(), H, W, pcfg);
-    std::printf("[ok] preprocess: grid=(1,%d,%d), num_image_tokens=%d\n",
-                pre.grid_h, pre.grid_w, pre.num_image_tokens());
+        q::PreprocessConfig pcfg;
+        pcfg.patch_size          = cfg.vision.patch_size;
+        pcfg.temporal_patch_size = cfg.vision.temporal_patch_size;
+        pcfg.merge_size          = cfg.vision.spatial_merge_size;
+        auto pre = q::preprocess_image(img.data(), H, W, pcfg);
+        std::printf("[ok] preprocess: grid=(1,%d,%d), num_image_tokens=%d\n",
+                    pre.grid_h, pre.grid_w, pre.num_image_tokens());
 
-    const float* patch_src = pre.patches.host_f32();
-    const int N        = pre.patches.rows;
-    const int patch_cols = pre.patches.cols;
-    bt::Tensor patches_dev;
-    if (brolm::compute_dtype() == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(static_cast<std::size_t>(N) * patch_cols);
-        for (std::size_t i = 0; i < bits.size(); ++i)
-            bits[i] = bt::fp32_to_fp16_bits(patch_src[i]);
-        patches_dev = bt::Tensor::from_host_fp16(bits.data(), N, patch_cols);
-    } else {
-        patches_dev = bt::Tensor::from_host(patch_src, N, patch_cols);
-    }
+        const float* patch_src = pre.patches.host_f32();
+        const int N        = pre.patches.rows;
+        const int patch_cols = pre.patches.cols;
+        bt::Tensor patches_dev;
+        if (brolm::compute_dtype() == bt::Dtype::FP16) {
+            std::vector<std::uint16_t> bits(static_cast<std::size_t>(N) * patch_cols);
+            for (std::size_t i = 0; i < bits.size(); ++i)
+                bits[i] = bt::fp32_to_fp16_bits(patch_src[i]);
+            patches_dev = bt::Tensor::from_host_fp16(bits.data(), N, patch_cols);
+        } else {
+            patches_dev = bt::Tensor::from_host(patch_src, N, patch_cols);
+        }
 
-    bt::Tensor out;
-    std::vector<bt::Tensor> deepstack_out;
-    tower.forward(patches_dev, pre.grid_t, pre.grid_h, pre.grid_w, out, deepstack_out);
-    check_finite_nontrivial(out, pre.num_image_tokens(), cfg.text.hidden_size,
-                           "real main merger");
-    assert(deepstack_out.size() == cfg.vision.deepstack_visual_indexes.size());
-    for (auto& d : deepstack_out) {
-        check_finite_nontrivial(d, pre.num_image_tokens(), cfg.text.hidden_size,
-                                "real deepstack merger");
+        bt::Tensor out;
+        std::vector<bt::Tensor> deepstack_out;
+        tower.forward(patches_dev, pre.grid_t, pre.grid_h, pre.grid_w, out, deepstack_out);
+        check_finite_nontrivial(out, pre.num_image_tokens(), cfg.text.hidden_size,
+                               "real main merger");
+        assert(deepstack_out.size() == cfg.vision.deepstack_visual_indexes.size());
+        for (auto& d : deepstack_out) {
+            check_finite_nontrivial(d, pre.num_image_tokens(), cfg.text.hidden_size,
+                                    "real deepstack merger");
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "qwen3vl_vision real-checkpoint threw: %s\n", e.what());
+        std::abort();
     }
 }
 

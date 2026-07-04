@@ -22,6 +22,7 @@
 
 #include "test_compute.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -351,12 +352,24 @@ void run_real_checkpoint() {
     }
     const std::filesystem::path dir = dir_env;
     const std::filesystem::path cfg_path = dir / "config.json";
-    const std::filesystem::path st_path  = dir / "model.safetensors";
     const std::filesystem::path vocab_path  = dir / "vocab.json";
     const std::filesystem::path merges_path = dir / "merges.txt";
-    if (!std::filesystem::exists(cfg_path) ||
-        !std::filesystem::exists(st_path)) {
+    if (!std::filesystem::exists(cfg_path)) {
         std::printf("[skip] real checkpoint not found at %s\n", dir_env);
+        return;
+    }
+
+    // Discover every model*.safetensors shard (HF's sharded checkpoints split
+    // model.language_model.* across more than one file for larger models).
+    std::vector<std::filesystem::path> shard_paths;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("model", 0) == 0 && entry.path().extension() == ".safetensors")
+            shard_paths.push_back(entry.path());
+    }
+    std::sort(shard_paths.begin(), shard_paths.end());
+    if (shard_paths.empty()) {
+        std::printf("[skip] no model*.safetensors shard found in %s\n", dir_env);
         return;
     }
 
@@ -364,10 +377,17 @@ void run_real_checkpoint() {
         auto cfg_full = q3vl::Qwen3VLConfig::load(cfg_path.string());
         const auto& cfg = cfg_full.text;
 
+        std::vector<st::File> shards;
+        shards.reserve(shard_paths.size());
+        for (const auto& p : shard_paths) shards.emplace_back(st::File::open(p.string()));
+        std::vector<const st::File*> shard_ptrs;
+        shard_ptrs.reserve(shards.size());
+        for (const auto& f : shards) shard_ptrs.push_back(&f);
+
         q3vl::TextModel model(cfg);
-        auto file = st::File::open(st_path.string());
-        model.load_weights(file);  // prefix defaults to "model.language_model."
-        std::printf("qwen3vl_text: loaded real-checkpoint weights\n");
+        model.load_weights(shard_ptrs);  // prefix defaults to "model.language_model."
+        std::printf("qwen3vl_text: loaded real-checkpoint weights (%zu shard(s))\n",
+                    shard_ptrs.size());
 
         std::vector<int> ids;
         if (std::filesystem::exists(vocab_path) &&

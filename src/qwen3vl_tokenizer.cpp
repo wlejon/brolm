@@ -10,11 +10,11 @@ namespace brolm::qwen3vl {
 namespace {
 
 // (token, id) pairs from Qwen/Qwen3-VL-4B-Instruct's `tokenizer_config.json`
-// (`added_tokens_decoder`). These ids live ABOVE vocab.json (which the base
-// Qwen3 tokenizer tops out below), so they are not discoverable via the
-// inner tokenizer's vocab lookup — they must be injected with explicit IDs.
-// <|endoftext|>/<|im_start|>/<|im_end|> are already inside vocab.json and
-// auto-registered by qwen::Tokenizer::load; not repeated here.
+// (`added_tokens_decoder`). vocab.json tops out at 151643 (verified against
+// the downloaded checkpoint: vocab_count == 151643) — EVERY special token,
+// including <|endoftext|>/<|im_start|>/<|im_end|>, lives above that range
+// and must be injected with explicit IDs; none are discoverable via the
+// inner tokenizer's vocab lookup.
 struct SpecialEntry {
     const char* token;
     int32_t     id;
@@ -22,10 +22,32 @@ struct SpecialEntry {
 
 const std::vector<SpecialEntry>& kSpecialTable() {
     static const std::vector<SpecialEntry> kTable = {
-        {"<|vision_start|>", 151652},
-        {"<|vision_end|>",   151653},
-        {"<|image_pad|>",    151655},
-        {"<|video_pad|>",    151656},
+        {"<|endoftext|>",         151643},
+        {"<|im_start|>",          151644},
+        {"<|im_end|>",            151645},
+        {"<|object_ref_start|>",  151646},
+        {"<|object_ref_end|>",    151647},
+        {"<|box_start|>",         151648},
+        {"<|box_end|>",           151649},
+        {"<|quad_start|>",        151650},
+        {"<|quad_end|>",          151651},
+        {"<|vision_start|>",      151652},
+        {"<|vision_end|>",        151653},
+        {"<|vision_pad|>",        151654},
+        {"<|image_pad|>",         151655},
+        {"<|video_pad|>",         151656},
+        {"<tool_call>",           151657},
+        {"</tool_call>",          151658},
+        {"<|fim_prefix|>",        151659},
+        {"<|fim_middle|>",        151660},
+        {"<|fim_suffix|>",        151661},
+        {"<|fim_pad|>",           151662},
+        {"<|repo_name|>",         151663},
+        {"<|file_sep|>",          151664},
+        {"<tool_response>",       151665},
+        {"</tool_response>",      151666},
+        {"<think>",               151667},
+        {"</think>",              151668},
     };
     return kTable;
 }
