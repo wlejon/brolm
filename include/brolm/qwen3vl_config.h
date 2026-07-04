@@ -57,6 +57,17 @@ struct Qwen3VLConfig {
 
         // Always full rotation for Qwen3-VL: rotary_dim == head_dim.
         int rotary_dim() const { return head_dim; }
+
+        // When true, TextModel::load_weights() stores the per-layer attention
+        // and MLP weight matrices (Wq/Wk/Wv/Wo, gate/up/down) as INT8
+        // weight-only quantisation (W8A16) — halving their VRAM footprint.
+        // Each such weight is quantised on the host straight from the
+        // checkpoint and only its INT8 bytes reach VRAM: the FP16 weight is
+        // never materialised on the device, so peak VRAM stays at the
+        // quantised footprint. The token embedding, the RMSNorm gains, and
+        // the per-head QK-norm gains stay at the compute dtype. INT8 is
+        // GPU-only; on the CPU backend the flag is ignored with a warning.
+        bool quantize_weights = false;
     } text;
 
     // ── vision_config ──────────────────────────────────────────────────────

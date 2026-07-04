@@ -2,6 +2,7 @@
 
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/weights.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
@@ -110,13 +111,14 @@ std::vector<int> rotary_row_perm(int rotary_dim, int d_t, int d_h, int d_w) {
     return brolm_to_hf;
 }
 
-std::vector<float> permute_rotary_rows(const std::vector<float>& src,
-                                       int num_heads, int head_dim,
-                                       int rotary_dim, int cols,
-                                       int d_t, int d_h, int d_w) {
+template <typename T>
+std::vector<T> permute_rotary_rows(const std::vector<T>& src,
+                                   int num_heads, int head_dim,
+                                   int rotary_dim, int cols,
+                                   int d_t, int d_h, int d_w) {
     std::vector<int> brolm_to_hf = rotary_row_perm(rotary_dim, d_t, d_h, d_w);
-    std::vector<float> dst(src.size());
-    const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(float);
+    std::vector<T> dst(src.size());
+    const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(T);
     for (int h = 0; h < num_heads; ++h) {
         const std::size_t base =
             static_cast<std::size_t>(h) * head_dim *
@@ -260,8 +262,78 @@ void TextModel::load_weights_impl_(
     upload_compute_checked(need(shards, prefix + "norm.weight"),
                            H, 1, final_norm_, "norm.weight");
 
+    // INT8 (W8A16) quantisation decision. GPU-only.
+    const bool do_quantize =
+        cfg_.quantize_weights &&
+        (brolm::compute_dtype() == bt::Dtype::FP16);
+    if (cfg_.quantize_weights && !do_quantize) {
+        std::fprintf(stderr,
+            "brolm: INT8 weight quantization is GPU-only; ignoring "
+            "Qwen3VLConfig::Text::quantize_weights on the CPU backend.\n");
+    }
+    const detail::weights::SafetensorsSource wsrc(shards, prefix);
+
+    // Quantise a host FP16 weight to INT8 with per-output-row symmetric
+    // FP32 scales and upload only the INT8 bytes + scales.
+    auto quantize_host = [](const std::vector<std::uint16_t>& host_fp16,
+                            int out, int in, QWeight& q) {
+        const std::size_t n =
+            static_cast<std::size_t>(out) * static_cast<std::size_t>(in);
+        std::vector<std::int8_t> host_int8(n);
+        std::vector<float>       host_scales(static_cast<std::size_t>(out));
+        bt::quantize_int8_per_row_host(host_fp16.data(), out, in,
+                                       host_int8.data(), host_scales.data());
+        bt::Tensor cpu_int8 =
+            bt::Tensor::empty_on(bt::Device::CPU, out, in, bt::Dtype::INT8);
+        std::memcpy(cpu_int8.host_raw_mut(), host_int8.data(), n);
+        q.W_int8 = cpu_int8.to(bt::default_device());
+        q.scales = bt::Tensor::from_host_on(bt::default_device(),
+                                            host_scales.data(), out, 1);
+    };
+
+    // Dense-or-quantised loader for the unpermuted per-layer linears
+    // (v_proj/o_proj/mlp.*). In the quantised path the dense weight never
+    // lands on the device.
+    auto load_lin = [&](const std::string& name, int out, int in,
+                        bt::Tensor& W, QWeight& q) {
+        if (do_quantize) {
+            std::vector<std::uint16_t> host_fp16;
+            wsrc.download_host_fp16(name, out, in, host_fp16, name);
+            quantize_host(host_fp16, out, in, q);
+        } else {
+            upload_compute_checked(need(shards, prefix + name), out, in, W,
+                                   name);
+        }
+    };
+
+    // q_proj/k_proj loader: permute the rotary subrange of rows for the HF
+    // rotate_half -> brotensor interleaved-pair convention (rd == HD here so
+    // every row is permuted — no pass-through tail), then upload dense or
+    // quantise. The permutation reorders whole rows, so it commutes with the
+    // per-row INT8 quantisation.
+    auto load_qk = [&](const std::string& name, int out, int num_heads,
+                       bt::Tensor& W, QWeight& q) {
+        if (do_quantize) {
+            std::vector<std::uint16_t> host_fp16;
+            wsrc.download_host_fp16(name, out, H, host_fp16, name);
+            std::vector<std::uint16_t> perm =
+                permute_rotary_rows(host_fp16, num_heads, HD, rd, H,
+                                   d_t_, d_h_, d_w_);
+            quantize_host(perm, out, H, q);
+        } else {
+            bt::Tensor raw;
+            upload_compute_checked(need(shards, prefix + name), out, H, raw,
+                                   name);
+            std::vector<float> perm =
+                permute_rotary_rows(download_fp32(raw), num_heads, HD, rd, H,
+                                   d_t_, d_h_, d_w_);
+            W = brolm::detail::upload_host(perm.data(), out, H);
+        }
+    };
+
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         const std::string p = prefix + "layers." + std::to_string(i) + ".";
+        const std::string pl = "layers." + std::to_string(i) + ".";
         LayerSlot& L = layers_[static_cast<std::size_t>(i)];
 
         upload_compute_checked(need(shards, p + "input_layernorm.weight"),
@@ -270,36 +342,15 @@ void TextModel::load_weights_impl_(
             need(shards, p + "post_attention_layernorm.weight"),
             H, 1, L.post_attn_norm, "post_attention_layernorm.weight");
 
-        upload_compute_checked(need(shards, p + "mlp.gate_proj.weight"),
-                               Fm, H, L.gate_W, "mlp.gate_proj.weight");
-        upload_compute_checked(need(shards, p + "mlp.up_proj.weight"),
-                               Fm, H, L.up_W, "mlp.up_proj.weight");
-        upload_compute_checked(need(shards, p + "mlp.down_proj.weight"),
-                               H, Fm, L.down_W, "mlp.down_proj.weight");
+        load_lin(pl + "mlp.gate_proj.weight", Fm, H, L.gate_W, L.gate_q);
+        load_lin(pl + "mlp.up_proj.weight",   Fm, H, L.up_W,   L.up_q);
+        load_lin(pl + "mlp.down_proj.weight", H, Fm, L.down_W, L.down_q);
 
-        // q_proj/k_proj: permute the rotary subrange of rows for the HF
-        // rotate_half -> brotensor interleaved-pair convention. rd == HD
-        // here so every row is permuted (no pass-through tail).
-        bt::Tensor q_raw;
-        upload_compute_checked(need(shards, p + "self_attn.q_proj.weight"),
-                               q_dim, H, q_raw, "self_attn.q_proj.weight");
-        std::vector<float> q_perm =
-            permute_rotary_rows(download_fp32(q_raw), n_q, HD, rd, H,
-                               d_t_, d_h_, d_w_);
-        L.Wq = brolm::detail::upload_host(q_perm.data(), q_dim, H);
+        load_qk(pl + "self_attn.q_proj.weight", q_dim,  n_q,  L.Wq, L.Wq_q);
+        load_qk(pl + "self_attn.k_proj.weight", kv_dim, n_kv, L.Wk, L.Wk_q);
 
-        bt::Tensor k_raw;
-        upload_compute_checked(need(shards, p + "self_attn.k_proj.weight"),
-                               kv_dim, H, k_raw, "self_attn.k_proj.weight");
-        std::vector<float> k_perm =
-            permute_rotary_rows(download_fp32(k_raw), n_kv, HD, rd, H,
-                               d_t_, d_h_, d_w_);
-        L.Wk = brolm::detail::upload_host(k_perm.data(), kv_dim, H);
-
-        upload_compute_checked(need(shards, p + "self_attn.v_proj.weight"),
-                               kv_dim, H, L.Wv, "self_attn.v_proj.weight");
-        upload_compute_checked(need(shards, p + "self_attn.o_proj.weight"),
-                               H, q_dim, L.Wo, "self_attn.o_proj.weight");
+        load_lin(pl + "self_attn.v_proj.weight", kv_dim, H, L.Wv, L.Wv_q);
+        load_lin(pl + "self_attn.o_proj.weight", H, q_dim, L.Wo, L.Wo_q);
 
         // Per-head norms: permute the (whole, since rd==HD) rotary range.
         bt::Tensor qn_raw, kn_raw;
@@ -434,16 +485,28 @@ void TextModel::apply_mrope_(bt::Tensor& qk, int num_heads, int L) {
     bt::copy_d2d_strided(scratch, 0, rd, qk, 0, HD, rd, L * num_heads);
 }
 
+// ─── linear dispatch ───────────────────────────────────────────────────────
+
+void TextModel::linear_(const bt::Tensor& W, const QWeight& q,
+                        const bt::Tensor& X, bt::Tensor& Y) {
+    if (q.active()) {
+        bt::linear_forward_batched_int8w_fp16(q.W_int8, q.scales,
+                                              /*bias=*/nullptr, X, Y);
+    } else {
+        detail::linear_batched(W, /*bias=*/nullptr, X, Y);
+    }
+}
+
 // ─── MLP block ─────────────────────────────────────────────────────────────
 
 void TextModel::mlp_block_(const LayerSlot& layer, int L) {
     (void)L;
-    detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, mlp_gate_);
-    detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, mlp_up_);
+    linear_(layer.gate_W, layer.gate_q, norm_, mlp_gate_);
+    linear_(layer.up_W,   layer.up_q,   norm_, mlp_up_);
 
     bt::silu_forward(mlp_gate_, mlp_gate_);
     bt::mul_inplace(mlp_gate_, mlp_up_);
-    detail::linear_batched(layer.down_W, /*bias=*/nullptr, mlp_gate_, proj_);
+    linear_(layer.down_W, layer.down_q, mlp_gate_, proj_);
     bt::add_inplace(h_, proj_);
 }
 
@@ -538,9 +601,9 @@ void TextModel::run_decoder_layers_(
 
         bt::rms_norm_forward(h_, layer.in_norm, eps, norm_);
 
-        detail::linear_batched(layer.Wq, nullptr, norm_, q_);
-        detail::linear_batched(layer.Wk, nullptr, norm_, k_);
-        detail::linear_batched(layer.Wv, nullptr, norm_, v_);
+        linear_(layer.Wq, layer.Wq_q, norm_, q_);
+        linear_(layer.Wk, layer.Wk_q, norm_, k_);
+        linear_(layer.Wv, layer.Wv_q, norm_, v_);
 
         auto headnorm = [&](const bt::Tensor& src, int num_heads,
                             const bt::Tensor& gain, bt::Tensor& dst) {
@@ -561,7 +624,7 @@ void TextModel::run_decoder_layers_(
         bt::flash_attention_decode(qn_, c.k, c.v, c.len + L, n_q, n_kv, attn_);
         c.len += L;
 
-        detail::linear_batched(layer.Wo, nullptr, attn_, proj_);
+        linear_(layer.Wo, layer.Wo_q, attn_, proj_);
         bt::add_inplace(h_, proj_);
 
         // DeepStack injection: this decoder layer receives image i's feature

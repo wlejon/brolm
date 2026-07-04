@@ -174,12 +174,32 @@ public:
     const Qwen3VLConfig::Text& config() const { return cfg_; }
 
 private:
+    // Paired INT8 weight + per-output-row FP32 scales. Populated by
+    // load_weights() when Qwen3VLConfig::Text::quantize_weights is true;
+    // .W_int8.size() == 0 means the matching dense tensor is in use instead.
+    struct QWeight {
+        brotensor::Tensor W_int8;   // INT8 (out, in)
+        brotensor::Tensor scales;   // FP32 (out, 1)
+        bool active() const { return W_int8.size() > 0; }
+    };
+
     struct LayerSlot {
         brotensor::Tensor in_norm, post_attn_norm;   // (hidden,)
         brotensor::Tensor Wq, Wk, Wv, Wo;
         brotensor::Tensor q_norm, k_norm;             // (head_dim,)
         brotensor::Tensor gate_W, up_W, down_W;       // SwiGLU MLP
+        // INT8 (W8A16) counterparts — populated by load_weights when
+        // quantize_weights is set on a GPU backend. When active, the
+        // matching dense tensor above is left empty.
+        QWeight Wq_q, Wk_q, Wv_q, Wo_q;
+        QWeight gate_q, up_q, down_q;
     };
+
+    // One linear: the INT8 W8A16 path when `q` is active, else the plain
+    // compute-dtype batched linear on `W`. Bias-free (Qwen3-VL text has no
+    // linear bias).
+    static void linear_(const brotensor::Tensor& W, const QWeight& q,
+                        const brotensor::Tensor& X, brotensor::Tensor& Y);
 
     void load_weights_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
                             const std::string& prefix);
