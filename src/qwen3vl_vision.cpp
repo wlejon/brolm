@@ -28,10 +28,12 @@ namespace {
     throw std::runtime_error("qwen3vl::VisionTower: " + msg);
 }
 
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("qwen3vl::VisionTower: missing tensor '" + key + "'");
-    return *v;
+const st::TensorView& need(const std::vector<const st::File*>& shards,
+                           const std::string& key) {
+    for (const st::File* f : shards) {
+        if (const auto* v = f->find(key)) return *v;
+    }
+    throw std::runtime_error("qwen3vl::VisionTower: missing tensor '" + key + "'");
 }
 
 // Download a compute-dtype tensor to a host FP32 vector. Same rationale as
@@ -188,6 +190,12 @@ VisionTower::~VisionTower() = default;
 // ─── load_weights ──────────────────────────────────────────────────────────
 
 void VisionTower::load_weights(const st::File& f, const std::string& prefix) {
+    load_weights({&f}, prefix);
+}
+
+void VisionTower::load_weights(const std::vector<const st::File*>& shards,
+                               const std::string& prefix) {
+    if (shards.empty()) fail("load_weights: no safetensors shards");
     const int D     = cfg_.hidden_size;
     const int F     = cfg_.intermediate_size;
     const int C     = cfg_.in_channels;
@@ -201,14 +209,14 @@ void VisionTower::load_weights(const st::File& f, const std::string& prefix) {
 
     // patch_embed.proj : shape on disk is (D, C, Tps, P, P); flatten to
     // (D, C*Tps*P*P).
-    upload_compute_checked(need(f, prefix + "patch_embed.proj.weight"),
+    upload_compute_checked(need(shards, prefix + "patch_embed.proj.weight"),
                            D, C * Tps * P * P, patch_W_,
                            "patch_embed.proj.weight");
-    upload_compute_checked(need(f, prefix + "patch_embed.proj.bias"),
+    upload_compute_checked(need(shards, prefix + "patch_embed.proj.bias"),
                            D, 1, patch_b_, "patch_embed.proj.bias");
 
     // pos_embed table (num_pos, D).
-    upload_compute_checked(need(f, prefix + "pos_embed.weight"),
+    upload_compute_checked(need(shards, prefix + "pos_embed.weight"),
                            Npos, D, pos_table_, "pos_embed.weight");
 
     // `depth` blocks.
@@ -216,35 +224,35 @@ void VisionTower::load_weights(const st::File& f, const std::string& prefix) {
         const std::string p = prefix + "blocks." + std::to_string(i) + ".";
         Block& B = blocks_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(f, p + "norm1.weight"), D, 1, B.norm1_g, "norm1.weight");
-        upload_compute_checked(need(f, p + "norm1.bias"),   D, 1, B.norm1_b, "norm1.bias");
-        upload_compute_checked(need(f, p + "norm2.weight"), D, 1, B.norm2_g, "norm2.weight");
-        upload_compute_checked(need(f, p + "norm2.bias"),   D, 1, B.norm2_b, "norm2.bias");
+        upload_compute_checked(need(shards, p + "norm1.weight"), D, 1, B.norm1_g, "norm1.weight");
+        upload_compute_checked(need(shards, p + "norm1.bias"),   D, 1, B.norm1_b, "norm1.bias");
+        upload_compute_checked(need(shards, p + "norm2.weight"), D, 1, B.norm2_g, "norm2.weight");
+        upload_compute_checked(need(shards, p + "norm2.bias"),   D, 1, B.norm2_b, "norm2.bias");
 
-        upload_compute_checked(need(f, p + "attn.qkv.weight"), qkv, D, B.Wqkv, "attn.qkv.weight");
-        upload_compute_checked(need(f, p + "attn.qkv.bias"),   qkv, 1, B.bqkv, "attn.qkv.bias");
+        upload_compute_checked(need(shards, p + "attn.qkv.weight"), qkv, D, B.Wqkv, "attn.qkv.weight");
+        upload_compute_checked(need(shards, p + "attn.qkv.bias"),   qkv, 1, B.bqkv, "attn.qkv.bias");
 
-        upload_compute_checked(need(f, p + "attn.proj.weight"), D, D, B.Wproj, "attn.proj.weight");
-        upload_compute_checked(need(f, p + "attn.proj.bias"),   D, 1, B.bproj, "attn.proj.bias");
+        upload_compute_checked(need(shards, p + "attn.proj.weight"), D, D, B.Wproj, "attn.proj.weight");
+        upload_compute_checked(need(shards, p + "attn.proj.bias"),   D, 1, B.bproj, "attn.proj.bias");
 
-        upload_compute_checked(need(f, p + "mlp.linear_fc1.weight"), F, D, B.fc1_W, "mlp.linear_fc1.weight");
-        upload_compute_checked(need(f, p + "mlp.linear_fc1.bias"),   F, 1, B.fc1_b, "mlp.linear_fc1.bias");
-        upload_compute_checked(need(f, p + "mlp.linear_fc2.weight"), D, F, B.fc2_W, "mlp.linear_fc2.weight");
-        upload_compute_checked(need(f, p + "mlp.linear_fc2.bias"),   D, 1, B.fc2_b, "mlp.linear_fc2.bias");
+        upload_compute_checked(need(shards, p + "mlp.linear_fc1.weight"), F, D, B.fc1_W, "mlp.linear_fc1.weight");
+        upload_compute_checked(need(shards, p + "mlp.linear_fc1.bias"),   F, 1, B.fc1_b, "mlp.linear_fc1.bias");
+        upload_compute_checked(need(shards, p + "mlp.linear_fc2.weight"), D, F, B.fc2_W, "mlp.linear_fc2.weight");
+        upload_compute_checked(need(shards, p + "mlp.linear_fc2.bias"),   D, 1, B.fc2_b, "mlp.linear_fc2.bias");
     }
 
     // Main merger. Pre-shuffle LayerNorm on the un-merged D=hidden_size.
-    upload_compute_checked(need(f, prefix + "merger.norm.weight"), D, 1,
+    upload_compute_checked(need(shards, prefix + "merger.norm.weight"), D, 1,
                            main_merger_.norm_g, "merger.norm.weight");
-    upload_compute_checked(need(f, prefix + "merger.norm.bias"), D, 1,
+    upload_compute_checked(need(shards, prefix + "merger.norm.bias"), D, 1,
                            main_merger_.norm_b, "merger.norm.bias");
-    upload_compute_checked(need(f, prefix + "merger.linear_fc1.weight"), Hmrg, Hmrg,
+    upload_compute_checked(need(shards, prefix + "merger.linear_fc1.weight"), Hmrg, Hmrg,
                            main_merger_.fc1_W, "merger.linear_fc1.weight");
-    upload_compute_checked(need(f, prefix + "merger.linear_fc1.bias"), Hmrg, 1,
+    upload_compute_checked(need(shards, prefix + "merger.linear_fc1.bias"), Hmrg, 1,
                            main_merger_.fc1_b, "merger.linear_fc1.bias");
-    upload_compute_checked(need(f, prefix + "merger.linear_fc2.weight"), Hout, Hmrg,
+    upload_compute_checked(need(shards, prefix + "merger.linear_fc2.weight"), Hout, Hmrg,
                            main_merger_.fc2_W, "merger.linear_fc2.weight");
-    upload_compute_checked(need(f, prefix + "merger.linear_fc2.bias"), Hout, 1,
+    upload_compute_checked(need(shards, prefix + "merger.linear_fc2.bias"), Hout, 1,
                            main_merger_.fc2_b, "merger.linear_fc2.bias");
 
     // DeepStack mergers. Post-shuffle LayerNorm — the on-disk norm shape is
@@ -255,12 +263,12 @@ void VisionTower::load_weights(const st::File& f, const std::string& prefix) {
         const std::string p =
             prefix + "deepstack_merger_list." + std::to_string(k) + ".";
         Merger& M = deepstack_mergers_[k];
-        upload_compute_checked(need(f, p + "norm.weight"), Hmrg, 1, M.norm_g, "deepstack norm.weight");
-        upload_compute_checked(need(f, p + "norm.bias"),   Hmrg, 1, M.norm_b, "deepstack norm.bias");
-        upload_compute_checked(need(f, p + "linear_fc1.weight"), Hmrg, Hmrg, M.fc1_W, "deepstack linear_fc1.weight");
-        upload_compute_checked(need(f, p + "linear_fc1.bias"),   Hmrg, 1, M.fc1_b, "deepstack linear_fc1.bias");
-        upload_compute_checked(need(f, p + "linear_fc2.weight"), Hout, Hmrg, M.fc2_W, "deepstack linear_fc2.weight");
-        upload_compute_checked(need(f, p + "linear_fc2.bias"),   Hout, 1, M.fc2_b, "deepstack linear_fc2.bias");
+        upload_compute_checked(need(shards, p + "norm.weight"), Hmrg, 1, M.norm_g, "deepstack norm.weight");
+        upload_compute_checked(need(shards, p + "norm.bias"),   Hmrg, 1, M.norm_b, "deepstack norm.bias");
+        upload_compute_checked(need(shards, p + "linear_fc1.weight"), Hmrg, Hmrg, M.fc1_W, "deepstack linear_fc1.weight");
+        upload_compute_checked(need(shards, p + "linear_fc1.bias"),   Hmrg, 1, M.fc1_b, "deepstack linear_fc1.bias");
+        upload_compute_checked(need(shards, p + "linear_fc2.weight"), Hout, Hmrg, M.fc2_W, "deepstack linear_fc2.weight");
+        upload_compute_checked(need(shards, p + "linear_fc2.bias"),   Hout, 1, M.fc2_b, "deepstack linear_fc2.bias");
     }
 }
 

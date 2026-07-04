@@ -91,6 +91,14 @@ public:
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "model.visual.");
 
+    // Sharded overload: a tensor is resolved by scanning the shards in
+    // order, first match wins. Unlike the single-shard Qwen3.5-0.8B
+    // checkpoint, larger Qwen3-VL releases may split `model.visual.*` across
+    // more than one shard file.
+    void load_weights(
+        const std::vector<const brotensor::safetensors::File*>& shards,
+        const std::string& prefix = "model.visual.");
+
     // Forward pass for a single image.
     //
     //   patches            : (num_patches, C * temporal_patch_size * P²) at
