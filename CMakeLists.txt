@@ -144,6 +144,7 @@ target_sources(brolm PRIVATE
     src/qwen3vl_config.cpp
     src/qwen3vl_tokenizer.cpp
     src/qwen3vl_vision.cpp
+    src/qwen3vl_text.cpp
 )
 
 # --- Install ---
