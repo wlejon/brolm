@@ -34,6 +34,7 @@
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 #include "brotensor/runtime.h"
+#include "brotensor/detail/cpu/thread_pool.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -231,11 +232,20 @@ public:
                 return;
             }
             case stns::Dtype::BF16: {
+                // Row-parallel: multi-GB BF16 checkpoints (e.g. Qwen3-VL-4B)
+                // make a serial conversion a large share of quantized-load
+                // time.
                 const auto* src = reinterpret_cast<const std::uint16_t*>(view.data);
-                for (std::size_t i = 0; i < n; ++i) {
-                    out[i] = brotensor::fp32_to_fp16_bits(
-                        brotensor::bf16_bits_to_fp32(src[i]));
-                }
+                brotensor::detail::cpu::parallel_for(
+                    static_cast<std::size_t>(rows), [&](std::size_t r) {
+                        const std::size_t base =
+                            r * static_cast<std::size_t>(cols);
+                        for (std::size_t i = base;
+                             i < base + static_cast<std::size_t>(cols); ++i) {
+                            out[i] = brotensor::fp32_to_fp16_bits(
+                                brotensor::bf16_bits_to_fp32(src[i]));
+                        }
+                    });
                 return;
             }
             default:
