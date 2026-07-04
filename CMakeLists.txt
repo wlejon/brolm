@@ -143,6 +143,7 @@ target_sources(brolm PRIVATE
     src/gemma2.cpp
     src/qwen3vl_config.cpp
     src/qwen3vl_tokenizer.cpp
+    src/qwen3vl_vision.cpp
 )
 
 # --- Install ---
