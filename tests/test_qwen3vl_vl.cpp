@@ -484,6 +484,56 @@ void run_real_checkpoint() {
             CHECK(id >= 0);
             CHECK(id < V);
         }
+
+        // ── parity vs HF transformers ───────────────────────────────────────
+        //
+        // Reference produced by Qwen/Qwen3-VL-4B-Instruct under transformers
+        // 5.9.0 (Qwen3VLForConditionalGeneration.generate, dtype=float16,
+        // greedy: do_sample=False, on a CUDA device), for this exact prompt
+        // and a constant mid-gray 224x224 image (all pixels 0.5 in [0,1] —
+        // i.e. uint8 128). brolm must reproduce the full 16-token greedy
+        // continuation exactly.
+        const std::vector<int> golden_ids = {
+            785, 2168, 374, 264, 6437, 11, 13794, 17545, 9334, 13,
+            2619, 525, 902, 41545, 1238, 6171,
+        };
+        const char* golden_text =
+            "The image is a solid, uniform gray square. There are no "
+            "discernible objects";
+        CHECK(out_ids == golden_ids);
+        CHECK(out_text == golden_text);
+        std::printf("vl real: parity vs HF %s\n",
+                    (out_ids == golden_ids && out_text == golden_text)
+                        ? "MATCH" : "MISMATCH");
+
+        // ── text-only parity case (no image — isolates the dense decoder +
+        // full-rotary M-RoPE path from vision/DeepStack). Same HF setup as
+        // above (transformers 5.9.0, float16, greedy).
+        const std::string text_prompt =
+            "<|im_start|>user\n"
+            "The capital of France is<|im_end|>\n"
+            "<|im_start|>assistant\n";
+        std::vector<q3vl::ImageInput> no_images;
+        std::vector<int> text_out_ids =
+            vlm.generate_tokens(text_prompt, no_images);
+        std::string text_out_text = vlm.tokenizer().decode(
+            std::vector<int32_t>(text_out_ids.begin(), text_out_ids.end()));
+
+        const std::vector<int> text_golden_ids = {
+            785, 6722, 315, 9625, 374, 3070, 59604, 334, 382,
+            59604, 374, 537, 1172, 279, 6722, 714,
+        };
+        const char* text_golden_text =
+            "The capital of France is **Paris**.\n\nParis is not only the "
+            "capital but";
+        std::printf("vl real (text-only): decoded = \"%s\"\n",
+                    text_out_text.c_str());
+        CHECK(text_out_ids == text_golden_ids);
+        CHECK(text_out_text == text_golden_text);
+        std::printf("vl real (text-only): parity vs HF %s\n",
+                    (text_out_ids == text_golden_ids &&
+                     text_out_text == text_golden_text)
+                        ? "MATCH" : "MISMATCH");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "qwen3vl_vl real-checkpoint threw: %s\n", e.what());
         ++g_failures;
