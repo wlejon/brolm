@@ -9,7 +9,12 @@
 //     a subset of image-token rows changes the output at those rows only
 //     changes hidden states (finite, no crash); a zero-feature splice must be
 //     a no-op vs no splice at all.
-// (d) Real checkpoint — gated on BROLM_QWEN3VL_DIR.
+// (d) forward_capture_hidden_states — capturing every layer must let the
+//     final norm + tied lm_head be reproduced by hand from the last captured
+//     hidden state, matching forward_embeds' logits; a non-contiguous subset
+//     must match the corresponding entries of the all-layers capture; empty/
+//     out-of-range/non-ascending capture_layers must throw.
+// (e) Real checkpoint — gated on BROLM_QWEN3VL_DIR.
 
 #include "brolm/qwen3vl_config.h"
 #include "brolm/qwen3vl_text.h"
@@ -344,6 +349,122 @@ void run_deepstack_injection() {
     std::filesystem::remove(path, ec);
 }
 
+void run_capture_hidden_states() {
+    const auto cfg = make_tiny_cfg();
+    const auto path = build_fixture(cfg);
+    const int H = cfg.hidden_size;
+    const int N = cfg.num_hidden_layers;   // 4 in make_tiny_cfg()
+
+    try {
+        auto file = st::File::open(path.string());
+        q3vl::TextModel model(cfg);
+        model.load_weights(file, "model.");
+
+        const std::vector<int> seq = {5, 17, 2, 31, 9};
+        const int L = static_cast<int>(seq.size());
+        std::vector<int64_t> mt(L), mh(L), mw(L);
+        for (int i = 0; i < L; ++i) { mt[i] = mh[i] = mw[i] = i; }
+
+        bt::Tensor embeds = model.embed_tokens(seq);
+
+        // Capturing every layer's output must let us reconstruct forward_embeds'
+        // logits by hand: apply the final norm + tied lm_head to the LAST
+        // captured hidden state ourselves and compare against a fresh
+        // forward_embeds call over the identical input.
+        std::vector<int> all_layers(static_cast<std::size_t>(N));
+        for (int i = 0; i < N; ++i) all_layers[static_cast<std::size_t>(i)] = i + 1;
+
+        std::vector<bt::Tensor> hs;
+        model.forward_capture_hidden_states(embeds, mt, mh, mw, all_layers, hs);
+        bt::sync_all();
+
+        CHECK(hs.size() == static_cast<std::size_t>(N));
+        for (const auto& t : hs) {
+            CHECK(t.rows == L);
+            CHECK(t.cols == H);
+        }
+
+        auto cache_ref = model.make_cache(16);
+        bt::Tensor logits_ref;
+        model.forward_embeds(embeds, mt, mh, mw, cache_ref, logits_ref);
+        bt::sync_all();
+
+        // Reproduce forward_embeds' tail (final norm + tied lm_head) by hand
+        // on the last captured hidden state, reading the same two weights
+        // straight from the fixture file (no TextModel internals needed).
+        const auto* norm_view  = file.find("model.norm.weight");
+        const auto* embed_view = file.find("model.embed_tokens.weight");
+        CHECK(norm_view != nullptr);
+        CHECK(embed_view != nullptr);
+        bt::Tensor final_norm_w, embed_w;
+        st::upload_compute_checked(*norm_view, H, 1, final_norm_w, "model.norm.weight");
+        st::upload_compute_checked(*embed_view, cfg.vocab_size, H, embed_w,
+                                   "model.embed_tokens.weight");
+
+        bt::Tensor manual_norm, manual_logits;
+        bt::rms_norm_forward(hs.back(), final_norm_w, cfg.rms_norm_eps, manual_norm);
+        brolm::detail::linear_batched(embed_w, nullptr, manual_norm, manual_logits);
+        bt::sync_all();
+
+        std::vector<float> ref = bdtest::bd_download(logits_ref);
+        std::vector<float> man = bdtest::bd_download(manual_logits);
+        CHECK(ref.size() == man.size());
+        float max_diff = 0.0f;
+        for (std::size_t i = 0; i < ref.size() && i < man.size(); ++i) {
+            max_diff = std::max(max_diff, std::fabs(ref[i] - man[i]));
+        }
+        std::printf("qwen3vl_text: capture-all-layers vs forward_embeds max diff = %.3e\n",
+                    static_cast<double>(max_diff));
+        CHECK(max_diff < 1e-2f);
+
+        // A non-contiguous subset (Krea-2-style tap pattern) must return
+        // exactly those layers, in order, with finite values.
+        std::vector<int> subset = {2, 4};
+        std::vector<bt::Tensor> hs2;
+        model.forward_capture_hidden_states(embeds, mt, mh, mw, subset, hs2);
+        bt::sync_all();
+        CHECK(hs2.size() == 2);
+        std::vector<float> layer2 = bdtest::bd_download(hs2[0]);
+        std::vector<float> layer4 = bdtest::bd_download(hs2[1]);
+        std::vector<float> full4  = bdtest::bd_download(hs.back());
+        int nonfinite = 0;
+        for (float v : layer2) if (!bdtest::bd_finite(v)) ++nonfinite;
+        for (float v : layer4) if (!bdtest::bd_finite(v)) ++nonfinite;
+        CHECK(nonfinite == 0);
+        CHECK(layer4.size() == full4.size());
+        float subset_diff = 0.0f;
+        for (std::size_t i = 0; i < layer4.size() && i < full4.size(); ++i) {
+            subset_diff = std::max(subset_diff, std::fabs(layer4[i] - full4[i]));
+        }
+        CHECK(subset_diff < 1e-3f);
+
+        // Validation: empty, out-of-range, and non-ascending capture_layers
+        // must all throw.
+        auto expect_throw = [&](const std::vector<int>& bad, const char* label) {
+            std::vector<bt::Tensor> tmp;
+            bool threw = false;
+            try {
+                model.forward_capture_hidden_states(embeds, mt, mh, mw, bad, tmp);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            if (!threw) {
+                std::fprintf(stderr, "expected throw for %s\n", label);
+                ++g_failures;
+            }
+        };
+        expect_throw({}, "empty");
+        expect_throw({0}, "index 0");
+        expect_throw({N + 1}, "index beyond num_hidden_layers");
+        expect_throw({3, 2}, "non-ascending");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "qwen3vl_text capture_hidden_states threw: %s\n", e.what());
+        ++g_failures;
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 void run_real_checkpoint() {
     const char* dir_env = std::getenv("BROLM_QWEN3VL_DIR");
     if (!dir_env) {
@@ -436,6 +557,7 @@ int main() {
     }
     run_synthetic();
     run_deepstack_injection();
+    run_capture_hidden_states();
     run_real_checkpoint();
     if (g_failures == 0) std::printf("qwen3vl_text: OK\n");
     else std::fprintf(stderr, "qwen3vl_text: %d failure(s)\n", g_failures);

@@ -143,6 +143,34 @@ public:
                         brotensor::Tensor& logits_out,
                         const std::vector<DeepstackSplice>& deepstack = {});
 
+    // Single-shot causal prefill that returns the residual stream after
+    // selected decoder layers instead of the final logits — for consumers
+    // that condition on a frozen text backbone's intermediate hidden states
+    // rather than its next-token distribution (e.g. Krea 2's image DiT, which
+    // taps 12 of Qwen3-VL-4B's 36 layers and fuses them internally).
+    //
+    // `capture_layers` are 1-based decoder-layer indices, matching HF's
+    // `output_hidden_states` tuple convention where index 0 is the raw
+    // embedding (before layer 0) and index i in [1, num_hidden_layers] is the
+    // residual stream immediately after layer i finishes (post-MLP, same
+    // point forward_embeds reads from before applying the final norm). Must
+    // be strictly ascending and each entry in [1, num_hidden_layers]; index 0
+    // is not obtainable here since it's just `embeds` unchanged.
+    //
+    // hidden_states_out[i] corresponds to capture_layers[i], each an
+    // independent (embeds.rows, hidden_size) clone. Uses an internal
+    // scratch KV cache sized exactly to embeds.rows — no cache is threaded
+    // through to the caller, since this is a one-shot conditioning pass, not
+    // a generation step. No DeepStack support (text-only conditioning has no
+    // vision tower feeding it); use forward_embeds directly if that's needed.
+    void forward_capture_hidden_states(
+        const brotensor::Tensor& embeds,
+        const std::vector<int64_t>& mrope_t,
+        const std::vector<int64_t>& mrope_h,
+        const std::vector<int64_t>& mrope_w,
+        const std::vector<int>& capture_layers,
+        std::vector<brotensor::Tensor>& hidden_states_out);
+
     const Qwen3VLConfig::Text& config() const { return cfg_; }
 
 private:
@@ -166,6 +194,18 @@ private:
     void apply_mrope_(brotensor::Tensor& qk, int num_heads, int L);
 
     void mlp_block_(const LayerSlot& layer, int L);
+
+    // Shared decoder-layer loop for forward_embeds and
+    // forward_capture_hidden_states. Assumes h_ already holds the input
+    // residual stream and prepare_mrope_ has been called for this L.
+    // capture_layers/hidden_states_out are both null for a plain
+    // forward_embeds call; when non-null, the residual stream is cloned into
+    // *hidden_states_out right after layer (1-based) (*capture_layers)[k]
+    // finishes, for each k in order (entries must be ascending).
+    void run_decoder_layers_(int L, std::vector<LayerCache>& cache,
+                             const std::vector<DeepstackSplice>& deepstack,
+                             const std::vector<int>* capture_layers,
+                             std::vector<brotensor::Tensor>* hidden_states_out);
 
     Qwen3VLConfig::Text cfg_;
 

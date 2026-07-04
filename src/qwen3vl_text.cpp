@@ -497,9 +497,6 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
     }
     if (embed_.size() == 0) fail("forward_embeds: weights not loaded");
 
-    const int HD   = cfg_.head_dim;
-    const int n_q  = cfg_.num_attention_heads;
-    const int n_kv = cfg_.num_key_value_heads;
     const float eps = cfg_.rms_norm_eps;
 
     std::vector<int32_t> pos_t(L), pos_h(L), pos_w(L);
@@ -511,14 +508,32 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
     prepare_mrope_(pos_t, pos_h, pos_w, L);
 
     h_ = embeds.clone();
+    run_decoder_layers_(L, cache, deepstack, /*capture_layers=*/nullptr,
+                       /*hidden_states_out=*/nullptr);
+
+    bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+    detail::linear_batched(embed_, /*bias=*/nullptr, norm_, logits_out);
+}
+
+void TextModel::run_decoder_layers_(
+    int L, std::vector<LayerCache>& cache,
+    const std::vector<DeepstackSplice>& deepstack,
+    const std::vector<int>* capture_layers,
+    std::vector<bt::Tensor>* hidden_states_out) {
+    const int HD   = cfg_.head_dim;
+    const int n_q  = cfg_.num_attention_heads;
+    const int n_kv = cfg_.num_key_value_heads;
+    const float eps = cfg_.rms_norm_eps;
+
+    std::size_t capture_cursor = 0;
 
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
         LayerSlot& layer = layers_[static_cast<std::size_t>(li)];
         LayerCache& c    = cache[static_cast<std::size_t>(li)];
-        if (c.k.size() == 0) fail("forward: cache not allocated");
+        if (c.k.size() == 0) fail("run_decoder_layers_: cache not allocated");
         const int max_seq = c.k.rows;
         if (c.len + L > max_seq) {
-            fail("forward: cache_len + L exceeds allocated capacity");
+            fail("run_decoder_layers_: cache_len + L exceeds allocated capacity");
         }
 
         bt::rms_norm_forward(h_, layer.in_norm, eps, norm_);
@@ -559,10 +574,66 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
 
         bt::rms_norm_forward(h_, layer.post_attn_norm, eps, norm_);
         mlp_block_(layer, L);
+
+        if (capture_layers != nullptr &&
+            capture_cursor < capture_layers->size() &&
+            (*capture_layers)[capture_cursor] == li + 1) {
+            hidden_states_out->push_back(h_.clone());
+            ++capture_cursor;
+        }
+    }
+}
+
+void TextModel::forward_capture_hidden_states(
+    const bt::Tensor& embeds,
+    const std::vector<int64_t>& mrope_t,
+    const std::vector<int64_t>& mrope_h,
+    const std::vector<int64_t>& mrope_w,
+    const std::vector<int>& capture_layers,
+    std::vector<bt::Tensor>& hidden_states_out) {
+    if (embeds.rows <= 0) fail("forward_capture_hidden_states: empty input");
+    const int L = embeds.rows;
+    if (embeds.cols != cfg_.hidden_size) {
+        fail("forward_capture_hidden_states: embeds.cols != hidden_size");
+    }
+    if (static_cast<int>(mrope_t.size()) != L ||
+        static_cast<int>(mrope_h.size()) != L ||
+        static_cast<int>(mrope_w.size()) != L) {
+        fail("forward_capture_hidden_states: mrope_{t,h,w} length must match "
+             "embeds.rows");
+    }
+    if (embed_.size() == 0) fail("forward_capture_hidden_states: weights not loaded");
+    if (capture_layers.empty()) {
+        fail("forward_capture_hidden_states: capture_layers must be non-empty");
+    }
+    for (std::size_t i = 0; i < capture_layers.size(); ++i) {
+        const int idx = capture_layers[i];
+        if (idx < 1 || idx > cfg_.num_hidden_layers) {
+            fail("forward_capture_hidden_states: capture_layers entry " +
+                 std::to_string(idx) + " out of range [1, " +
+                 std::to_string(cfg_.num_hidden_layers) + "]");
+        }
+        if (i > 0 && capture_layers[i] <= capture_layers[i - 1]) {
+            fail("forward_capture_hidden_states: capture_layers must be "
+                 "strictly ascending");
+        }
     }
 
-    bt::rms_norm_forward(h_, final_norm_, eps, norm_);
-    detail::linear_batched(embed_, /*bias=*/nullptr, norm_, logits_out);
+    std::vector<int32_t> pos_t(L), pos_h(L), pos_w(L);
+    for (int i = 0; i < L; ++i) {
+        pos_t[static_cast<std::size_t>(i)] = static_cast<int32_t>(mrope_t[static_cast<std::size_t>(i)]);
+        pos_h[static_cast<std::size_t>(i)] = static_cast<int32_t>(mrope_h[static_cast<std::size_t>(i)]);
+        pos_w[static_cast<std::size_t>(i)] = static_cast<int32_t>(mrope_w[static_cast<std::size_t>(i)]);
+    }
+    prepare_mrope_(pos_t, pos_h, pos_w, L);
+
+    h_ = embeds.clone();
+    std::vector<LayerCache> scratch_cache = make_cache(L);
+
+    hidden_states_out.clear();
+    hidden_states_out.reserve(capture_layers.size());
+    run_decoder_layers_(L, scratch_cache, /*deepstack=*/{}, &capture_layers,
+                       &hidden_states_out);
 }
 
 }  // namespace brolm::qwen3vl
