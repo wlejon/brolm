@@ -3,6 +3,7 @@
 #include "brolm/qwen3vl_vl.h"
 
 #include "brolm/detail/compute.h"
+#include "brolm/qwen3vl_prompt.h"
 #include "brolm/qwen_generate.h"
 
 #include "brotensor/ops.h"
@@ -138,137 +139,11 @@ void VLM::load_from_directory(const std::string& dir) {
 }
 
 // ─── generate ──────────────────────────────────────────────────────────────
-
-namespace {
-
-// Expand each single <|image_pad|> token into N copies, where N is the
-// num_image_tokens() count for the i-th image.
-std::vector<int> expand_image_pad_(const std::vector<int>& tokens,
-                                   const std::vector<PreprocessedImage>& images,
-                                   int image_pad_id) {
-    std::size_t pad_count = 0;
-    for (int t : tokens) if (t == image_pad_id) ++pad_count;
-    if (pad_count != images.size()) {
-        throw std::runtime_error(
-            "qwen3vl::VLM: prompt has " + std::to_string(pad_count) +
-            " <|image_pad|> token(s) but " + std::to_string(images.size()) +
-            " image(s) supplied");
-    }
-
-    std::vector<int> out;
-    std::size_t expanded_extra = 0;
-    for (const auto& im : images) {
-        expanded_extra += static_cast<std::size_t>(im.num_image_tokens());
-    }
-    out.reserve(tokens.size() + expanded_extra);
-
-    std::size_t img_idx = 0;
-    for (int t : tokens) {
-        if (t == image_pad_id) {
-            const int n = images[img_idx++].num_image_tokens();
-            for (int k = 0; k < n; ++k) out.push_back(image_pad_id);
-        } else {
-            out.push_back(t);
-        }
-    }
-    return out;
-}
-
-// Locate the start row of each image_pad run in `expanded`.
-std::vector<int> image_pad_run_starts_(const std::vector<int>& expanded,
-                                       const std::vector<PreprocessedImage>& images,
-                                       int image_pad_id) {
-    std::vector<int> starts;
-    starts.reserve(images.size());
-    std::size_t img_idx = 0;
-    const int T = static_cast<int>(expanded.size());
-    int i = 0;
-    while (i < T) {
-        if (expanded[static_cast<std::size_t>(i)] == image_pad_id) {
-            int j = i;
-            while (j < T &&
-                   expanded[static_cast<std::size_t>(j)] == image_pad_id) {
-                ++j;
-            }
-            if (img_idx >= images.size()) {
-                throw std::runtime_error(
-                    "qwen3vl::VLM: image_pad run count mismatch (internal)");
-            }
-            const int expected_len = images[img_idx++].num_image_tokens();
-            if (j - i != expected_len) {
-                throw std::runtime_error(
-                    "qwen3vl::VLM: image_pad run length " +
-                    std::to_string(j - i) +
-                    " != num_image_tokens " +
-                    std::to_string(expected_len));
-            }
-            starts.push_back(i);
-            i = j;
-        } else {
-            ++i;
-        }
-    }
-    if (img_idx != images.size()) {
-        throw std::runtime_error(
-            "qwen3vl::VLM: fewer image_pad runs than images (internal)");
-    }
-    return starts;
-}
-
-// Splice the (n, hidden) vision-tower output into `embeds` starting at row
-// `dst_row`.
-void splice_vision_(bt::Tensor& embeds, int dst_row,
-                    const bt::Tensor& vision_out) {
-    const int n      = vision_out.rows;
-    const int hidden = vision_out.cols;
-    if (embeds.cols != hidden) {
-        throw std::runtime_error(
-            "qwen3vl::VLM: splice hidden mismatch " +
-            std::to_string(embeds.cols) + " vs " + std::to_string(hidden));
-    }
-    if (embeds.dtype != vision_out.dtype) {
-        throw std::runtime_error("qwen3vl::VLM: splice dtype mismatch");
-    }
-    bt::copy_d2d(vision_out, /*src_off=*/0,
-                embeds, /*dst_off=*/dst_row * hidden,
-                n * hidden);
-}
-
-// Upload an FP32 host buffer (3, H, W) preprocessor input, then run the
-// preprocessor + vision tower, returning the per-image post-merger token
-// tensor plus the DeepStack feature list at compute dtype.
-bt::Tensor run_vision_one_(VisionTower& tower,
-                           const PreprocessConfig& pp,
-                           const ImageInput& img,
-                           PreprocessedImage& pp_out,
-                           std::vector<bt::Tensor>& deepstack_out) {
-    if (!img.pixels || img.H <= 0 || img.W <= 0) {
-        throw std::runtime_error("qwen3vl::VLM: invalid ImageInput");
-    }
-    pp_out = preprocess_image(img.pixels, img.H, img.W, pp);
-
-    const float* patch_src = pp_out.patches.host_f32();
-    const int N          = pp_out.patches.rows;
-    const int patch_cols = pp_out.patches.cols;
-    bt::Tensor patches_dev;
-    if (brolm::compute_dtype() == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(
-            static_cast<std::size_t>(N) * patch_cols);
-        for (std::size_t i = 0; i < bits.size(); ++i) {
-            bits[i] = bt::fp32_to_fp16_bits(patch_src[i]);
-        }
-        patches_dev = bt::Tensor::from_host_fp16(bits.data(), N, patch_cols);
-    } else {
-        patches_dev = bt::Tensor::from_host(patch_src, N, patch_cols);
-    }
-
-    bt::Tensor out;
-    tower.forward(patches_dev, pp_out.grid_t, pp_out.grid_h, pp_out.grid_w,
-                 out, deepstack_out);
-    return out;
-}
-
-}  // namespace
+//
+// expand_image_pad / image_pad_run_starts / splice_vision / run_vision_one
+// live in qwen3vl_prompt.{h,cpp} — shared with brodiffusion's Krea 2
+// image-as-prompt encoder, which assembles the same kind of image-token
+// sequence but taps hidden states instead of sampling from them.
 
 std::vector<int> VLM::generate_tokens(const std::string& prompt,
                                       const std::vector<ImageInput>& images) {
@@ -312,14 +187,14 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
     for (const auto& img : images) {
         PreprocessedImage pp_one;
         std::vector<bt::Tensor> ds_one;
-        bt::Tensor out = run_vision_one_(*vision_, cfg_.pp, img, pp_one, ds_one);
+        bt::Tensor out = run_vision_one(*vision_, cfg_.pp, img, pp_one, ds_one);
         pp_results.push_back(std::move(pp_one));
         vision_outs.push_back(std::move(out));
         deepstack_outs.push_back(std::move(ds_one));
     }
 
     // 3. Expand each <|image_pad|> placeholder to its post-merger run length.
-    std::vector<int> expanded = expand_image_pad_(tokens, pp_results, pad_id);
+    std::vector<int> expanded = expand_image_pad(tokens, pp_results, pad_id);
     const int T = static_cast<int>(expanded.size());
     if (T <= 0) fail("generate: empty prompt");
     if (T > cfg_.max_seq_len) {
@@ -333,11 +208,11 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
     // 5. Splice each image's main-merger output into its image_pad run, and
     //    build the DeepStack splice list for the same row ranges.
     std::vector<int> run_starts =
-        image_pad_run_starts_(expanded, pp_results, pad_id);
+        image_pad_run_starts(expanded, pp_results, pad_id);
     std::vector<DeepstackSplice> deepstack;
     deepstack.reserve(images.size());
     for (std::size_t i = 0; i < images.size(); ++i) {
-        splice_vision_(embeds, run_starts[i], vision_outs[i]);
+        splice_vision(embeds, run_starts[i], vision_outs[i]);
         DeepstackSplice sp;
         sp.row_start = run_starts[i];
         sp.per_layer = std::move(deepstack_outs[i]);

@@ -161,15 +161,20 @@ public:
     // independent (embeds.rows, hidden_size) clone. Uses an internal
     // scratch KV cache sized exactly to embeds.rows — no cache is threaded
     // through to the caller, since this is a one-shot conditioning pass, not
-    // a generation step. No DeepStack support (text-only conditioning has no
-    // vision tower feeding it); use forward_embeds directly if that's needed.
+    // a generation step. `deepstack` (default empty) is injected exactly as
+    // forward_embeds() does — this is the one-shot analogue of forward_embeds
+    // for consumers that need both an image-conditioned forward AND captured
+    // intermediate hidden states (e.g. brodiffusion's Krea 2 image-as-prompt
+    // encoder, which taps this backbone the same way krea2::encode_prompt
+    // taps its text-only forward).
     void forward_capture_hidden_states(
         const brotensor::Tensor& embeds,
         const std::vector<int64_t>& mrope_t,
         const std::vector<int64_t>& mrope_h,
         const std::vector<int64_t>& mrope_w,
         const std::vector<int>& capture_layers,
-        std::vector<brotensor::Tensor>& hidden_states_out);
+        std::vector<brotensor::Tensor>& hidden_states_out,
+        const std::vector<DeepstackSplice>& deepstack = {});
 
     const Qwen3VLConfig::Text& config() const { return cfg_; }
 

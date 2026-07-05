@@ -653,7 +653,8 @@ void TextModel::forward_capture_hidden_states(
     const std::vector<int64_t>& mrope_h,
     const std::vector<int64_t>& mrope_w,
     const std::vector<int>& capture_layers,
-    std::vector<bt::Tensor>& hidden_states_out) {
+    std::vector<bt::Tensor>& hidden_states_out,
+    const std::vector<DeepstackSplice>& deepstack) {
     if (embeds.rows <= 0) fail("forward_capture_hidden_states: empty input");
     const int L = embeds.rows;
     if (embeds.cols != cfg_.hidden_size) {
@@ -695,7 +696,7 @@ void TextModel::forward_capture_hidden_states(
 
     hidden_states_out.clear();
     hidden_states_out.reserve(capture_layers.size());
-    run_decoder_layers_(L, scratch_cache, /*deepstack=*/{}, &capture_layers,
+    run_decoder_layers_(L, scratch_cache, deepstack, &capture_layers,
                        &hidden_states_out);
 }
 
