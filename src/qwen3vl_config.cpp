@@ -82,8 +82,11 @@ Qwen3VLConfig Qwen3VLConfig::from_json_text(const std::string& json_text) {
     t.rms_norm_eps          = get_float(tc, "rms_norm_eps",        t.rms_norm_eps);
     t.max_position_embeddings = get_int(tc, "max_position_embeddings",
                                         t.max_position_embeddings);
+    // HF semantics: text_config may omit the flag, in which case the
+    // top-level tie_word_embeddings applies (Qwen3-VL-8B: top-level false,
+    // absent in text_config, separate lm_head.weight shipped).
     t.tie_word_embeddings     = get_bool(tc, "tie_word_embeddings",
-                                         t.tie_word_embeddings);
+                                         cfg.tie_word_embeddings_top);
 
     // rope_scaling: optional sub-object; if absent the struct defaults stand.
     // HF names this key `rope_scaling` in text_config (some releases nest a

@@ -99,9 +99,9 @@ public:
     // `layers.N.self_attn.{q,k}_norm.weight`,
     // `layers.N.{input_layernorm,post_attention_layernorm}.weight`,
     // `layers.N.mlp.{gate,up,down}_proj.weight`. Throws std::runtime_error
-    // on a missing name or shape mismatch. `tie_word_embeddings=false` (an
-    // untied lm_head) is not supported — no released Qwen3-VL checkpoint
-    // uses it.
+    // on a missing name or shape mismatch. With `tie_word_embeddings=false`
+    // (Qwen3-VL-8B) the separate `lm_head.weight` is loaded — it lives at
+    // the checkpoint ROOT, not under `prefix`.
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "model.language_model.");
     void load_weights(
@@ -238,6 +238,7 @@ private:
 
     // Weights.
     brotensor::Tensor embed_;        // (vocab, hidden)
+    brotensor::Tensor lm_head_;      // (vocab, hidden) — only when untied
     std::vector<LayerSlot> layers_;
     brotensor::Tensor final_norm_;   // (hidden,)
 

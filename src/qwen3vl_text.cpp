@@ -369,11 +369,14 @@ void TextModel::load_weights_impl_(
     }
 
     if (!cfg_.tie_word_embeddings) {
-        if (find_in(shards, prefix + "lm_head.weight") == nullptr) {
+        // The untied head (Qwen3-VL-8B) lives at the checkpoint ROOT
+        // ("lm_head.weight"), not under the language-model prefix.
+        const st::TensorView* head = find_in(shards, "lm_head.weight");
+        if (head == nullptr) head = find_in(shards, prefix + "lm_head.weight");
+        if (head == nullptr) {
             fail("tie_word_embeddings=false but lm_head.weight missing");
         }
-        fail("tie_word_embeddings=false is not supported (no released "
-             "Qwen3-VL checkpoint uses an untied lm_head)");
+        upload_compute_checked(*head, V, H, lm_head_, "lm_head.weight");
     }
 }
 
@@ -575,7 +578,8 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                        /*hidden_states_out=*/nullptr);
 
     bt::rms_norm_forward(h_, final_norm_, eps, norm_);
-    detail::linear_batched(embed_, /*bias=*/nullptr, norm_, logits_out);
+    detail::linear_batched(cfg_.tie_word_embeddings ? embed_ : lm_head_,
+                           /*bias=*/nullptr, norm_, logits_out);
 }
 
 void TextModel::run_decoder_layers_(
