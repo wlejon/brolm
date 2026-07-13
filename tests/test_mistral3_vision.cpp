@@ -200,6 +200,15 @@ int main() {
             int nonfinite = 0;
             for (float v : out_a) if (!bdtest::bd_finite(v)) ++nonfinite;
             CHECK(nonfinite == 0);
+            // Exact fingerprint on fixed synthetic weights. The 2-D RoPE and the
+            // attention are what mix patch positions; a wrong rotary pairing
+            // moves these numbers while every shape/finiteness check above stays
+            // perfectly happy. Printed so a refactor can be diffed against the
+            // implementation it replaces.
+            double sum_abs = 0.0;
+            for (float v : out_a) sum_abs += std::fabs(static_cast<double>(v));
+            std::printf("FINGERPRINT mistral3 sum=%.6f v0=%.6f v1=%.6f v2=%.6f v3=%.6f\n",
+                        sum_abs, out_a[0], out_a[1], out_a[2], out_a[3]);
         }
 
         // ── 2. determinism ────────────────────────────────────────────────

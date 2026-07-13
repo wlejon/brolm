@@ -226,6 +226,13 @@ void test_synthetic() {
     assert(mean_abs < 1.0e3);
     std::printf("[ok] synthetic VisionTower forward: out=(%d,%d), mean_abs=%.5f\n",
                 out.rows, out.cols, mean_abs);
+    // Exact fingerprint of the tower's output on fixed synthetic weights. RoPE
+    // and attention are what mix patch positions together, so a wrong rotary
+    // pairing moves these numbers while leaving every shape/finiteness check
+    // above perfectly happy. Printed so a refactor can be diffed against the
+    // implementation it replaces, not merely asserted to be "reasonable".
+    std::printf("FINGERPRINT qwen35 sum=%.6f v0=%.6f v1=%.6f v2=%.6f v3=%.6f\n",
+                sum_abs, hostv[0], hostv[1], hostv[2], hostv[3]);
 
     std::remove(path.c_str());
 }

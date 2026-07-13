@@ -178,8 +178,17 @@ void VisionTower::load_from_(const wt::Source& src) {
         Block& B = blocks_[static_cast<std::size_t>(i)];
 
         src.upload_compute_dequant(p + "attention_norm.weight", D, 1, B.attn_norm_g, "attention_norm.weight");
-        src.upload_compute_checked(p + "attention.q_proj.weight", D, D, B.q_W, "attention.q_proj.weight");
-        src.upload_compute_checked(p + "attention.k_proj.weight", D, D, B.k_W, "attention.k_proj.weight");
+        // Q/K rows are permuted from HF's rotate_half pairing into brotensor's
+        // adjacent-pair pairing, so rope_apply rotates the pairs HF rotates.
+        // V is left alone: the permutation shuffles Q's and K's feature axis
+        // identically, and a dot product does not care — scores are unchanged
+        // and attention output stays in V's basis, so o_proj needs no change.
+        src.upload_compute_rope_permuted(p + "attention.q_proj.weight", D, D,
+                                         cfg_.num_attention_heads, cfg_.head_dim,
+                                         B.q_W, "attention.q_proj.weight");
+        src.upload_compute_rope_permuted(p + "attention.k_proj.weight", D, D,
+                                         cfg_.num_attention_heads, cfg_.head_dim,
+                                         B.k_W, "attention.k_proj.weight");
         src.upload_compute_checked(p + "attention.v_proj.weight", D, D, B.v_W, "attention.v_proj.weight");
         src.upload_compute_checked(p + "attention.o_proj.weight", D, D, B.o_W, "attention.o_proj.weight");
 
@@ -221,61 +230,32 @@ void VisionTower::build_rotary_tables_(int grid_h, int grid_w) {
         inv_w[static_cast<std::size_t>(k)] = 1.0f / std::pow(theta, ew);
     }
 
-    // angle vector per patch has length half = [h-quarter | w-quarter]; emb is
-    // that vector duplicated over head_dim (HF emb = cat(freqs, freqs)), so the
-    // [half, head_dim) columns mirror [0, half). Patches are row-major (h, w):
-    // patch n sits at (ph = n / grid_w, pw = n % grid_w).
-    cos_host_.assign(static_cast<std::size_t>(N) * head_dim, 1.0f);
-    sin_host_.assign(static_cast<std::size_t>(N) * head_dim, 0.0f);
+    // The angle vector per patch has length half = [h-quarter | w-quarter], and
+    // HF duplicates it over head_dim (emb = cat(freqs, freqs)) so the
+    // [half, head_dim) columns mirror [0, half). Once the pairing is explicit
+    // that mirror is redundant: rope_apply takes one angle per rotated pair,
+    // (N, head_dim/2) shared across heads. Patches are row-major (h, w): patch
+    // n sits at (ph = n / grid_w, pw = n % grid_w).
+    cos_host_.assign(static_cast<std::size_t>(N) * half, 1.0f);
+    sin_host_.assign(static_cast<std::size_t>(N) * half, 0.0f);
     for (int n = 0; n < N; ++n) {
         const int ph = n / grid_w;
         const int pw = n % grid_w;
-        const std::size_t row = static_cast<std::size_t>(n) * head_dim;
+        const std::size_t row = static_cast<std::size_t>(n) * half;
         for (int k = 0; k < quarter; ++k) {
             const float ah = static_cast<float>(ph) * inv_h[static_cast<std::size_t>(k)];
             const float aw = static_cast<float>(pw) * inv_w[static_cast<std::size_t>(k)];
-            const float ch = std::cos(ah), sh = std::sin(ah);
-            const float cw = std::cos(aw), sw = std::sin(aw);
-            // h-quarter at column k; w-quarter at column quarter+k; +half mirror.
-            cos_host_[row + static_cast<std::size_t>(k)]                 = ch;
-            sin_host_[row + static_cast<std::size_t>(k)]                 = sh;
-            cos_host_[row + static_cast<std::size_t>(k) + half]          = ch;
-            sin_host_[row + static_cast<std::size_t>(k) + half]          = sh;
-            cos_host_[row + static_cast<std::size_t>(quarter + k)]        = cw;
-            sin_host_[row + static_cast<std::size_t>(quarter + k)]        = sw;
-            cos_host_[row + static_cast<std::size_t>(quarter + k) + half] = cw;
-            sin_host_[row + static_cast<std::size_t>(quarter + k) + half] = sw;
+            // h-quarter at column k; w-quarter at column quarter+k.
+            cos_host_[row + static_cast<std::size_t>(k)]            = std::cos(ah);
+            sin_host_[row + static_cast<std::size_t>(k)]            = std::sin(ah);
+            cos_host_[row + static_cast<std::size_t>(quarter + k)]  = std::cos(aw);
+            sin_host_[row + static_cast<std::size_t>(quarter + k)]  = std::sin(aw);
         }
     }
+    cos_dev_ = bt::Tensor::from_host(cos_host_.data(), N, half).to(ln_pre_g_.device);
+    sin_dev_ = bt::Tensor::from_host(sin_host_.data(), N, half).to(ln_pre_g_.device);
 }
 
-void VisionTower::apply_rope_(const bt::Tensor& in, bt::Tensor& out) {
-    const int D        = cfg_.hidden_size;
-    const int H        = cfg_.num_attention_heads;
-    const int head_dim = cfg_.head_dim;
-    const int half     = head_dim / 2;
-    const int N        = in.rows;
-
-    std::vector<float> X = to_host_f32(in);
-    std::vector<float> Y(X.size());
-    // HF rotate_half(x) = cat(-x[..., half:], x[..., :half]); per token/head:
-    //   y[c]      = x[c]      * cos[c]      - x[c+half] * sin[c]
-    //   y[c+half] = x[c+half] * cos[c+half] + x[c]      * sin[c+half]
-    for (int n = 0; n < N; ++n) {
-        const float* cosrow = &cos_host_[static_cast<std::size_t>(n) * head_dim];
-        const float* sinrow = &sin_host_[static_cast<std::size_t>(n) * head_dim];
-        for (int h = 0; h < H; ++h) {
-            const std::size_t base = static_cast<std::size_t>(n) * D + static_cast<std::size_t>(h) * head_dim;
-            for (int c = 0; c < half; ++c) {
-                const float x0 = X[base + static_cast<std::size_t>(c)];
-                const float x1 = X[base + static_cast<std::size_t>(c + half)];
-                Y[base + static_cast<std::size_t>(c)]        = x0 * cosrow[c]        + (-x1) * sinrow[c];
-                Y[base + static_cast<std::size_t>(c + half)] = x1 * cosrow[c + half] +   x0  * sinrow[c + half];
-            }
-        }
-    }
-    from_host_f32(Y, N, D, in.device, out);
-}
 
 // ─── dense per-head full attention ──────────────────────────────────────────
 
@@ -359,9 +339,20 @@ void VisionTower::forward(const bt::Tensor& patches, int grid_h, int grid_w,
         detail::linear_batched(B.k_W, /*bias=*/nullptr, xn_, k_);
         detail::linear_batched(B.v_W, /*bias=*/nullptr, xn_, v_);
 
-        apply_rope_(q_, q_rope_);
-        apply_rope_(k_, k_rope_);
-        dense_attention_(q_rope_, k_rope_, v_, attn_out_);
+        // Q/K rows were permuted at load, so this is HF's rotate_half rotation.
+        const bt::Dtype dt = compute_dtype();
+        bt::rope_apply(q_, cos_dev_, sin_dev_, cfg_.head_dim,
+                       cfg_.num_attention_heads, q_rope_);
+        bt::rope_apply(k_, cos_dev_, sin_dev_, cfg_.head_dim,
+                       cfg_.num_attention_heads, k_rope_);
+        if (dt == bt::Dtype::FP16) {
+            bt::flash_attention_forward(q_rope_, k_rope_, v_, /*d_mask=*/nullptr,
+                                        cfg_.num_attention_heads, /*causal=*/false,
+                                        attn_out_);
+        } else {
+            // CPU backend (FP32): brotensor's fused attention is FP16-only.
+            dense_attention_(q_rope_, k_rope_, v_, attn_out_);
+        }
 
         detail::linear_batched(B.o_W, /*bias=*/nullptr, attn_out_, proj_out_);
         bt::add_inplace(x_, proj_out_);

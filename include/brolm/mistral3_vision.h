@@ -124,26 +124,25 @@ private:
     brotensor::Tensor mlp_act_;           // (N, F) silu(gate)*up
     brotensor::Tensor mlp_out_;           // (N, D)
 
-    // Host-side cos/sin tables for the 2-D rotary, (N, head_dim) each.
-    std::vector<float> cos_host_, sin_host_;
+    std::vector<float> cos_host_, sin_host_;  // (N, head_dim/2) staging
+    brotensor::Tensor cos_dev_, sin_dev_;     // (N, head_dim/2) FP32, on device
 
     // Shared loader over the container-agnostic weights Source (safetensors or
     // mmproj gguf). Names are relative (no `vision_tower.` prefix); the Source
-    // applies the prefix / ggml mapping.
+    // applies the prefix / ggml mapping. Q/K arrive rope-permuted (see
+    // load_from_), so rope_apply's adjacent-pair rotation is HF's rotate_half.
     void load_from_(const brolm::detail::weights::Source& src);
 
-    // Build the per-patch (N, head_dim) cos/sin tables for this image's grid
+    // Build the per-patch (N, head_dim/2) cos/sin tables for this image's grid
     // following PixtralRotaryEmbedding: the h-position drives the first quarter
-    // of head_dim/2 frequencies and the w-position the second quarter, then the
-    // half-table is duplicated for the rotate_half convention.
+    // of the frequencies and the w-position the second. One angle per rotated
+    // pair, shared across heads — HF's duplicated mirror half is redundant once
+    // the pairing is explicit. Lands in cos_dev_/sin_dev_.
     void build_rotary_tables_(int grid_h, int grid_w);
 
-    // Apply the 2-D rotary (HF rotate_half form) to one (N, D) Q or K tensor.
-    void apply_rope_(const brotensor::Tensor& in, brotensor::Tensor& out);
-
     // Dense per-head full attention after RoPE: O = softmax(QKᵀ/√d) V per head,
-    // concatenated back to (N, D). Internally FP32 on the host — single image,
-    // small matrices, correct on every backend.
+    // concatenated back to (N, D). FP32 on the host — the CPU backend's path
+    // only, since brotensor's fused attention is FP16 and FP16 is the GPU case.
     void dense_attention_(const brotensor::Tensor& q_in,
                           const brotensor::Tensor& k_in,
                           const brotensor::Tensor& v_in,
