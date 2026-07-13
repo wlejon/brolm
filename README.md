@@ -7,9 +7,9 @@
 Language- and text-model inference for the bro stack — the text counterpart to
 [brodiffusion](https://github.com/wlejon/brodiffusion). Pure C++20, built on
 [brotensor](https://github.com/wlejon/brotensor) (tensor + compute kernels) and
-[bromath](https://github.com/wlejon/bromath) (scalar / RNG helpers). Runs
-**CPU-by-default and on a GPU when one is available** — FP32 on the CPU backend,
-FP16 on a GPU — with the device chosen at runtime.
+[bromath](https://github.com/wlejon/bromath) (scalar / RNG helpers). The device
+is picked at runtime — a GPU when one is registered, CPU otherwise — and the
+compute dtype follows it: FP16 on a GPU, FP32 on CPU.
 
 brolm turns token sequences into embeddings (encoder models) and generates them
 (decoder models). It owns the tokenizers, the transformer building blocks, and
