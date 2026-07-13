@@ -2,6 +2,7 @@
 
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
+#include "brolm/detail/weights.h"
 #include "brotensor/ops.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -231,6 +232,8 @@ void VisionTower::load_weights(const std::vector<const st::File*>& shards,
 
         upload_compute_checked(need(shards, p + "attn.qkv.weight"), qkv, D, B.Wqkv, "attn.qkv.weight");
         upload_compute_checked(need(shards, p + "attn.qkv.bias"),   qkv, 1, B.bqkv, "attn.qkv.bias");
+        permute_qk_rope_rows_(B.Wqkv, D);
+        permute_qk_rope_rows_(B.bqkv, 1);
 
         upload_compute_checked(need(shards, p + "attn.proj.weight"), D, D, B.Wproj, "attn.proj.weight");
         upload_compute_checked(need(shards, p + "attn.proj.bias"),   D, 1, B.bproj, "attn.proj.bias");
@@ -272,14 +275,43 @@ void VisionTower::load_weights(const std::vector<const st::File*>& shards,
     }
 }
 
-// ─── helpers: rotary tables, pos embed ─────────────────────────────────────
+// ─── helpers: rotary rows, rotary tables, pos embed ─────────────────────────
+
+// HF stores each head's rotary dims in "rotate_half" order — dim c pairs with
+// dim c + head_dim/2 — while brotensor's rope_apply rotates ADJACENT pairs
+// (2i, 2i+1). Permuting the Q and K output rows of the fused qkv projection at
+// load time reconciles the two once, for free, instead of per image: row 2i of
+// the permuted weight is HF's row i, row 2i+1 is HF's row i + head_dim/2, so
+// the pair rope_apply rotates is exactly the pair HF rotates. This is the same
+// trick qwen3vl_text.cpp uses (permute_rotary_rows) for the M-RoPE layout.
+//
+// V is deliberately left alone: the permutation is a per-head shuffle of Q's
+// and K's feature axis, and a dot product is invariant to shuffling both sides
+// the same way. Scores are therefore bit-identical, attention output stays in
+// V's original basis, and attn.proj needs no change.
+void VisionTower::permute_qk_rope_rows_(bt::Tensor& W, int cols) {
+    const int D        = cfg_.hidden_size;
+    const int H        = cfg_.num_heads;
+    const int head_dim = D / H;
+
+    std::vector<float> host = to_host_f32(W);                 // (3D, cols)
+    const std::size_t block = static_cast<std::size_t>(D) * static_cast<std::size_t>(cols);
+    for (int part = 0; part < 2; ++part) {                    // Q, then K
+        const auto begin = host.begin() + static_cast<std::ptrdiff_t>(part * block);
+        std::vector<float> sub(begin, begin + static_cast<std::ptrdiff_t>(block));
+        std::vector<float> perm =
+            brolm::detail::weights::detail_::permute_rope_fp32(sub, H, head_dim, cols);
+        std::copy(perm.begin(), perm.end(), begin);
+    }
+    from_host_f32(host, W.rows, cols, W.device, W);
+}
 
 void VisionTower::build_rotary_tables_(int grid_t, int grid_h, int grid_w) {
     const int D        = cfg_.hidden_size;
     const int H        = cfg_.num_heads;
     const int head_dim = D / H;
-    const int rot_full = head_dim / 2;
-    const int half      = rot_full / 2;
+    const int rot_full = head_dim / 2;   // one angle per rotated pair
+    const int half     = rot_full / 2;   // pairs [0, half) follow h; [half, ..) follow w
 
     std::vector<int> hpos, wpos;
     build_vision_position_ids(grid_t, grid_h, grid_w, cfg_.spatial_merge_size,
@@ -293,8 +325,11 @@ void VisionTower::build_rotary_tables_(int grid_t, int grid_h, int grid_w) {
         inv_freq[static_cast<std::size_t>(i)] = 1.0f / std::pow(theta, p);
     }
 
-    cos_host_.assign(static_cast<std::size_t>(N) * head_dim, 1.0f);
-    sin_host_.assign(static_cast<std::size_t>(N) * head_dim, 0.0f);
+    // (N, head_dim/2): one angle per rotated pair, shared across heads — the
+    // layout rope_apply takes. HF's duplicated second half is redundant once
+    // the pairing is explicit.
+    cos_host_.assign(static_cast<std::size_t>(N) * rot_full, 1.0f);
+    sin_host_.assign(static_cast<std::size_t>(N) * rot_full, 0.0f);
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < rot_full; ++c) {
             const int axis = (c / half) % 2;
@@ -302,40 +337,12 @@ void VisionTower::build_rotary_tables_(int grid_t, int grid_h, int grid_w) {
             const int pos  = (axis == 0) ? hpos[static_cast<std::size_t>(n)]
                                          : wpos[static_cast<std::size_t>(n)];
             const float ang = static_cast<float>(pos) * inv_freq[static_cast<std::size_t>(k)];
-            const float cv = std::cos(ang);
-            const float sv = std::sin(ang);
-            cos_host_[static_cast<std::size_t>(n) * head_dim + c] = cv;
-            sin_host_[static_cast<std::size_t>(n) * head_dim + c] = sv;
-            cos_host_[static_cast<std::size_t>(n) * head_dim + rot_full + c] = cv;
-            sin_host_[static_cast<std::size_t>(n) * head_dim + rot_full + c] = sv;
+            cos_host_[static_cast<std::size_t>(n) * rot_full + c] = std::cos(ang);
+            sin_host_[static_cast<std::size_t>(n) * rot_full + c] = std::sin(ang);
         }
     }
-}
-
-void VisionTower::apply_rope_(const bt::Tensor& in, bt::Tensor& out) {
-    const int D        = cfg_.hidden_size;
-    const int H        = cfg_.num_heads;
-    const int head_dim = D / H;
-    const int half     = head_dim / 2;
-    const int N        = in.rows;
-
-    std::vector<float> X = to_host_f32(in);
-    std::vector<float> Y(X.size());
-    for (int n = 0; n < N; ++n) {
-        const float* cosrow = &cos_host_[static_cast<std::size_t>(n) * head_dim];
-        const float* sinrow = &sin_host_[static_cast<std::size_t>(n) * head_dim];
-        for (int h = 0; h < H; ++h) {
-            const std::size_t base = static_cast<std::size_t>(n) * D + static_cast<std::size_t>(h) * head_dim;
-            for (int c = 0; c < half; ++c) {
-                const float x0 = X[base + static_cast<std::size_t>(c)];
-                const float x1 = X[base + static_cast<std::size_t>(c + half)];
-                Y[base + static_cast<std::size_t>(c)]        = x0 * cosrow[c]        + (-x1) * sinrow[c];
-                Y[base + static_cast<std::size_t>(c + half)] = x1 * cosrow[c + half] +   x0  * sinrow[c + half];
-            }
-        }
-    }
-
-    from_host_f32(Y, N, D, in.device, out);
+    cos_dev_ = bt::Tensor::from_host(cos_host_.data(), N, rot_full).to(patch_W_.device);
+    sin_dev_ = bt::Tensor::from_host(sin_host_.data(), N, rot_full).to(patch_W_.device);
 }
 
 void VisionTower::build_pos_embed_(int grid_t, int grid_h, int grid_w) {
@@ -527,7 +534,9 @@ void VisionTower::forward(const bt::Tensor& patches,
     const int N = grid_t * grid_h * grid_w;
     if (patches.rows != N) fail("forward: patches.rows does not match grid_t*grid_h*grid_w");
 
-    const int D = cfg_.hidden_size;
+    const int D        = cfg_.hidden_size;
+    const int H        = cfg_.num_heads;
+    const int head_dim = D / H;
 
     // ── patch embed: (N, C*tps*P²) -> (N, D) via linear (=Conv3d collapsed) ──
     detail::linear_batched(patch_W_, &patch_b_, patches, x_);
@@ -550,26 +559,28 @@ void VisionTower::forward(const bt::Tensor& patches,
         detail::layernorm_batched(x_, B.norm1_g, B.norm1_b, xn_, eps);
         detail::linear_batched(B.Wqkv, &B.bqkv, xn_, qkv_);
 
-        {
-            std::vector<float> qkv_host = to_host_f32(qkv_);
-            std::vector<float> qh(static_cast<std::size_t>(N) * D);
-            std::vector<float> kh(static_cast<std::size_t>(N) * D);
-            std::vector<float> vh(static_cast<std::size_t>(N) * D);
-            for (int n = 0; n < N; ++n) {
-                const float* src = &qkv_host[static_cast<std::size_t>(n) * 3 * D];
-                std::copy(src,           src + D,     qh.begin() + static_cast<std::ptrdiff_t>(n) * D);
-                std::copy(src + D,       src + 2 * D, kh.begin() + static_cast<std::ptrdiff_t>(n) * D);
-                std::copy(src + 2 * D,   src + 3 * D, vh.begin() + static_cast<std::ptrdiff_t>(n) * D);
-            }
-            from_host_f32(qh, N, D, x_.device, q_);
-            from_host_f32(kh, N, D, x_.device, k_);
-            from_host_f32(vh, N, D, x_.device, v_);
+        // Split the fused (N, 3D) projection into Q/K/V without leaving the
+        // device — three strided row copies.
+        const bt::Dtype dt = compute_dtype();
+        detail::resize_like(q_, N, D, dt, x_.device);
+        detail::resize_like(k_, N, D, dt, x_.device);
+        detail::resize_like(v_, N, D, dt, x_.device);
+        bt::copy_d2d_strided(qkv_, 0,         3 * D, q_, 0, D, D, N);
+        bt::copy_d2d_strided(qkv_, D,         3 * D, k_, 0, D, D, N);
+        bt::copy_d2d_strided(qkv_, 2 * D,     3 * D, v_, 0, D, D, N);
+
+        // Q/K rows were permuted into adjacent-pair order at load, so this is
+        // HF's rotate_half rotation.
+        bt::rope_apply(q_, cos_dev_, sin_dev_, head_dim, H, q_rope_);
+        bt::rope_apply(k_, cos_dev_, sin_dev_, head_dim, H, k_rope_);
+
+        if (dt == bt::Dtype::FP16) {
+            bt::flash_attention_forward(q_rope_, k_rope_, v_, /*d_mask=*/nullptr,
+                                        H, /*causal=*/false, attn_out_);
+        } else {
+            // CPU backend (FP32): brotensor's fused attention is FP16-only.
+            dense_attention_(q_rope_, k_rope_, v_, attn_out_);
         }
-
-        apply_rope_(q_, q_rope_);
-        apply_rope_(k_, k_rope_);
-
-        dense_attention_(q_rope_, k_rope_, v_, attn_out_);
 
         detail::linear_batched(B.Wproj, &B.bproj, attn_out_, proj_out_);
         bt::add_inplace(x_, proj_out_);

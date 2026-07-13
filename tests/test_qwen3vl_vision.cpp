@@ -317,9 +317,96 @@ void test_real_checkpoint_if_present() {
     }
 }
 
+// The vision tower runs RoPE with brotensor's rope_apply, which rotates
+// ADJACENT dim pairs (2i, 2i+1) — but HF's vision rotary is "rotate_half",
+// pairing dim c with dim c + head_dim/2. The tower reconciles the two by
+// permuting the Q/K rows of the fused qkv projection at load, so that a
+// projected row lands where rope_apply expects it.
+//
+// This asserts the identity that permutation rests on:
+//
+//     rope_apply(P·x)  ==  P·rotate_half_rope(x)
+//
+// where P is the per-head row permutation (P·x)[2i] = x[i], (P·x)[2i+1] =
+// x[i + half]. Get it wrong and the vision tokens are silently scrambled —
+// shapes and finiteness (which the tests above check) stay perfectly valid.
+void test_rope_pairing_identity() {
+    const int N = 7, H = 4, head_dim = 8, D = H * head_dim;
+    const int half = head_dim / 2;
+
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<std::size_t>(N) * D);
+    for (auto& v : x) v = uni(rng);
+    std::vector<float> cos_t(static_cast<std::size_t>(N) * half);
+    std::vector<float> sin_t(static_cast<std::size_t>(N) * half);
+    for (int n = 0; n < N; ++n) {
+        for (int c = 0; c < half; ++c) {
+            const float ang = uni(rng) * 3.0f;
+            cos_t[static_cast<std::size_t>(n) * half + c] = std::cos(ang);
+            sin_t[static_cast<std::size_t>(n) * half + c] = std::sin(ang);
+        }
+    }
+
+    // Reference: HF rotate_half, exactly as the tower's host path used to do it
+    // (cos/sin duplicated across the two halves of head_dim).
+    std::vector<float> ref(x.size());
+    for (int n = 0; n < N; ++n) {
+        for (int h = 0; h < H; ++h) {
+            const std::size_t base =
+                static_cast<std::size_t>(n) * D + static_cast<std::size_t>(h) * head_dim;
+            for (int c = 0; c < half; ++c) {
+                const float cv = cos_t[static_cast<std::size_t>(n) * half + c];
+                const float sv = sin_t[static_cast<std::size_t>(n) * half + c];
+                const float x0 = x[base + static_cast<std::size_t>(c)];
+                const float x1 = x[base + static_cast<std::size_t>(c + half)];
+                ref[base + static_cast<std::size_t>(c)]        = x0 * cv - x1 * sv;
+                ref[base + static_cast<std::size_t>(c + half)] = x1 * cv + x0 * sv;
+            }
+        }
+    }
+
+    // Permute the input the way the permuted qkv weight would emit it, then let
+    // brotensor rotate adjacent pairs.
+    auto permute = [&](const std::vector<float>& src) {
+        std::vector<float> dst(src.size());
+        for (int n = 0; n < N; ++n) {
+            for (int h = 0; h < H; ++h) {
+                const std::size_t base =
+                    static_cast<std::size_t>(n) * D + static_cast<std::size_t>(h) * head_dim;
+                for (int i = 0; i < half; ++i) {
+                    dst[base + static_cast<std::size_t>(2 * i)]     = src[base + static_cast<std::size_t>(i)];
+                    dst[base + static_cast<std::size_t>(2 * i + 1)] = src[base + static_cast<std::size_t>(i + half)];
+                }
+            }
+        }
+        return dst;
+    };
+
+    const std::vector<float> xp = permute(x);
+    bt::Tensor X   = bt::Tensor::from_host(xp.data(), N, D);
+    bt::Tensor C   = bt::Tensor::from_host(cos_t.data(), N, half);
+    bt::Tensor S   = bt::Tensor::from_host(sin_t.data(), N, half);
+    bt::Tensor Y;
+    bt::rope_apply(X, C, S, head_dim, H, Y);
+    const std::vector<float> got = Y.to_host_vector();
+
+    const std::vector<float> want = permute(ref);
+    double worst = 0.0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        worst = std::max(worst, std::abs(static_cast<double>(got[i]) - want[i]));
+    }
+    if (!(worst < 1e-4)) {
+        std::fprintf(stderr,
+                     "qwen3vl vision RoPE pairing mismatch: worst |Δ| = %.6f\n", worst);
+        std::abort();
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_rope_pairing_identity();
     test_synthetic();
     test_real_checkpoint_if_present();
     return 0;

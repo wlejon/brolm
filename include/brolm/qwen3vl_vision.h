@@ -178,22 +178,24 @@ private:
     brotensor::Tensor merger_mid_;       // (N/m², D*m²)
     brotensor::Tensor merger_act_;       // (N/m², D*m²)
 
-    // Host-side staging for cos/sin tables; on GPU we upload to device-side
-    // buffers but the attention path runs scalar-friendly FP32 here.
-    std::vector<float> cos_host_, sin_host_;  // (N, head_dim) each
+    std::vector<float> cos_host_, sin_host_;  // (N, head_dim/2) staging
+    brotensor::Tensor cos_dev_, sin_dev_;     // (N, head_dim/2) FP32, on device
 
-    // Dense per-head attention helper, applied AFTER RoPE on Q/K.
+    // Dense per-head attention, FP32 on the host. The CPU backend's path only:
+    // brotensor's fused attention is FP16, and FP16 is exactly the GPU case.
     void dense_attention_(const brotensor::Tensor& q_in,
                           const brotensor::Tensor& k_in,
                           const brotensor::Tensor& v_in,
                           brotensor::Tensor& out);
 
-    // Apply vision rotary embedding (HF rotate_half form, h+w concatenated
-    // along head_dim) to one Q or K tensor in place via xn_-style buffer.
-    void apply_rope_(const brotensor::Tensor& in, brotensor::Tensor& out);
+    // Permute the Q and K rows of a fused (3D, cols) qkv tensor from HF's
+    // rotate_half pairing into brotensor's adjacent-pair pairing, so
+    // rope_apply rotates the pairs HF rotates. Done once at load. V untouched.
+    void permute_qk_rope_rows_(brotensor::Tensor& W, int cols);
 
-    // Build the (N, head_dim) cos/sin tables for this image's (grid_h, grid_w)
-    // grid. Result lives in cos_host_/sin_host_.
+    // Build the (N, head_dim/2) cos/sin tables for this image's (grid_h,
+    // grid_w) grid — one angle per rotated pair, shared across heads. Result
+    // lands in cos_dev_/sin_dev_ on the compute device.
     void build_rotary_tables_(int grid_t, int grid_h, int grid_w);
 
     // Bilinear-interpolate pos_table_ from the reference grid to the
