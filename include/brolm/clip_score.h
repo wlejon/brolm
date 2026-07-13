@@ -72,11 +72,17 @@ public:
     // position the official CLIP pooling rule uses).
     void set_prompt(std::string_view prompt);
 
-    // Score a VAE-decoded image against the cached prompt. Returns the
-    // cosine similarity in [-1, 1] (higher = better alignment).
+    // Encode an image to the shared cross-modal space: the projected,
+    // L2-normalised image feature (length projection_dim). Comparable to
+    // text_feature() by a plain dot product — and, unlike score(), usable on
+    // its own as an embedding (cluster them, difference them, PCA them).
     //   image: (3 * H * W) FP32, NCHW planar, values in [-1, 1] (the
     //          pipeline::Pipeline::generate output format).
     //   H, W:  pixel dimensions of the image.
+    std::vector<float> encode_image(const std::vector<float>& image, int H, int W);
+
+    // Score a VAE-decoded image against the cached prompt (set_prompt). The
+    // cosine similarity in [-1, 1] — i.e. dot(encode_image(...), text_feature()).
     float score(const std::vector<float>& image, int H, int W);
 
     // Accessor exposing the active text feature (post-projection,

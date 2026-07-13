@@ -119,15 +119,11 @@ void CLIPScorer::set_prompt(std::string_view prompt) {
     l2_normalise_in_place(text_feat_);
 }
 
-float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
-    if (text_feat_.empty()) {
-        fail("score: set_prompt was not called");
-    }
-
+std::vector<float> CLIPScorer::encode_image(const std::vector<float>& image,
+                                            int H, int W) {
     auto pixel_vals = preprocess_(image, H, W);
     const int S  = image_enc_.config().image_size;
     const int C  = image_enc_.config().in_channels;
-    const int P  = cfg_.projection_dim;
 
     pixels_dev_ = detail::upload_host(pixel_vals.data(), 1, C * S * S);
     image_enc_.forward(pixels_dev_, img_cls_);
@@ -139,6 +135,16 @@ float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
     bt::sync_all();
     std::vector<float> img_feat = download_compute(img_proj_);
     l2_normalise_in_place(img_feat);
+    return img_feat;
+}
+
+float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
+    if (text_feat_.empty()) {
+        fail("score: set_prompt was not called");
+    }
+
+    const std::vector<float> img_feat = encode_image(image, H, W);
+    const int P = cfg_.projection_dim;
 
     double dot = 0.0;
     for (int i = 0; i < P; ++i) {
