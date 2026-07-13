@@ -28,21 +28,21 @@ jobs:
       actions: read
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: brolm
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/bromath
           path: bromath
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brotensor
           path: brotensor
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/broimage
           path: broimage
@@ -73,7 +73,7 @@ jobs:
             --target stb_image broimage brotensor_core brotensor_cpu
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
           build-mode: manual
@@ -84,6 +84,6 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: /language:c-cpp
