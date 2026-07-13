@@ -1,0 +1,33 @@
+name: brolm CodeQL config
+
+queries:
+  - uses: security-extended
+
+# cpp/path-injection does not describe a real weakness in this codebase, so it is
+# excluded rather than left to file the same 33 alerts every week.
+#
+# Every instance it finds is the same shape: a test or a tool driver takes a
+# checkpoint directory from argv or an environment variable and hands it to an
+# API like `VLM::load_from_directory(dir)`, which joins `config.json`,
+# `vocab.json`, `merges.txt` onto it and opens them. Opening the path the caller
+# named *is* what that API is for.
+#
+# The query's threat model is a privileged process — a server, a setuid binary —
+# taking a path from an untrusted remote party and escaping a sandbox with it.
+# brolm is a library linked into whatever the caller is building. It crosses no
+# privilege boundary: the process reads the checkpoint with exactly the rights of
+# whoever chose the path, and a caller who can pass `../../etc/passwd` could
+# equally have opened it themselves. There is no confinement to break out of.
+#
+# Excluding the query does not blunt the scan where it matters. The parsers are
+# the real attack surface — safetensors and GGUF checkpoints, tokenizer
+# vocab/merges, model config JSON, all of it attacker-shaped if a user loads a
+# model someone else built — and the memory-safety queries that cover them (bad
+# indexing, unchecked casts, overflow in shape/offset arithmetic) are untouched.
+# Those need no taint source from argv and keep running against src/.
+#
+# If brolm ever grows a component that takes a path from a network peer, this
+# exclusion is wrong and should be removed.
+query-filters:
+  - exclude:
+      id: cpp/path-injection

@@ -72,12 +72,16 @@ jobs:
           cmake --build build --parallel 4 \
             --target stb_image broimage brotensor_core brotensor_cpu
 
+      # The query set lives in the config file, which also documents why
+      # cpp/path-injection is excluded.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
           build-mode: manual
-          queries: security-extended
+          # Relative to the workspace root, and this repo is checked out into
+          # brolm/ (not the root) so the siblings can sit beside it.
+          config-file: brolm/.github/codeql/codeql-config.yml
 
       # Only brolm's own TUs are left to compile, so only they are traced.
       - name: Build brolm (traced)
