@@ -1,5 +1,9 @@
 # brolm
 
+[![CI](https://github.com/wlejon/brolm/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brolm/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/wlejon/brolm/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brolm/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Language- and text-model inference for the bro stack — the text counterpart to
 [brodiffusion](https://github.com/wlejon/brodiffusion). Pure C++20, built on
 [brotensor](https://github.com/wlejon/brotensor) (tensor + compute kernels) and
@@ -173,6 +177,34 @@ full VLM end-to-end) without NaN. Bit-exact numerical parity against HF `transfo
 is not yet asserted — that's the remaining validation step before this is
 production-ready. The MTP head present in the checkpoint is loaded by the text
 model but not yet wired into a speculative-decoding pass.
+
+## CI
+
+Builds and tests on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64. Each job
+checks out bromath, brotensor and broimage alongside this repo and builds the whole
+stack from source, so a breaking change in a sibling fails here rather than in
+whoever next builds brolm by hand.
+
+What a green run does and does not mean: `weights/` is 86 GB and gitignored, so a
+runner never has it. The model tests gate on the checkpoint being present and skip
+without it; the rest build their fixtures synthetically and run for real. So green
+means "brolm compiles everywhere and its self-contained tests pass" — not that the
+models produce correct output. That check needs the weights and stays on hardware
+that has them.
+
+Coverage of `src/` + `include/brolm/` lands in each run's job summary
+(`-DBROLM_COVERAGE=ON` locally; GCC/Clang only), and understates the loading and
+generation paths for the same reason. [CodeQL](.github/workflows/codeql.yml) runs
+weekly and on every push: brolm parses safetensors and GGUF checkpoints, tokenizer
+vocab/merges, and model config JSON, and indexes buffers using shapes and offsets
+those files declare — all of it attacker-shaped input if a user loads a model
+someone else built. The siblings are built ahead of the traced build so their
+findings stay in their own repos.
+
+## Versioning
+
+Pre-1.0. Siblings vendor this repo via `add_subdirectory` and build from source,
+so a tag is a pin point rather than a compatibility promise.
 
 ## License
 
