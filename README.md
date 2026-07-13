@@ -65,9 +65,10 @@ ctest --test-dir build -C Release
 
 bromath, brotensor, and broimage are resolved as standalone sibling repos at
 `../bromath`, `../brotensor`, and `../broimage`, with a `third_party/` submodule
-fallback — the pattern documented in `bro/docs/multi-repo-workflow.md`. Override
-any of them with `-DBROMATH_DIR=...`, `-DBROTENSOR_DIR=...`,
-`-DBROIMAGE_DIR=...`. Pass `-DBROTENSOR_WITH_CUDA=ON` or
+fallback. See
+[bro/docs/multi-repo-workflow.md](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
+for the layout. Override any of them with `-DBROMATH_DIR=...`,
+`-DBROTENSOR_DIR=...`, `-DBROIMAGE_DIR=...`. Pass `-DBROTENSOR_WITH_CUDA=ON` or
 `-DBROTENSOR_WITH_METAL=ON` to forward the GPU backend selection to brotensor.
 
 CMake options:
@@ -93,12 +94,13 @@ brolm::qwen::Qwen3Model model(cfg);
 model.load_weights(f);
 ```
 
-Supported today: Qwen3 (model + tokenizer + config), T5 (model + tokenizer +
-config), Whisper (tokenizer). BF16 weights load on every backend; on-disk
-quants (Q4_K / Q6_K / Q8_0) are kept in their original dtype and dispatched
-through brotensor's quant-carrier kernels (CUDA-only at the moment). Dense
-tensors whose downstream op is dense-only (embedding lookup, RMSNorm gamma) are
-dequantised to the compute dtype on load.
+GGUF covers Qwen3 (model + tokenizer + config), T5 (model + tokenizer + config)
+and Whisper (tokenizer). BF16 weights load on every backend. On-disk quants
+(Q4_K / Q6_K / Q8_0) are kept in their original dtype and dispatched through
+brotensor's quant-carrier kernels, which exist on the CUDA backend only — a CPU
+build cannot run a quantised GGUF. Dense tensors whose downstream op is
+dense-only (embedding lookup, RMSNorm gamma) are dequantised to the compute dtype
+on load.
 
 A helper script pulls the smallest text-only Qwen3 in both BF16 and Q8_0:
 
@@ -107,76 +109,21 @@ scripts/download_qwen3_gguf.sh                              # unsloth/Qwen3-0.6B
 REPO=Qwen/Qwen3-1.7B-GGUF scripts/download_qwen3_gguf.sh    # different size
 ```
 
-## Qwen3.5-VL
+## Multimodal
 
-Qwen3.5-VL is the first multimodal model fully supported in brolm. The pipeline
-loads the official `Qwen/Qwen3.5-*` Hugging Face safetensors directly — no
-conversion step.
+**[Qwen3.5-VL](docs/qwen35-vl.md)** — image + text in, generated text out. Loads
+the official `Qwen/Qwen3.5-*` Hugging Face safetensors directly, with a 12-block
+ViT vision tower and a hybrid text backbone that interleaves full-attention layers
+with Gated DeltaNet linear-attention layers. `docs/qwen35-vl.md` covers the
+pipeline, the architecture, the weight download, and the CLI driver.
 
 ```cpp
 #include "brolm/qwen35_vl.h"
 
-brolm::qwen35::VLMConfig cfg;
-cfg.max_new_tokens = 64;
 brolm::qwen35::VLM vlm(cfg);
 vlm.load_from_directory("weights/Qwen3.5-0.8B");
-
-// (3, H, W) float pixels in [0, 1] — caller owns image decoding.
-brolm::qwen35::ImageInput img{ pixels.data(), H, W };
-
-const std::string prompt =
-    "<|im_start|>user\n"
-    "<|vision_start|><|image_pad|><|vision_end|>"
-    "Describe the image.<|im_end|>\n"
-    "<|im_start|>assistant\n";
-
 std::string out = vlm.generate(prompt, { img });
 ```
-
-Architecture notes:
-- **Vision tower** (`qwen35_vision.h`): 12-block ViT, learned 48×48 position
-  table bilinearly interpolated to the runtime patch grid, qkv + 2D rotary
-  attention, GELU-tanh MLP, patch merger that 2×2-shuffles to text hidden size.
-- **Hybrid text backbone** (`qwen35_text.h`): 24 layers in a `[L,L,L,F]×6`
-  schedule (read from `config.json`'s `layer_types`). Full-attention layers use
-  GQA (8 q-heads, 2 kv-heads), per-head q/k RMSNorm, partial M-RoPE (rotates
-  64/256 dims with `mrope_section=[11,11,10]` over (t,h,w)), and a sigmoid
-  attention-output gate. Linear-attention layers run the Gated DeltaNet
-  recurrence with a depthwise causal conv1d front-end. KV-cache for full layers;
-  recurrent + conv-shift state for linear layers.
-- **Preprocessor** (`qwen35_preprocessor.h`): mirrors HF
-  `Qwen2VLImageProcessorFast` — smart-resize to a multiple of `patch_size *
-  merge_size`, clamp to the min/max pixel budget, normalize with mean/std=0.5,
-  patchify in HF's exact merger-block-major order with the temporal axis
-  duplicated for static images, and emit per-token M-RoPE `(t, h, w)` streams
-  for the full image+text sequence.
-
-Weight download (requires `hf` CLI authenticated):
-
-```bash
-scripts/download_qwen35.sh           # Qwen/Qwen3.5-0.8B by default
-REPO=Qwen/Qwen3.5-2B scripts/download_qwen35.sh
-```
-
-An ad-hoc CLI driver under `tools/` runs the full pipeline against a real image
-file:
-
-```bash
-build/tools/Release/brolm_run_qwen35_image \
-    weights/Qwen3.5-0.8B path/to/image.png "Describe the image."
-```
-
-It decodes the image via broimage, area-resamples it down to a per-tool pixel
-cap (~512×512 by default — vision token count is linear in pixels and ViT
-attention cost quadratic in tokens), and prints the model's reply.
-
-Status: the unconditional CPU test suite passes, and the gated real-checkpoint
-suite loads the official 0.8B safetensors and runs every stage (config /
-tokenizer / preprocessor / vision tower / hybrid text prefill+decode parity /
-full VLM end-to-end) without NaN. Bit-exact numerical parity against HF `transformers`
-is not yet asserted — that's the remaining validation step before this is
-production-ready. The MTP head present in the checkpoint is loaded by the text
-model but not yet wired into a speculative-decoding pass.
 
 ## CI
 
