@@ -687,6 +687,9 @@ void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
     const int n_kv = cfg_.num_key_value_heads;
     const float eps = cfg_.rms_norm_eps;
 
+    namespace prof = profile;
+    using PStage   = profile::Stage;
+
     // Same per-head RMSNorm view trick as run_layers_ (QK-norm families only).
     auto headnorm = [&](const bt::Tensor& src, int num_heads,
                         const bt::Tensor& gain, bt::Tensor& dst) -> void {
@@ -700,15 +703,22 @@ void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
 
     for (Layer& layer : layers_) {
         // ── self-attention sub-layer (bidirectional) ──────────────────────
-        bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+        {
+            prof::ScopedStage ps(PStage::rms_norm);
+            bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+        }
 
-        detail::linear_batched(layer.Wq, /*bias=*/nullptr, norm_, q_);
-        detail::linear_batched(layer.Wk, /*bias=*/nullptr, norm_, k_);
-        detail::linear_batched(layer.Wv, /*bias=*/nullptr, norm_, v_);
+        {
+            prof::ScopedStage ps(PStage::qkv_proj);
+            detail::linear_batched(layer.Wq, /*bias=*/nullptr, norm_, q_);
+            detail::linear_batched(layer.Wk, /*bias=*/nullptr, norm_, k_);
+            detail::linear_batched(layer.Wv, /*bias=*/nullptr, norm_, v_);
+        }
 
         bt::Tensor* q_attn = &q_;
         bt::Tensor* k_attn = &k_;
         if (cfg_.use_qk_norm) {
+            prof::ScopedStage ps(PStage::qk_norm);
             headnorm(q_, n_q,  layer.q_norm, qn_);
             headnorm(k_, n_kv, layer.k_norm, kn_);
             q_attn = &qn_;
@@ -716,32 +726,63 @@ void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
         }
 
         // Encoder RoPE: positions restart at 0 (no cache), so seq_offset = 0.
-        bt::rope_forward(*q_attn, HD, n_q,  /*seq_offset=*/0, cfg_.rope_theta,
-                         *q_attn);
-        bt::rope_forward(*k_attn, HD, n_kv, /*seq_offset=*/0, cfg_.rope_theta,
-                         *k_attn);
+        {
+            prof::ScopedStage ps(PStage::rope);
+            bt::rope_forward(*q_attn, HD, n_q,  /*seq_offset=*/0, cfg_.rope_theta,
+                             *q_attn);
+            bt::rope_forward(*k_attn, HD, n_kv, /*seq_offset=*/0, cfg_.rope_theta,
+                             *k_attn);
+        }
 
         // Full (non-causal) grouped-query attention over all L keys — the one
         // deviation from run_layers_'s causal cached attention. n_kv-width K/V
         // feed straight in; the op maps query head h to KV head h/(n_q/n_kv).
-        bt::flash_attention_gqa_forward(*q_attn, *k_attn, v_, /*d_mask=*/nullptr,
-                                        n_q, n_kv, /*causal=*/false, attn_);
+        {
+            prof::ScopedStage ps(PStage::attention);
+            bt::flash_attention_gqa_forward(*q_attn, *k_attn, v_,
+                                            /*d_mask=*/nullptr, n_q, n_kv,
+                                            /*causal=*/false, attn_);
+        }
 
-        detail::linear_batched(layer.Wo, /*bias=*/nullptr, attn_, proj_);
-        bt::add_inplace(h_, proj_);
+        {
+            prof::ScopedStage ps(PStage::o_proj);
+            detail::linear_batched(layer.Wo, /*bias=*/nullptr, attn_, proj_);
+        }
+        {
+            prof::ScopedStage ps(PStage::residual_add);
+            bt::add_inplace(h_, proj_);
+        }
 
         // ── MLP sub-layer (SwiGLU) ────────────────────────────────────────
-        bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
-        detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, gate_);
-        detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, up_);
-        bt::silu_forward(gate_, gate_);
-        bt::mul_inplace(gate_, up_);
-        detail::linear_batched(layer.down_W, /*bias=*/nullptr, gate_, proj_);
-        bt::add_inplace(h_, proj_);
+        {
+            prof::ScopedStage ps(PStage::rms_norm);
+            bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
+        }
+        {
+            prof::ScopedStage ps(PStage::mlp_proj);
+            detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, gate_);
+            detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, up_);
+        }
+        {
+            prof::ScopedStage ps(PStage::swiglu);
+            bt::silu_forward(gate_, gate_);
+            bt::mul_inplace(gate_, up_);
+        }
+        {
+            prof::ScopedStage ps(PStage::mlp_proj);
+            detail::linear_batched(layer.down_W, /*bias=*/nullptr, gate_, proj_);
+        }
+        {
+            prof::ScopedStage ps(PStage::residual_add);
+            bt::add_inplace(h_, proj_);
+        }
     }
 
     // Final norm -> stable (L, hidden) hidden states for the caller (no lm_head).
-    bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+    {
+        prof::ScopedStage ps(PStage::final_norm);
+        bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+    }
     hidden_out = norm_.clone();
 }
 

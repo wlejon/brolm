@@ -29,12 +29,14 @@
 // Not run by ctest — driven by scripts/llm2vec_parity.sh.
 
 #include "brolm/llm2vec.h"
+#include "brolm/detail/profile.h"
 
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +123,7 @@ int main(int argc, char** argv) {
 
     std::string weights_dir, config_arg, weights_arg, prefix, ids_path, out_path;
     bool pool = false;
+    int iters = 1;
 
     for (int i = 1; i < argc; ++i) {
         auto next = [&](const char* flag) -> const char* {
@@ -138,6 +141,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--ids"))         ids_path    = next(a);
         else if (!std::strcmp(a, "--out"))         out_path    = next(a);
         else if (!std::strcmp(a, "--pool"))        pool        = true;
+        else if (!std::strcmp(a, "--iters"))       iters       = std::atoi(next(a));
         else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
             usage(argv[0]); return 0;
         } else {
@@ -191,20 +195,39 @@ int main(int argc, char** argv) {
         if (L == 0) throw std::runtime_error("ids file is empty");
         std::printf("[info] L=%d ids\n", L);
 
-        std::vector<float> host;
-        if (pool) {
-            bt::Tensor emb;
-            enc.encode_pooled(ids.data(), L, emb, /*pool_mask=*/nullptr);
-            host = download_f32(emb);
+        auto run_once = [&](bt::Tensor& out) {
+            if (pool) enc.encode_pooled(ids.data(), L, out, /*pool_mask=*/nullptr);
+            else      enc.encode(ids.data(), L, out);
+        };
+
+        bt::Tensor out;
+        run_once(out);       // warm-up (also the result we dump)
+        bt::sync_all();
+
+        if (iters > 1) {
+            // Timed loop: BROLM_PROFILE=1 adds the per-stage table.
+            brolm::detail::profile::reset();
+            using clk = std::chrono::steady_clock;
+            const auto t0 = clk::now();
+            for (int it = 0; it < iters; ++it) {
+                bt::Tensor tmp;
+                run_once(tmp);
+            }
+            bt::sync_all();
+            const double ms =
+                std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            std::printf("[bench] %d iters, L=%d: %.3f ms/forward (%.3f ms total)\n",
+                        iters, L, ms / iters, ms);
+            brolm::detail::profile::report();
+        }
+
+        std::vector<float> host = download_f32(out);
+        if (pool)
             std::printf("[info] pooled embedding: (%d,1) -> %zu floats\n",
                         cfg.hidden_size, host.size());
-        } else {
-            bt::Tensor hidden;
-            enc.encode(ids.data(), L, hidden);
-            host = download_f32(hidden);
+        else
             std::printf("[info] hidden states: (%d,%d) -> %zu floats\n",
                         L, cfg.hidden_size, host.size());
-        }
 
         write_f32(out_path, host);
         std::printf("[done] wrote %s (%zu floats)\n", out_path.c_str(),
