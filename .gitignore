@@ -15,3 +15,4 @@ compile_commands.json
 
 # Downloaded model weights and tokenizer files.
 weights/
+.parity/
