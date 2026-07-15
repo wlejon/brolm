@@ -1,10 +1,13 @@
 #include "brolm/qwen_tokenizer.h"
 
 #include "brolm/detail/byte_level_bpe.h"
+#include "brolm/detail/json.h"
 #include "brotensor/gguf.h"
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -227,6 +230,145 @@ Tokenizer Tokenizer::from_gguf(
 
     // Always make sure the Qwen3 ChatML specials and caller-supplied extras are
     // registered if they exist by name (some converters omit token_type).
+    std::vector<std::string> by_name = {
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>"};
+    by_name.insert(by_name.end(),
+                   extra_special_tokens.begin(), extra_special_tokens.end());
+    for (const auto& s : by_name) {
+        auto it = t.vocab_.find(s);
+        if (it == t.vocab_.end()) continue;
+        t.specials_.add(s, it->second);
+    }
+
+    auto lookup = [&](const char* s) -> int {
+        auto it = t.vocab_.find(s);
+        return it != t.vocab_.end() ? it->second : -1;
+    };
+    t.endoftext_id_ = lookup("<|endoftext|>");
+    t.im_start_id_  = lookup("<|im_start|>");
+    t.im_end_id_    = lookup("<|im_end|>");
+    return t;
+}
+
+namespace {
+
+namespace j = brolm::detail::json;
+
+std::string slurp_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error(
+        "qwen::Tokenizer::from_tokenizer_json: cannot open '" + path + "'");
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+}  // namespace
+
+Tokenizer Tokenizer::from_tokenizer_json(
+    const std::string& tokenizer_json_path,
+    const std::vector<std::string>& extra_special_tokens) {
+    Tokenizer t;
+    bpe::build_byte_unicode_maps(t.byte_to_unicode_, t.unicode_to_byte_);
+
+    j::Value root;
+    try {
+        root = j::parse(slurp_file(tokenizer_json_path));
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("qwen::Tokenizer::from_tokenizer_json: json parse: ") +
+            e.what());
+    }
+    if (!root.is_object()) {
+        throw std::runtime_error(
+            "qwen::Tokenizer::from_tokenizer_json: root is not a JSON object");
+    }
+
+    const j::Value* model = root.find("model");
+    if (!model || !model->is_object()) {
+        throw std::runtime_error(
+            "qwen::Tokenizer::from_tokenizer_json: missing 'model' object");
+    }
+
+    // model.vocab: { "token": id, ... }
+    const j::Value* vocab = model->find("vocab");
+    if (!vocab || !vocab->is_object()) {
+        throw std::runtime_error(
+            "qwen::Tokenizer::from_tokenizer_json: model.vocab is not an object "
+            "(not a byte-level BPE tokenizer.json)");
+    }
+    const auto& vocab_members = vocab->as_object();
+    t.vocab_.reserve(vocab_members.size());
+    for (const auto& [tok, idv] : vocab_members) {
+        if (!idv.is_number()) continue;
+        t.vocab_.emplace(tok, static_cast<int32_t>(idv.as_number()));
+    }
+
+    // model.merges: array of "a b" strings, or ["a","b"] pairs (newer HF).
+    // Lowest index = highest priority = lowest rank.
+    const j::Value* merges = model->find("merges");
+    if (merges && merges->is_array()) {
+        const auto& arr = merges->as_array();
+        t.merge_ranks_.reserve(arr.size());
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            std::string a, b;
+            if (arr[i].is_array()) {
+                const auto& pair = arr[i].as_array();
+                if (pair.size() != 2 || !pair[0].is_string() ||
+                    !pair[1].is_string()) {
+                    throw std::runtime_error(
+                        "qwen::Tokenizer::from_tokenizer_json: malformed "
+                        "model.merges pair entry");
+                }
+                a = pair[0].as_string();
+                b = pair[1].as_string();
+            } else if (arr[i].is_string()) {
+                const std::string& line = arr[i].as_string();
+                const auto sp = line.find(' ');
+                if (sp == std::string::npos) {
+                    throw std::runtime_error(
+                        "qwen::Tokenizer::from_tokenizer_json: malformed "
+                        "model.merges entry '" + line + "'");
+                }
+                a = line.substr(0, sp);
+                b = line.substr(sp + 1);
+            } else {
+                continue;
+            }
+            t.merge_ranks_.emplace(a + '\x01' + b, static_cast<int32_t>(i));
+        }
+    }
+
+    // added_tokens: [{ "id": N, "content": "<|...|>", "special": true }, ...].
+    // These carry the control specials (Llama-3's live at 128000..128255) that
+    // may not appear in model.vocab. Add each to the vocab so decode() renders
+    // it, and register the special-flagged ones as atomic specials.
+    if (const j::Value* at = root.find("added_tokens"); at && at->is_array()) {
+        for (const auto& tok : at->as_array()) {
+            if (!tok.is_object()) continue;
+            const j::Value* content = tok.find("content");
+            const j::Value* idv = tok.find("id");
+            if (!content || !content->is_string() || !idv || !idv->is_number()) {
+                continue;
+            }
+            const std::string& s = content->as_string();
+            const int32_t id = static_cast<int32_t>(idv->as_number());
+            t.vocab_[s] = id;
+            bool special = true;  // added_tokens default to special in HF
+            if (const j::Value* sp = tok.find("special"); sp && sp->is_bool()) {
+                special = sp->as_bool();
+            }
+            if (special) t.specials_.add(s, id);
+        }
+    }
+
+    for (const auto& [tok, id] : t.vocab_) {
+        t.id_to_token_.emplace(id, tok);
+    }
+
+    // Caller extras + Qwen built-ins (registered only if present in the vocab;
+    // for a Llama-3 tokenizer.json none of the Qwen names exist, so these are
+    // no-ops and the accessor ids stay -1).
     std::vector<std::string> by_name = {
         "<|endoftext|>", "<|im_start|>", "<|im_end|>"};
     by_name.insert(by_name.end(),

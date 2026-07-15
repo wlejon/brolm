@@ -61,6 +61,23 @@ public:
         const brotensor::gguf::File& f,
         const std::vector<std::string>& extra_special_tokens = {});
 
+    // Build a tokenizer from a Hugging Face unified `tokenizer.json` (the
+    // "fast"/`tokenizers` container). Reads the byte-level-BPE model block:
+    //   model.vocab   — object { "token": id, ... }
+    //   model.merges  — array of "a b" strings, or ["a","b"] pairs (newer HF)
+    //   added_tokens  — array of { "id", "content", "special" }; each is added
+    //                   to the vocab and, when "special" is true (the default),
+    //                   registered as an atomic special matched before BPE.
+    // This is the same GPT-2 byte-level BPE as load(); only the container
+    // differs. Models that ship a single tokenizer.json instead of the
+    // vocab.json + merges.txt pair — Llama-3 among them — load through here.
+    // `extra_special_tokens` are registered in addition to the added_tokens
+    // specials, if present in the vocab. Throws std::runtime_error on I/O or
+    // parse failure, or if the model block is not a byte-level BPE.
+    static Tokenizer from_tokenizer_json(
+        const std::string& tokenizer_json_path,
+        const std::vector<std::string>& extra_special_tokens = {});
+
     // Encode `text` into int32 token IDs via byte-level BPE. Substrings that
     // exactly match a registered special token are emitted atomically as that
     // token's single id; the text around them is BPE-encoded normally.

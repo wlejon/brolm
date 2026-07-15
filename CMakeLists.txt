@@ -132,6 +132,7 @@ target_sources(brolm PRIVATE
     src/nllb_beam.cpp
     src/nllb.cpp
     src/qwen_tokenizer.cpp
+    src/llama3_tokenizer.cpp
     src/gemma_tokenizer.cpp
     src/mistral_tokenizer.cpp
     src/mistral3_config.cpp
