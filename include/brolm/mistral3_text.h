@@ -24,7 +24,7 @@
 //
 // GGUF: deferred. Mistral 3.1 (`mistral3` / Pixtral) needs its own verified
 // ggml tensor-name map before a gguf path is wired; HF safetensors is the load
-// path today, matching brolm's no-offline-conversion convention.
+// path today, and Mistral loads with no conversion step.
 
 #include "brolm/detail/dense_decoder.h"
 #include "brolm/mistral3_config.h"

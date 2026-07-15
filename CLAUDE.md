@@ -96,15 +96,22 @@ and `tests/CMakeLists.txt`).
 
 ## Conventions
 
-- **C++20, pure C++.** No Python anywhere in this stack — not for scripts, not
-  for validation, not for weight conversion. Shell or C++ only.
+- **C++20 runtime + build.** The library, its tests, and its validation are
+  pure C++ (shell for glue). The one exception is **offline weight-prep**: like
+  the other siblings (`brosoundml/scripts/convert-*.py`,
+  `brovisionml/scripts/convert-*.py`), one-off HF→brolm conversion / adapter-merge
+  scripts live in `scripts/` as Python and are never invoked at build or run time
+  — they produce a checkpoint the C++ loaders then read directly.
 - **No CUDA/Metal in this repo.** GPU paths must go through brotensor ops; if a
   kernel is missing, add it to brotensor.
 - **Tokenizers share `brolm::detail::bpe`.** New byte-level-BPE families should
   reuse it and add only their pre-tokenization regex and special-token table.
-- **Load HF safetensors directly** — no offline conversion step. Tokenizers
-  read `vocab.json` + `merges.txt` (or `tokenizer.json`); models read the
-  sharded safetensors + `config.json` from a directory. `.gguf` checkpoints
+- **Loaders read HF checkpoints directly.** Tokenizers read `vocab.json` +
+  `merges.txt` (or `tokenizer.json`); models read the sharded safetensors +
+  `config.json` from a directory. Most families load with no conversion; when a
+  checkpoint ships in a form the loaders can't consume as-is (e.g. LoRA adapters
+  that must be merged into the base weights), a `scripts/convert-*.py` prepares a
+  merged checkpoint offline and the C++ loader reads that. `.gguf` checkpoints
   (llama.cpp format) load through the same model classes via `from_gguf` /
   `load_weights(gguf::File)`; both containers go through the
   `brolm::detail::weights::Source` adapter so loaders stay format-agnostic.

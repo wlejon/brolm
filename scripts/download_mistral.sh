@@ -66,7 +66,7 @@ mkdir -p "${DEST}"
 if [ "${FULL}" = "1" ]; then
     # Whole repo: safetensors shards, model.safetensors.index.json, config.json,
     # and the tokenizer (tekken.json + the json configs). brolm's loaders consume
-    # the safetensors shards plus tekken.json directly — no offline conversion.
+    # the safetensors shards plus tekken.json directly — Mistral needs no conversion.
     hf download "${REPO}" --local-dir "${DEST}"
 else
     # Tokenizer milestone only needs tekken.json; the rest are small and handy
