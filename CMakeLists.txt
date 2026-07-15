@@ -144,6 +144,7 @@ target_sources(brolm PRIVATE
     src/whisper_tokenizer.cpp
     src/clip.cpp
     src/t5.cpp
+    src/llm2vec.cpp
     src/qwen.cpp
     src/qwen_generate.cpp
     src/clip_image.cpp

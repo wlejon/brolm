@@ -293,6 +293,22 @@ void DenseDecoder::forward_last(const int32_t* ids, int L,
                 /*logits_last_row_only=*/true);
 }
 
+void DenseDecoder::forward_encode(const int32_t* ids, int L,
+                                  bt::Tensor& hidden_out) {
+    if (!ids) fail("forward_encode: ids pointer is null");
+    if (L <= 0) fail("forward_encode: L must be positive");
+    if (embed_tokens_.size() == 0) fail("forward_encode: weights not loaded");
+
+    // Embedding lookup -> own a stable residual stream in h_. No KV cache: the
+    // bidirectional stack attends the whole L-token window in one shot.
+    ids_dev_ = make_idx_device(ids, L);
+    bt::embedding_lookup_forward(
+        embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
+    h_ = h_.clone();
+
+    run_layers_encode_(L, hidden_out);
+}
+
 void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
                                   bt::Tensor& logits_out,
                                   bt::Tensor* hidden_out) {
@@ -662,6 +678,71 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
     }
 
     cache_len_ += L;
+}
+
+void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
+    (void)L;  // attention length is implicit in the tensor row counts.
+    const int HD   = cfg_.head_dim;
+    const int n_q  = cfg_.num_attention_heads;
+    const int n_kv = cfg_.num_key_value_heads;
+    const float eps = cfg_.rms_norm_eps;
+
+    // Same per-head RMSNorm view trick as run_layers_ (QK-norm families only).
+    auto headnorm = [&](const bt::Tensor& src, int num_heads,
+                        const bt::Tensor& gain, bt::Tensor& dst) -> void {
+        const int rows = src.rows;
+        bt::Tensor src_v = bt::Tensor::view(
+            src.device, src.data, rows * num_heads, HD, src.dtype);
+        bt::rms_norm_forward(src_v, gain, eps, dst);
+        dst.rows = rows;
+        dst.cols = num_heads * HD;
+    };
+
+    for (Layer& layer : layers_) {
+        // ── self-attention sub-layer (bidirectional) ──────────────────────
+        bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+
+        detail::linear_batched(layer.Wq, /*bias=*/nullptr, norm_, q_);
+        detail::linear_batched(layer.Wk, /*bias=*/nullptr, norm_, k_);
+        detail::linear_batched(layer.Wv, /*bias=*/nullptr, norm_, v_);
+
+        bt::Tensor* q_attn = &q_;
+        bt::Tensor* k_attn = &k_;
+        if (cfg_.use_qk_norm) {
+            headnorm(q_, n_q,  layer.q_norm, qn_);
+            headnorm(k_, n_kv, layer.k_norm, kn_);
+            q_attn = &qn_;
+            k_attn = &kn_;
+        }
+
+        // Encoder RoPE: positions restart at 0 (no cache), so seq_offset = 0.
+        bt::rope_forward(*q_attn, HD, n_q,  /*seq_offset=*/0, cfg_.rope_theta,
+                         *q_attn);
+        bt::rope_forward(*k_attn, HD, n_kv, /*seq_offset=*/0, cfg_.rope_theta,
+                         *k_attn);
+
+        // Full (non-causal) grouped-query attention over all L keys — the one
+        // deviation from run_layers_'s causal cached attention. n_kv-width K/V
+        // feed straight in; the op maps query head h to KV head h/(n_q/n_kv).
+        bt::flash_attention_gqa_forward(*q_attn, *k_attn, v_, /*d_mask=*/nullptr,
+                                        n_q, n_kv, /*causal=*/false, attn_);
+
+        detail::linear_batched(layer.Wo, /*bias=*/nullptr, attn_, proj_);
+        bt::add_inplace(h_, proj_);
+
+        // ── MLP sub-layer (SwiGLU) ────────────────────────────────────────
+        bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
+        detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, gate_);
+        detail::linear_batched(layer.up_W,   /*bias=*/nullptr, norm_, up_);
+        bt::silu_forward(gate_, gate_);
+        bt::mul_inplace(gate_, up_);
+        detail::linear_batched(layer.down_W, /*bias=*/nullptr, gate_, proj_);
+        bt::add_inplace(h_, proj_);
+    }
+
+    // Final norm -> stable (L, hidden) hidden states for the caller (no lm_head).
+    bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+    hidden_out = norm_.clone();
 }
 
 }  // namespace brolm::detail

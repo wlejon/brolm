@@ -154,6 +154,20 @@ public:
                         brotensor::Tensor& logits_out,
                         brotensor::Tensor* hidden_out = nullptr);
 
+    // Bidirectional, cacheless prefill for ENCODER use. LLM2Vec turns this
+    // LLaMA-family decoder into a text encoder by dropping the causal mask;
+    // forward_encode embeds the L tokens, runs every layer with FULL grouped-
+    // query attention (flash_attention_gqa_forward, causal=false, no KV cache,
+    // RoPE positions from 0), and writes `hidden_out` := (L, hidden_size)
+    // post-final-norm hidden states — the contextualised per-token embeddings a
+    // pooling stage reduces to a sentence vector. lm_head is never run and
+    // allocate_cache is NOT required; the KV cache is untouched. Reuses the same
+    // RoPE / RMSNorm / SwiGLU / projection ops as forward() — only the attention
+    // call and the absence of the cache differ. Encodes one sequence at a time
+    // (no padding mask); batching/padding is a caller concern.
+    void forward_encode(const int32_t* ids, int L,
+                        brotensor::Tensor& hidden_out);
+
     const DenseDecoderConfig& config() const { return cfg_; }
 
 private:
@@ -179,6 +193,13 @@ private:
     void run_layers_(int L, brotensor::Tensor& logits_out,
                      brotensor::Tensor* hidden_out,
                      bool logits_last_row_only = false);
+
+    // Bidirectional (non-causal), cacheless layer stack for forward_encode.
+    // Mirrors run_layers_'s per-layer math but attends all L keys via
+    // flash_attention_gqa_forward (causal=false) with no KV cache, and writes
+    // the (L, hidden_size) post-final-norm hidden states to `hidden_out` (no
+    // lm_head). h_ holds the L-row residual stream on entry.
+    void run_layers_encode_(int L, brotensor::Tensor& hidden_out);
 
     // Graph-captured single-token decode (CUDA only). try_graph_step_ runs
     // one forward_last(ids, 1, ...) step through the captured session and
