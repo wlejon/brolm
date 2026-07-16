@@ -83,37 +83,67 @@ def main() -> int:
     ap.add_argument("--out", default="weights/llm2vec-llama3-8b")
     ap.add_argument("--mntp", default=_DEF_MNTP)
     ap.add_argument("--supervised", default=None)
+    ap.add_argument("--local-dir", default=None,
+                    help="offline merge: a dir holding base/ mntp/ supervised/ "
+                         "(from scripts/download-llm2vec.sh). Uses peft directly, "
+                         "no llm2vec package and no gated repo.")
     ap.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
     ap.add_argument("--dump-keys", action="store_true")
     args = ap.parse_args()
 
-    supervised = args.supervised or (args.mntp + "-supervised"
-                                     if args.mntp == _DEF_MNTP else None)
-    if supervised is None:
-        ap.error("--supervised is required when --mntp is not the default")
-
-    try:
-        from llm2vec import LLM2Vec
-    except ImportError:
-        print("error: the 'llm2vec' package is required (pip install llm2vec)",
-              file=sys.stderr)
-        return 1
-
     dtype = _DTYPES[args.dtype]
+    tok_src = args.mntp  # where the tokenizer is loaded from at the end
 
-    # Assemble base + MNTP (merged inside from_pretrained) + supervised adapter.
-    print(f"loading {args.mntp}\n     + {supervised}", flush=True)
-    l2v = LLM2Vec.from_pretrained(
-        args.mntp,
-        peft_model_name_or_path=supervised,
-        device_map="cpu",
-        torch_dtype=dtype,
-    )
-    model = l2v.model
-    # Fold the still-attached supervised LoRA into the base weights.
-    if hasattr(model, "merge_and_unload"):
-        print("merging supervised adapter...", flush=True)
-        model = model.merge_and_unload()
+    if args.local_dir:
+        # ── Offline peft-only stack: base + MNTP + supervised, all local ──
+        # This is the ungated path. The llm2vec package pins an old transformers
+        # and monkeypatches attention; we don't need it — merging LoRA deltas is
+        # pure peft (W += B@A), and the bidirectional-attention change is applied
+        # at inference by the C++ encoder, not baked into the weights.
+        from pathlib import Path as _P
+        root = _P(args.local_dir)
+        base_dir, mntp_dir, sup_dir = root / "base", root / "mntp", root / "supervised"
+        for d in (base_dir, mntp_dir, sup_dir):
+            if not d.is_dir():
+                ap.error(f"--local-dir missing subdir: {d}")
+        tok_src = str(base_dir)
+
+        from transformers import AutoModel
+        from peft import PeftModel
+
+        print(f"loading base {base_dir}", flush=True)
+        model = AutoModel.from_pretrained(str(base_dir), torch_dtype=dtype)
+        print(f"applying + merging MNTP adapter {mntp_dir}", flush=True)
+        model = PeftModel.from_pretrained(model, str(mntp_dir)).merge_and_unload()
+        print(f"applying + merging supervised adapter {sup_dir}", flush=True)
+        model = PeftModel.from_pretrained(model, str(sup_dir)).merge_and_unload()
+    else:
+        supervised = args.supervised or (args.mntp + "-supervised"
+                                         if args.mntp == _DEF_MNTP else None)
+        if supervised is None:
+            ap.error("--supervised is required when --mntp is not the default")
+
+        try:
+            from llm2vec import LLM2Vec
+        except ImportError:
+            print("error: the 'llm2vec' package is required (pip install "
+                  "llm2vec), or use --local-dir for the offline peft path",
+                  file=sys.stderr)
+            return 1
+
+        # Assemble base + MNTP (merged inside from_pretrained) + supervised.
+        print(f"loading {args.mntp}\n     + {supervised}", flush=True)
+        l2v = LLM2Vec.from_pretrained(
+            args.mntp,
+            peft_model_name_or_path=supervised,
+            device_map="cpu",
+            torch_dtype=dtype,
+        )
+        model = l2v.model
+        # Fold the still-attached supervised LoRA into the base weights.
+        if hasattr(model, "merge_and_unload"):
+            print("merging supervised adapter...", flush=True)
+            model = model.merge_and_unload()
 
     sd = model.state_dict()
 
@@ -164,7 +194,7 @@ def main() -> int:
     # Tokenizer — the base Llama-3 BPE (tokenizer.json + specials).
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(args.mntp)
+        tok = AutoTokenizer.from_pretrained(tok_src)
         tok.save_pretrained(out)
         print(f"wrote tokenizer to {out}", flush=True)
     except Exception as e:  # noqa: BLE001 - tokenizer is convenience, not fatal
