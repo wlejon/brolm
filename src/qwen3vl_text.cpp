@@ -3,6 +3,7 @@
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
 #include "brolm/detail/weights.h"
+#include "brotensor/gguf.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
@@ -139,6 +140,113 @@ std::vector<T> permute_rotary_rows(const std::vector<T>& src,
     return dst;
 }
 
+// ── GGUF (llama.cpp) tensor-name map for the Qwen3-VL text backbone ─────────
+//
+// Maps the bare HF names this loader emits (no "model.language_model." prefix)
+// to their ggml counterparts. Same convention as qwen.cpp's qwen3_hf_to_ggml,
+// minus the leading "model." (that path prefixes with "model."; here the
+// prefix is stripped before the call). Empty return = "no such mapping".
+std::string qwen3vl_hf_to_ggml(std::string_view hf) {
+    if (hf == "embed_tokens.weight") return "token_embd.weight";
+    if (hf == "norm.weight")         return "output_norm.weight";
+    if (hf == "lm_head.weight")      return "output.weight";
+
+    constexpr std::string_view kPfx = "layers.";
+    if (hf.size() < kPfx.size() || hf.compare(0, kPfx.size(), kPfx) != 0) {
+        return {};
+    }
+    const auto dot = hf.find('.', kPfx.size());
+    if (dot == std::string_view::npos) return {};
+    const std::string_view idx  = hf.substr(kPfx.size(), dot - kPfx.size());
+    const std::string_view tail = hf.substr(dot + 1);
+
+    auto blk = [&](std::string_view suffix) -> std::string {
+        std::string out;
+        out.reserve(4 + idx.size() + 1 + suffix.size());
+        out.append("blk.");
+        out.append(idx);
+        out.push_back('.');
+        out.append(suffix);
+        return out;
+    };
+
+    if (tail == "self_attn.q_proj.weight")         return blk("attn_q.weight");
+    if (tail == "self_attn.k_proj.weight")         return blk("attn_k.weight");
+    if (tail == "self_attn.v_proj.weight")         return blk("attn_v.weight");
+    if (tail == "self_attn.o_proj.weight")         return blk("attn_output.weight");
+    if (tail == "self_attn.q_norm.weight")         return blk("attn_q_norm.weight");
+    if (tail == "self_attn.k_norm.weight")         return blk("attn_k_norm.weight");
+    if (tail == "input_layernorm.weight")          return blk("attn_norm.weight");
+    if (tail == "post_attention_layernorm.weight") return blk("ffn_norm.weight");
+    if (tail == "mlp.gate_proj.weight")            return blk("ffn_gate.weight");
+    if (tail == "mlp.up_proj.weight")              return blk("ffn_up.weight");
+    if (tail == "mlp.down_proj.weight")            return blk("ffn_down.weight");
+    return {};
+}
+
+// Load a q_proj / k_proj weight from a gguf shard set and permute its output
+// rows from HF (rotate_half) layout into brotensor's interleaved-pair M-RoPE
+// layout — the exact permutation permute_rotary_rows() applies on the
+// safetensors path, but done byte-wise so a quant carrier (Q8_0 …) survives
+// untouched. Each output row is `head_dim`-grouped per head; a row is
+// self-contained (its `in` weights are contiguous, quant blocks run along the
+// contiguous `in` axis), so reordering whole rows is dtype-agnostic. Dense
+// gguf q/k (rare) fall back to the fp32 host-roundtrip path.
+void upload_qk_mrope_gguf(const std::vector<const bt::gguf::File*>& shards,
+                          const std::string& ggml_name, int out, int in,
+                          int num_heads, int head_dim, int rd,
+                          int d_t, int d_h, int d_w, bt::Tensor& dst) {
+    const bt::gguf::TensorInfo* info = nullptr;
+    for (const bt::gguf::File* f : shards) {
+        if ((info = f->find_tensor(ggml_name)) != nullptr) break;
+    }
+    if (info == nullptr) fail("missing gguf tensor '" + ggml_name + "'");
+    if (info->numel != static_cast<int64_t>(out) * static_cast<int64_t>(in)) {
+        fail("gguf tensor '" + ggml_name + "': shape mismatch (expected " +
+             std::to_string(out) + "x" + std::to_string(in) + ")");
+    }
+    if (out != num_heads * head_dim) {
+        fail("gguf q/k '" + ggml_name + "': rows != num_heads*head_dim");
+    }
+
+    // brolm_to_hf[b] == the HF source row for interleaved dst row b (per head).
+    const std::vector<int> brolm_to_hf = rotary_row_perm(rd, d_t, d_h, d_w);
+
+    if (bt::dtype_is_quant(info->dtype)) {
+        if (in % bt::dtype_block_size(info->dtype) != 0) {
+            fail("gguf q/k '" + ggml_name + "': in-dim not a multiple of the "
+                 "quant block size");
+        }
+        const std::size_t bpr = static_cast<std::size_t>(
+            bt::dtype_storage_bytes(info->dtype, static_cast<int64_t>(in)));
+        std::vector<std::uint8_t> permuted(info->nbytes);
+        for (int h = 0; h < num_heads; ++h) {
+            const std::size_t base =
+                static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim) * bpr;
+            for (int b = 0; b < head_dim; ++b) {
+                const int src_row = (b < rd) ? brolm_to_hf[static_cast<std::size_t>(b)] : b;
+                std::memcpy(permuted.data() + base + static_cast<std::size_t>(b) * bpr,
+                            info->data + base + static_cast<std::size_t>(src_row) * bpr,
+                            bpr);
+            }
+        }
+        bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, out, in, info->dtype);
+        if (cpu.bytes() != info->nbytes) fail("gguf q/k '" + ggml_name + "': byte-size mismatch");
+        std::memcpy(cpu.host_raw_mut(), permuted.data(), info->nbytes);
+        const bt::Device target = bt::default_device();
+        dst = (target == bt::Device::CPU) ? std::move(cpu) : cpu.to(target);
+        return;
+    }
+
+    // Dense gguf q/k: upload raw to the compute dtype, then fp32-permute.
+    bt::Tensor raw;
+    bt::gguf::upload_raw(*info, out, in, raw);
+    std::vector<float> perm =
+        permute_rotary_rows(download_fp32(raw), num_heads, head_dim, rd, in,
+                            d_t, d_h, d_w);
+    dst = brolm::detail::upload_host(perm.data(), out, in);
+}
+
 void build_axis_tables(int max_pos_inclusive, int d_axis, int rotary_dim,
                        float rope_theta,
                        const std::vector<int>& freq_indices,
@@ -240,6 +348,90 @@ void TextModel::load_weights(const st::File& f, const std::string& prefix) {
 void TextModel::load_weights(const std::vector<const st::File*>& shards,
                              const std::string& prefix) {
     load_weights_impl_(shards, prefix);
+}
+
+void TextModel::load_weights(const bt::gguf::File& f) {
+    const std::vector<const bt::gguf::File*> shards = {&f};
+    load_weights_gguf_impl_(shards);
+}
+
+void TextModel::load_weights(const std::vector<const bt::gguf::File*>& shards) {
+    load_weights_gguf_impl_(shards);
+}
+
+void TextModel::load_weights_gguf_impl_(
+    const std::vector<const bt::gguf::File*>& shards) {
+    if (shards.empty()) fail("load_weights: no gguf shards");
+
+    const int V    = cfg_.vocab_size;
+    const int H    = cfg_.hidden_size;
+    const int Fm   = cfg_.intermediate_size;
+    const int HD   = cfg_.head_dim;
+    const int rd   = cfg_.rotary_dim();   // == HD (full rotation)
+    const int n_q  = cfg_.num_attention_heads;
+    const int n_kv = cfg_.num_key_value_heads;
+    const int q_dim  = n_q  * HD;
+    const int kv_dim = n_kv * HD;
+
+    // Source over the gguf shards, mapping bare HF names → ggml names.
+    const detail::weights::GgufSource src(
+        shards, [](std::string_view n) { return qwen3vl_hf_to_ggml(n); });
+
+    // Embeddings must be dense (the embedding gather / tied lm_head matmul
+    // don't read a quant carrier) — dequant Q8_0 → compute dtype.
+    src.upload_compute_dequant("embed_tokens.weight", V, H, embed_,
+                               "embed_tokens.weight");
+    src.upload_compute_dequant("norm.weight", H, 1, final_norm_, "norm.weight");
+
+    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        const std::string pl = "layers." + std::to_string(i) + ".";
+        LayerSlot& L = layers_[static_cast<std::size_t>(i)];
+
+        src.upload_compute_dequant(pl + "input_layernorm.weight", H, 1,
+                                   L.in_norm, "input_layernorm.weight");
+        src.upload_compute_dequant(pl + "post_attention_layernorm.weight", H, 1,
+                                   L.post_attn_norm, "post_attention_layernorm.weight");
+
+        // Non-rotary linears: keep the on-disk quant carrier (the quant matmul
+        // dispatches on it); the QWeight INT8 slots stay empty (inactive).
+        src.upload_compute_checked(pl + "mlp.gate_proj.weight", Fm, H, L.gate_W,
+                                   "mlp.gate_proj.weight");
+        src.upload_compute_checked(pl + "mlp.up_proj.weight",   Fm, H, L.up_W,
+                                   "mlp.up_proj.weight");
+        src.upload_compute_checked(pl + "mlp.down_proj.weight", H, Fm, L.down_W,
+                                   "mlp.down_proj.weight");
+        src.upload_compute_checked(pl + "self_attn.v_proj.weight", kv_dim, H,
+                                   L.Wv, "v_proj.weight");
+        src.upload_compute_checked(pl + "self_attn.o_proj.weight", H, q_dim,
+                                   L.Wo, "o_proj.weight");
+
+        // q/k: M-RoPE row permute on the (quant) carrier.
+        upload_qk_mrope_gguf(shards, qwen3vl_hf_to_ggml(pl + "self_attn.q_proj.weight"),
+                             q_dim, H, n_q, HD, rd, d_t_, d_h_, d_w_, L.Wq);
+        upload_qk_mrope_gguf(shards, qwen3vl_hf_to_ggml(pl + "self_attn.k_proj.weight"),
+                             kv_dim, H, n_kv, HD, rd, d_t_, d_h_, d_w_, L.Wk);
+
+        // Per-head QK-norms: dense (F32 in gguf), permuted like q/k rows.
+        bt::Tensor qn_raw, kn_raw;
+        src.upload_compute_dequant(pl + "self_attn.q_norm.weight", HD, 1, qn_raw,
+                                   "self_attn.q_norm.weight");
+        src.upload_compute_dequant(pl + "self_attn.k_norm.weight", HD, 1, kn_raw,
+                                   "self_attn.k_norm.weight");
+        std::vector<float> qn_perm =
+            permute_rotary_rows(download_fp32(qn_raw), /*num_heads=*/1, HD, rd, 1,
+                               d_t_, d_h_, d_w_);
+        std::vector<float> kn_perm =
+            permute_rotary_rows(download_fp32(kn_raw), /*num_heads=*/1, HD, rd, 1,
+                               d_t_, d_h_, d_w_);
+        L.q_norm = brolm::detail::upload_host(qn_perm.data(), HD, 1);
+        L.k_norm = brolm::detail::upload_host(kn_perm.data(), HD, 1);
+    }
+
+    if (!cfg_.tie_word_embeddings) {
+        // Untied head lives at the gguf root as "output.weight".
+        src.upload_compute_checked("lm_head.weight", V, H, lm_head_,
+                                   "lm_head.weight");
+    }
 }
 
 void TextModel::load_weights_impl_(

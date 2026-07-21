@@ -60,6 +60,7 @@
 #include <vector>
 
 namespace brotensor::safetensors { class File; struct TensorView; }
+namespace brotensor::gguf { class File; }
 
 namespace brolm::qwen3vl {
 
@@ -107,6 +108,19 @@ public:
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "model.language_model.");
+
+    // GGUF overloads. Loads the same Qwen3-VL text backbone from a llama.cpp
+    // .gguf checkpoint (tensor names `token_embd.weight`, `output_norm.weight`,
+    // `blk.N.{attn_q,attn_k,attn_v,attn_output,attn_q_norm,attn_k_norm,
+    // attn_norm,ffn_norm,ffn_gate,ffn_up,ffn_down}.weight`). Quantized linears
+    // (Q8_0 / Q4_K / Q6_K) keep their on-disk carrier and dispatch a quant
+    // matmul; embeddings and norms are dequantized to the compute dtype. The
+    // config is NOT read from the gguf — it must already match this TextModel's
+    // Qwen3VLConfig::Text (shapes are checked per tensor). Quant carriers need
+    // FP16 compute (GPU); throws on the CPU backend. `Qwen3VLConfig::Text::
+    // quantize_weights` is ignored (the gguf already carries its own quant).
+    void load_weights(const brotensor::gguf::File& f);
+    void load_weights(const std::vector<const brotensor::gguf::File*>& shards);
 
     // Allocate the per-layer K/V cache for sequences up to `max_seq` tokens.
     std::vector<LayerCache> make_cache(int max_seq) const;
@@ -208,6 +222,8 @@ private:
 
     void load_weights_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
                             const std::string& prefix);
+    void load_weights_gguf_impl_(
+        const std::vector<const brotensor::gguf::File*>& shards);
 
     // Stage the M-RoPE position streams + per-axis sin/cos tables for this
     // forward call.
