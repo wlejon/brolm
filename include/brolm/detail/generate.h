@@ -72,6 +72,34 @@ struct GenerateOptions {
 // eos token is NOT included in the returned vector. A negative `eos_id`
 // disables EOS stopping regardless of `stop_on_eos`.
 //
+#include <atomic>
+#include <stdexcept>
+#include <type_traits>
+
+template <class Model>
+struct ModelGateGuard {
+    std::atomic<bool>* flag_ = nullptr;
+    bool claimed_ = false;
+
+    template <class M, class = std::void_t<decltype(std::declval<M&>().busy)>>
+    explicit ModelGateGuard(M& m, int) : flag_(&m.busy) {
+        bool expected = false;
+        if (!flag_->compare_exchange_strong(expected, true)) {
+            throw std::runtime_error("brolm: single-owner precondition violated - model operation already in progress");
+        }
+        claimed_ = true;
+    }
+
+    template <class M>
+    explicit ModelGateGuard(M&, ...) {}
+
+    ~ModelGateGuard() {
+        if (claimed_ && flag_) {
+            flag_->store(false, std::memory_order_release);
+        }
+    }
+};
+
 // Empty prompt: the model requires L >= 1 per forward, so generation cannot be
 // primed and an empty vector is returned. `max_new_tokens <= 0` likewise
 // returns an empty vector.
@@ -80,6 +108,7 @@ std::vector<int32_t> generate(Model& model,
                               const std::vector<int32_t>& prompt_ids,
                               int eos_id,
                               const GenerateOptions& opts) {
+    ModelGateGuard<Model> gateGuard(model, 0);
     std::vector<int32_t> generated;
 
     // The model requires L >= 1 per forward, so an empty prompt cannot prime
