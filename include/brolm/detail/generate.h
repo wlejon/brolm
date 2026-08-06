@@ -17,9 +17,13 @@
 
 #include "brotensor/tensor.h"
 
+#include <atomic>
 #include <cstdint>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace brolm::detail {
@@ -60,22 +64,11 @@ struct GenerateOptions {
     bool           stop_on_eos    = true;  // stop when eos_id is sampled
 };
 
-// Autoregressive generation over any model exposing `config().vocab_size`,
-// `allocate_cache(int)`, and `forward_last(const int32_t*, int, Tensor&)`.
-// Sizes + resets the model's KV-cache for (prompt + max_new_tokens), prefills
-// `prompt_ids` in one forward, then decodes token by token. forward_last is
-// used throughout: the sampler only ever consumes the final token's logits,
-// so the lm_head matmul over the prompt's intermediate rows is skipped.
-// Returns ONLY the newly generated ids (prompt excluded).
-//
-// When `stop_on_eos`, generation halts as soon as `eos_id` is sampled, and the
-// eos token is NOT included in the returned vector. A negative `eos_id`
-// disables EOS stopping regardless of `stop_on_eos`.
-//
-#include <atomic>
-#include <stdexcept>
-#include <type_traits>
-
+// Single-owner gate for a decode call. The loop below drives the model's
+// KV-cache in place, so two overlapping calls on one model would interleave
+// writes into the same cache. Models that expose a `busy` flag claim it for the
+// duration and throw on a second claim; models without one select the variadic
+// overload and the guard is inert.
 template <class Model>
 struct ModelGateGuard {
     std::atomic<bool>* flag_ = nullptr;
@@ -100,6 +93,18 @@ struct ModelGateGuard {
     }
 };
 
+// Autoregressive generation over any model exposing `config().vocab_size`,
+// `allocate_cache(int)`, and `forward_last(const int32_t*, int, Tensor&)`.
+// Sizes + resets the model's KV-cache for (prompt + max_new_tokens), prefills
+// `prompt_ids` in one forward, then decodes token by token. forward_last is
+// used throughout: the sampler only ever consumes the final token's logits,
+// so the lm_head matmul over the prompt's intermediate rows is skipped.
+// Returns ONLY the newly generated ids (prompt excluded).
+//
+// When `stop_on_eos`, generation halts as soon as `eos_id` is sampled, and the
+// eos token is NOT included in the returned vector. A negative `eos_id`
+// disables EOS stopping regardless of `stop_on_eos`.
+//
 // Empty prompt: the model requires L >= 1 per forward, so generation cannot be
 // primed and an empty vector is returned. `max_new_tokens <= 0` likewise
 // returns an empty vector.
