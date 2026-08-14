@@ -23,6 +23,7 @@
 // no sliding window, NO QK-norm, and an UNTIED lm_head (HF Mistral defaults
 // `tie_word_embeddings` to false; the key is absent from the config).
 
+#include "brotensor/tensor.h"
 #include <string>
 #include <vector>
 
@@ -53,6 +54,9 @@ struct Mistral3Config {
         // by the decoder today.
         bool  has_sliding_window    = false;
         int   sliding_window        = 0;
+
+        // Multi-device pipeline parallelism (empty = default single-device).
+        std::vector<brotensor::Device> pipeline_devices;
     } text;
 
     // ── vision_config (Pixtral ViT tower) ───────────────────────────────────

@@ -79,6 +79,10 @@ struct DenseDecoderConfig {
     float rope_theta          = 1000000.0f;
     bool  use_qk_norm         = false;  // Qwen3: true; Mistral 3: false
     bool  tie_word_embeddings = true;
+
+    // Multi-device pipeline parallelism (empty = single device).
+    // Layers are partitioned across the specified devices.
+    std::vector<brotensor::Device> pipeline_devices;
 };
 
 class DenseDecoder {
@@ -209,6 +213,11 @@ private:
     // cache storage are replaced.
     bool try_graph_step_(int32_t token, brotensor::Tensor& logits_out);
     void invalidate_graph_();
+
+    brotensor::Device stage_device(int stage_idx) const;
+    brotensor::Device layer_device(int layer_idx) const;
+    brotensor::Device embed_device() const;
+    brotensor::Device final_device() const;
 
     DenseDecoderConfig cfg_;
 

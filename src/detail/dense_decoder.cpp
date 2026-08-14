@@ -33,12 +33,12 @@ namespace {
 
 // Build a device-resident INT32 buffer holding `n` token ids. brotensor has
 // no from_host path for INT32, so stage on the host then migrate to the
-// default device.
-bt::Tensor make_idx_device(const int32_t* host, int n) {
+// target device.
+bt::Tensor make_idx_device(const int32_t* host, int n, bt::Device dev = bt::default_device()) {
     bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
     std::memcpy(cpu.host_raw_mut(), host,
                 static_cast<std::size_t>(n) * sizeof(int32_t));
-    return cpu.to(bt::default_device());
+    return cpu.to(dev);
 }
 
 }  // namespace
@@ -116,6 +116,34 @@ DenseDecoder::~DenseDecoder() = default;
 DenseDecoder::DenseDecoder(DenseDecoder&&) noexcept = default;
 DenseDecoder& DenseDecoder::operator=(DenseDecoder&&) noexcept = default;
 
+bt::Device DenseDecoder::stage_device(int stage_idx) const {
+    if (cfg_.pipeline_devices.empty()) return bt::default_device();
+    if (stage_idx < 0) stage_idx = 0;
+    if (stage_idx >= static_cast<int>(cfg_.pipeline_devices.size())) {
+        stage_idx = static_cast<int>(cfg_.pipeline_devices.size()) - 1;
+    }
+    return cfg_.pipeline_devices[static_cast<std::size_t>(stage_idx)];
+}
+
+bt::Device DenseDecoder::layer_device(int layer_idx) const {
+    if (cfg_.pipeline_devices.empty()) return bt::default_device();
+    const int num_stages = static_cast<int>(cfg_.pipeline_devices.size());
+    if (num_stages <= 1) return cfg_.pipeline_devices[0];
+    const int total_layers = cfg_.num_hidden_layers;
+    int stage = (layer_idx * num_stages) / total_layers;
+    if (stage >= num_stages) stage = num_stages - 1;
+    return cfg_.pipeline_devices[static_cast<std::size_t>(stage)];
+}
+
+bt::Device DenseDecoder::embed_device() const {
+    return stage_device(0);
+}
+
+bt::Device DenseDecoder::final_device() const {
+    if (cfg_.pipeline_devices.empty()) return bt::default_device();
+    return cfg_.pipeline_devices.back();
+}
+
 // ─── load_weights ────────────────────────────────────────────────────────────
 
 void DenseDecoder::load_weights(const brolm::detail::weights::Source& src) {
@@ -131,10 +159,14 @@ void DenseDecoder::load_weights(const brolm::detail::weights::Source& src) {
     const int q_dim  = n_q  * HD;
     const int kv_dim = n_kv * HD;
 
-    src.upload_compute_dequant("model.embed_tokens.weight",
-                               V, H, embed_tokens_, "embed_tokens.weight");
+    {
+        bt::DeviceScope scope(embed_device());
+        src.upload_compute_dequant("model.embed_tokens.weight",
+                                   V, H, embed_tokens_, "embed_tokens.weight");
+    }
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        bt::DeviceScope scope(layer_device(i));
         const std::string p = "model.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
@@ -174,20 +206,25 @@ void DenseDecoder::load_weights(const brolm::detail::weights::Source& src) {
                                    H, F, L.down_W, "down_proj.weight");
     }
 
-    src.upload_compute_dequant("model.norm.weight",
-                               H, 1, final_norm_, "model.norm.weight");
+    {
+        bt::DeviceScope scope(final_device());
+        src.upload_compute_dequant("model.norm.weight",
+                                   H, 1, final_norm_, "model.norm.weight");
 
-    if (src.has("lm_head.weight")) {
-        src.upload_compute_checked("lm_head.weight",
-                                   V, H, lm_head_, "lm_head.weight");
-    } else {
-        if (!cfg_.tie_word_embeddings) {
-            fail("load_weights: lm_head.weight missing and "
-                 "tie_word_embeddings is false");
+        if (src.has("lm_head.weight")) {
+            src.upload_compute_checked("lm_head.weight",
+                                       V, H, lm_head_, "lm_head.weight");
+        } else {
+            if (!cfg_.tie_word_embeddings) {
+                fail("load_weights: lm_head.weight missing and "
+                     "tie_word_embeddings is false");
+            }
+            if (embed_tokens_.device == final_device()) {
+                lm_head_ = embed_tokens_.clone();
+            } else {
+                lm_head_ = embed_tokens_.to(final_device());
+            }
         }
-        // Tied: lm_head shares the embedding matrix. Clone so the two tensors
-        // are independent storage (cheap; avoids aliasing surprises).
-        lm_head_ = embed_tokens_.clone();
     }
 }
 
@@ -202,8 +239,9 @@ void DenseDecoder::allocate_cache(int max_seq_len) {
     const int n_kv = cfg_.num_key_value_heads;
     const int cache_cols = n_kv * cfg_.head_dim;
     const bt::Dtype dt = brolm::compute_dtype();
-    const bt::Device dev = bt::default_device();
-    for (Layer& L : layers_) {
+    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        Layer& L = layers_[static_cast<std::size_t>(i)];
+        const bt::Device dev = layer_device(i);
         // KV cache stores true n_kv-width K/V; flash_attention_decode does the
         // GQA head-mapping internally, so no per-head widening is needed.
         brolm::detail::resize_like(L.K_cache, max_seq_len, cache_cols, dt, dev);
@@ -233,7 +271,7 @@ void DenseDecoder::embed_tokens(const int32_t* ids, int L, bt::Tensor& out) {
     if (L <= 0) fail("embed_tokens: L must be positive");
     if (embed_tokens_.size() == 0) fail("embed_tokens: weights not loaded");
 
-    bt::Tensor idx = make_idx_device(ids, L);
+    bt::Tensor idx = make_idx_device(ids, L, embed_device());
     bt::embedding_lookup_forward(
         embed_tokens_, static_cast<const int32_t*>(idx.data), L, out);
     out = out.clone();
@@ -252,10 +290,11 @@ void DenseDecoder::forward(const int32_t* ids, int L, bt::Tensor& logits_out,
     // Embedding lookup -> own a stable residual stream in h_.
     {
         profile::ScopedStage ps(profile::Stage::idx_upload);
-        ids_dev_ = make_idx_device(ids, L);
+        ids_dev_ = make_idx_device(ids, L, embed_device());
     }
     {
         profile::ScopedStage ps(profile::Stage::embed);
+        h_ = bt::Tensor();
         bt::embedding_lookup_forward(
             embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
         h_ = h_.clone();
@@ -280,10 +319,11 @@ void DenseDecoder::forward_last(const int32_t* ids, int L,
 
     {
         profile::ScopedStage ps(profile::Stage::idx_upload);
-        ids_dev_ = make_idx_device(ids, L);
+        ids_dev_ = make_idx_device(ids, L, embed_device());
     }
     {
         profile::ScopedStage ps(profile::Stage::embed);
+        h_ = bt::Tensor();
         bt::embedding_lookup_forward(
             embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
         h_ = h_.clone();
@@ -301,7 +341,8 @@ void DenseDecoder::forward_encode(const int32_t* ids, int L,
 
     // Embedding lookup -> own a stable residual stream in h_. No KV cache: the
     // bidirectional stack attends the whole L-token window in one shot.
-    ids_dev_ = make_idx_device(ids, L);
+    ids_dev_ = make_idx_device(ids, L, embed_device());
+    h_ = bt::Tensor();
     bt::embedding_lookup_forward(
         embed_tokens_, static_cast<const int32_t*>(ids_dev_.data), L, h_);
     h_ = h_.clone();
@@ -338,6 +379,7 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
     (void)logits_out;
     return false;
 #else
+    if (cfg_.pipeline_devices.size() > 1) return false;
     if (bt::default_device() != bt::Device::CUDA) return false;
     // BROLM_PROFILE brackets every op in sync pairs — capturing those scopes
     // is illegal and pointless (profiling wants per-stage attribution, which
@@ -421,7 +463,7 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
         std::fill(hmask.begin(), hmask.begin() + pos, 1.0f);
         bt::detail::alloc_for(dev).memcpy_h2d(
             s.mask.data, hmask.data(),
-            static_cast<std::size_t>(s.cap) * sizeof(float));
+            static_cast<std::size_t>(s.cap) * sizeof(float), dev.index);
         s.mask_len = pos;
     }
 
@@ -552,7 +594,27 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
     namespace prof = profile;
     using PStage   = profile::Stage;
 
-    for (Layer& layer : layers_) {
+    bt::Device prev_dev = bt::Device::CPU;
+    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        Layer& layer = layers_[static_cast<std::size_t>(i)];
+        const bt::Device cur_dev = layer_device(i);
+        if (h_.device != cur_dev) {
+            h_ = h_.to(cur_dev);
+        }
+        if (cur_dev != prev_dev) {
+            norm_ = bt::Tensor();
+            q_    = bt::Tensor();
+            k_    = bt::Tensor();
+            v_    = bt::Tensor();
+            qn_   = bt::Tensor();
+            kn_   = bt::Tensor();
+            attn_ = bt::Tensor();
+            proj_ = bt::Tensor();
+            gate_ = bt::Tensor();
+            up_   = bt::Tensor();
+            prev_dev = cur_dev;
+        }
+
         // ── self-attention sub-layer ──────────────────────────────────────
         {
             prof::ScopedStage ps(PStage::rms_norm);
@@ -647,6 +709,12 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
     }
 
     // Final norm + LM head.
+    if (h_.device != final_device()) {
+        h_ = h_.to(final_device());
+    }
+    if (final_device() != prev_dev) {
+        norm_ = bt::Tensor();
+    }
     {
         prof::ScopedStage ps(PStage::final_norm);
         bt::rms_norm_forward(h_, final_norm_, eps, norm_);
@@ -701,7 +769,27 @@ void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
         dst.cols = num_heads * HD;
     };
 
-    for (Layer& layer : layers_) {
+    bt::Device prev_dev = bt::Device::CPU;
+    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        Layer& layer = layers_[static_cast<std::size_t>(i)];
+        const bt::Device cur_dev = layer_device(i);
+        if (h_.device != cur_dev) {
+            h_ = h_.to(cur_dev);
+        }
+        if (cur_dev != prev_dev) {
+            norm_ = bt::Tensor();
+            q_    = bt::Tensor();
+            k_    = bt::Tensor();
+            v_    = bt::Tensor();
+            qn_   = bt::Tensor();
+            kn_   = bt::Tensor();
+            attn_ = bt::Tensor();
+            proj_ = bt::Tensor();
+            gate_ = bt::Tensor();
+            up_   = bt::Tensor();
+            prev_dev = cur_dev;
+        }
+
         // ── self-attention sub-layer (bidirectional) ──────────────────────
         {
             prof::ScopedStage ps(PStage::rms_norm);
@@ -779,6 +867,12 @@ void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
     }
 
     // Final norm -> stable (L, hidden) hidden states for the caller (no lm_head).
+    if (h_.device != final_device()) {
+        h_ = h_.to(final_device());
+    }
+    if (final_device() != prev_dev) {
+        norm_ = bt::Tensor();
+    }
     {
         prof::ScopedStage ps(PStage::final_norm);
         bt::rms_norm_forward(h_, final_norm_, eps, norm_);

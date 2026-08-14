@@ -45,6 +45,9 @@ struct Qwen3Config {
     bool  tie_word_embeddings   = true;
     int   max_position_embeddings = 40960;
 
+    // Multi-device pipeline parallelism (empty = default single-device).
+    std::vector<brotensor::Device> pipeline_devices;
+
     // Populate a Qwen3Config from the metadata of a Qwen3 .gguf file. Reads
     // the llama.cpp-convention keys (`qwen3.embedding_length`,
     // `qwen3.attention.head_count`, ...) plus the tokenizer vocab length for

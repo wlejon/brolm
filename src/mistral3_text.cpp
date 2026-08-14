@@ -37,6 +37,7 @@ brolm::detail::DenseDecoderConfig to_core_config(const Mistral3Config::Text& c) 
     d.rope_theta          = c.rope_theta;
     d.use_qk_norm         = false;   // Mistral has no QK-norm
     d.tie_word_embeddings = c.tie_word_embeddings;
+    d.pipeline_devices    = c.pipeline_devices;
     return d;
 }
 

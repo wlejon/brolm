@@ -38,6 +38,7 @@ brolm::detail::DenseDecoderConfig to_core_config(const Qwen3Config& c) {
     d.rope_theta          = c.rope_theta;
     d.use_qk_norm         = true;   // Qwen3 has per-head QK-norm
     d.tie_word_embeddings = c.tie_word_embeddings;
+    d.pipeline_devices    = c.pipeline_devices;
     return d;
 }
 
