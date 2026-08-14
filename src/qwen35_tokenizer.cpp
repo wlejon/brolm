@@ -1,5 +1,7 @@
 #include "brolm/qwen35_tokenizer.h"
 
+#include "brotensor/gguf.h"
+
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -88,6 +90,18 @@ Tokenizer Tokenizer::load(const std::string& vocab_json_path,
     qwen::Tokenizer inner = qwen::Tokenizer::load(vocab_json_path,
                                                   merges_txt_path,
                                                   /*extras=*/{});
+    for (const SpecialEntry& e : kSpecialTable()) {
+        inner.register_special_token(e.token, e.id);
+    }
+    Tokenizer t(std::move(inner));
+    t.resolve_named_ids_();
+    return t;
+}
+
+Tokenizer Tokenizer::from_gguf(const brotensor::gguf::File& f,
+                              const std::vector<std::string>& extra_special_tokens) {
+    (void)extra_special_tokens;
+    qwen::Tokenizer inner = qwen::Tokenizer::from_gguf(f, {});
     for (const SpecialEntry& e : kSpecialTable()) {
         inner.register_special_token(e.token, e.id);
     }

@@ -30,6 +30,11 @@ public:
                           const std::string& merges_txt_path,
                           const std::vector<std::string>& extra_special_tokens = {});
 
+    // Build tokenizer directly from a Qwen3.5 / Qwen3.8 GGUF file.
+    static Tokenizer from_gguf(
+        const brotensor::gguf::File& f,
+        const std::vector<std::string>& extra_special_tokens = {});
+
     // The HF "added_tokens" set for Qwen3.5 — pulled verbatim from the
     // tokenizer_config.json shipped with Qwen/Qwen3.5-0.8B (33 entries). Same
     // list across the Qwen3.5 size lineup; the trimmed-vocab tolerance in

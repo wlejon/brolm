@@ -20,7 +20,10 @@ namespace brolm::detail {
 // matching-shape resize reuses storage (brotensor::Tensor::resize fast path).
 inline void resize_like(brotensor::Tensor& t, int r, int c,
                         brotensor::Dtype dt, brotensor::Device dev) {
-    if (t.data == nullptr) t.device = dev;
+    if (t.device != dev) {
+        t = brotensor::Tensor();
+        t.device = dev;
+    }
     t.resize(r, c, dt);
 }
 

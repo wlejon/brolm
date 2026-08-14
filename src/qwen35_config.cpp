@@ -1,7 +1,9 @@
 #include "brolm/qwen35_config.h"
 
+#include "brotensor/gguf.h"
 #include "brolm/detail/json.h"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -10,6 +12,7 @@
 
 namespace brolm::qwen35 {
 
+namespace bt = ::brotensor;
 namespace j = brolm::detail::json;
 
 namespace {
@@ -173,6 +176,120 @@ Qwen35Config Qwen35Config::from_json_text(const std::string& json_text) {
     return cfg;
 }
 
+Qwen35Config Qwen35Config::from_gguf(const bt::gguf::File& f) {
+    if (const auto* arch = f.find_meta("general.architecture")) {
+        if (arch->type == bt::gguf::ValueType::String &&
+            arch->str != "qwen35" && arch->str != "qwen3_5" && arch->str != "qwen38") {
+            fail("general.architecture is '" + arch->str + "', expected 'qwen35'");
+        }
+    }
+    Qwen35Config cfg;
+    auto meta_int = [&](const char* key, int dflt) -> int {
+        const auto* v = f.find_meta(key);
+        if (!v) return dflt;
+        if (v->type == bt::gguf::ValueType::I32) return v->scalar.i32;
+        if (v->type == bt::gguf::ValueType::U32) return static_cast<int>(v->scalar.u32);
+        if (v->type == bt::gguf::ValueType::I64) return static_cast<int>(v->scalar.i64);
+        if (v->type == bt::gguf::ValueType::U64) return static_cast<int>(v->scalar.u64);
+        return dflt;
+    };
+    auto meta_float = [&](const char* key, float dflt) -> float {
+        const auto* v = f.find_meta(key);
+        if (!v) return dflt;
+        if (v->type == bt::gguf::ValueType::F32) return v->scalar.f32;
+        if (v->type == bt::gguf::ValueType::F64) return static_cast<float>(v->scalar.f64);
+        return dflt;
+    };
+
+    Qwen35Config::Text& t = cfg.text;
+    t.num_hidden_layers     = meta_int("qwen35.block_count", t.num_hidden_layers);
+    t.hidden_size           = meta_int("qwen35.embedding_length", t.hidden_size);
+    t.intermediate_size     = meta_int("qwen35.feed_forward_length", t.intermediate_size);
+    t.num_attention_heads   = meta_int("qwen35.attention.head_count", t.num_attention_heads);
+    t.num_key_value_heads   = meta_int("qwen35.attention.head_count_kv", t.num_key_value_heads);
+    t.head_dim              = meta_int("qwen35.attention.key_length", t.head_dim);
+    t.rms_norm_eps          = meta_float("qwen35.attention.layer_norm_rms_epsilon", t.rms_norm_eps);
+    t.full_attention_interval = meta_int("qwen35.full_attention_interval", 4);
+    t.max_position_embeddings = meta_int("qwen35.context_length", t.max_position_embeddings);
+    t.linear_conv_kernel_dim = meta_int("qwen35.ssm.conv_kernel", t.linear_conv_kernel_dim);
+
+    // SSM state dimensions
+    const int state_size = meta_int("qwen35.ssm.state_size", 128);
+    t.linear_key_head_dim = state_size;
+    t.linear_value_head_dim = state_size;
+
+    const int inner_size = meta_int("qwen35.ssm.inner_size", 0);
+    const int time_step_rank = meta_int("qwen35.ssm.time_step_rank", 0);
+    const int group_count = meta_int("qwen35.ssm.group_count", 0);
+
+    if (inner_size > 0 && state_size > 0) {
+        t.linear_num_value_heads = inner_size / state_size;
+    }
+    if (group_count > 0) {
+        t.linear_num_key_heads = group_count;
+    } else if (time_step_rank > 0) {
+        t.linear_num_key_heads = time_step_rank;
+    } else {
+        t.linear_num_key_heads = t.linear_num_value_heads;
+    }
+
+    // Vocab size from tokenizer or token_embd tensor
+    if (const auto* toks = f.find_meta("tokenizer.ggml.tokens")) {
+        if (toks->type == bt::gguf::ValueType::Array) {
+            t.vocab_size = static_cast<int>(toks->array.size());
+        }
+    } else if (const auto* tinfo = f.find_tensor("token_embd.weight")) {
+        t.vocab_size = static_cast<int>(tinfo->shape.size() > 1 ? tinfo->shape[1] : tinfo->shape[0]);
+    }
+
+    // RoPE
+    t.rope.rope_theta = meta_float("qwen35.rope.freq_base", t.rope.rope_theta);
+    const int rot_dim = meta_int("qwen35.rope.dimension_count", 0);
+    if (rot_dim > 0 && t.head_dim > 0) {
+        t.rope.partial_rotary_factor = static_cast<float>(rot_dim) / static_cast<float>(t.head_dim);
+    }
+    if (const auto* dim_sec = f.find_meta("qwen35.rope.dimension_sections")) {
+        if (dim_sec->type == bt::gguf::ValueType::Array) {
+            t.rope.mrope_section.clear();
+            const std::size_t lim = dim_sec->array.size() < 3 ? dim_sec->array.size() : 3;
+            for (std::size_t i = 0; i < lim; ++i) {
+                if (dim_sec->array[i].type == bt::gguf::ValueType::I32) {
+                    t.rope.mrope_section.push_back(dim_sec->array[i].scalar.i32);
+                } else if (dim_sec->array[i].type == bt::gguf::ValueType::U32) {
+                    t.rope.mrope_section.push_back(static_cast<int>(dim_sec->array[i].scalar.u32));
+                }
+            }
+        }
+    }
+    if (t.rope.mrope_section.empty()) {
+        const int rd = t.rotary_dim();
+        int p = (rd / 2) / 3;
+        int rem = (rd / 2) - 2 * p;
+        t.rope.mrope_section = { p, p, rem };
+    }
+
+    // Build layer_types directly from GGUF tensor existence
+    t.layer_types.resize(static_cast<std::size_t>(t.num_hidden_layers));
+    for (int i = 0; i < t.num_hidden_layers; ++i) {
+        std::string prefix = "blk." + std::to_string(i) + ".";
+        if (f.find_tensor(prefix + "attn_qkv.weight") || f.find_tensor(prefix + "ssm_a")) {
+            t.layer_types[static_cast<std::size_t>(i)] = LayerType::Linear;
+        } else if (f.find_tensor(prefix + "attn_q.weight")) {
+            t.layer_types[static_cast<std::size_t>(i)] = LayerType::Full;
+        } else if (t.full_attention_interval > 0 && (i + 1) % t.full_attention_interval == 0) {
+            t.layer_types[static_cast<std::size_t>(i)] = LayerType::Full;
+        } else {
+            t.layer_types[static_cast<std::size_t>(i)] = LayerType::Linear;
+        }
+    }
+
+    cfg.vision.out_hidden_size = t.hidden_size;
+    cfg.vision.depth = 0; // indicates text-only GGUF
+
+    cfg.validate();
+    return cfg;
+}
+
 void Qwen35Config::validate() const {
     if (text.hidden_size <= 0 || text.intermediate_size <= 0 ||
         text.num_hidden_layers <= 0 || text.vocab_size <= 0 ||
@@ -198,16 +315,18 @@ void Qwen35Config::validate() const {
     if (2 * pair_sum != text.rotary_dim()) {
         fail("2*sum(mrope_section) != rotary_dim");
     }
-    if (vision.patch_size <= 0 || vision.temporal_patch_size <= 0 ||
-        vision.spatial_merge_size <= 0) {
-        fail("vision patch/merge sizes must be positive");
-    }
-    if (vision.hidden_size % vision.num_heads != 0) {
-        fail("vision.hidden_size % vision.num_heads != 0");
-    }
-    if (vision.out_hidden_size != text.hidden_size) {
-        // The merger projects to text.hidden_size; the config should reflect that.
-        fail("vision.out_hidden_size must equal text.hidden_size");
+    if (vision.depth > 0) {
+        if (vision.patch_size <= 0 || vision.temporal_patch_size <= 0 ||
+            vision.spatial_merge_size <= 0) {
+            fail("vision patch/merge sizes must be positive");
+        }
+        if (vision.hidden_size % vision.num_heads != 0) {
+            fail("vision.hidden_size % vision.num_heads != 0");
+        }
+        if (vision.out_hidden_size != text.hidden_size) {
+            // The merger projects to text.hidden_size; the config should reflect that.
+            fail("vision.out_hidden_size must equal text.hidden_size");
+        }
     }
 }
 

@@ -51,6 +51,8 @@ class Source {
 public:
     virtual ~Source() = default;
 
+    virtual bool is_gguf() const { return false; }
+
     // True iff a tensor with HF-style `name` exists in the source.
     virtual bool has(const std::string& name) const = 0;
 
@@ -284,6 +286,8 @@ public:
 
     GgufSource(std::vector<const brotensor::gguf::File*> shards, NameMap mapper)
         : shards_(std::move(shards)), mapper_(std::move(mapper)) {}
+
+    bool is_gguf() const override { return true; }
 
     bool has(const std::string& name) const override {
         const std::string ggml = mapper_(name);

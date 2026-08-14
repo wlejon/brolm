@@ -75,6 +75,8 @@
 #include <vector>
 
 namespace brotensor::safetensors { class File; struct TensorView; }
+namespace brotensor::gguf { class File; }
+namespace brolm::detail::weights { class Source; }
 
 namespace brolm::qwen35 {
 
@@ -134,6 +136,10 @@ public:
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "model.language_model.");
+
+    // Load weights from one or more GGUF file shards.
+    void load_weights(const brotensor::gguf::File& f);
+    void load_weights(const std::vector<const brotensor::gguf::File*>& shards);
 
     // Allocate per-layer caches sized for `max_seq` tokens. Full-attn layers
     // get K/V at the compute dtype; linear-attn slots get zero-filled FP32
@@ -240,9 +246,7 @@ private:
         MLP mlp;
     };
 
-    void load_weights_impl_(
-        const std::vector<const brotensor::safetensors::File*>& shards,
-        const std::string& prefix);
+    void load_weights_impl_(const brolm::detail::weights::Source& src);
 
     // Run the MLP sub-layer in place on h_.
     void mlp_block_(const MLP& mlp, int L);
@@ -310,12 +314,16 @@ private:
     brotensor::Tensor lin_a_raw_;      // (T, num_heads) FP32
     brotensor::Tensor lin_beta_;       // (T, num_heads) FP32
     brotensor::Tensor lin_z_;          // (T, num_heads*value_head_dim)
+    brotensor::Tensor lin_z_fp32_;     // FP32 cast of lin_z_
     brotensor::Tensor lin_zsilu_;      // silu(z)
     brotensor::Tensor lin_O_;          // (T, num_heads*value_head_dim) recurrence out
     brotensor::Tensor lin_O_norm_;     // per-head RMSNormed O
+    brotensor::Tensor lin_O_cast_;     // FP16 cast of lin_O_norm_ for quantized out_proj
     brotensor::Tensor lin_log_A_;      // (num_heads, 1) FP32 — cached per layer view
     brotensor::Tensor lin_x_fp32_;     // FP32 cast of norm_ for the linear-attn block
-    brotensor::Tensor lin_proj_cast_;  // compute-dtype cast of FP32 out_proj output
+    brotensor::Tensor lin_proj_cast_;  // compute-dtype cast of out_proj output
+    brotensor::Tensor lin_q_exp_, lin_k_exp_; // GQA expanded q/k if num_key_heads < num_value_heads
+    brotensor::Tensor lin_qkv_fp32_;   // FP32 cast of lin_qkv_
 };
 
 }  // namespace brolm::qwen35

@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+namespace brotensor::gguf { class File; }
+
 namespace brolm::qwen35 {
 
 // Per-layer attention type, parallel to HF's `text_config.layer_types` list of
@@ -121,9 +123,12 @@ struct Qwen35Config {
     // Parse from an in-memory JSON document (useful for tests).
     static Qwen35Config from_json_text(const std::string& json_text);
 
+    // Build configuration from a Qwen3.5 / Qwen3.8 GGUF file's metadata.
+    static Qwen35Config from_gguf(const brotensor::gguf::File& f);
+
     // Validate cross-field invariants (layer_types.size == num_hidden_layers,
     // head_dim % 2 == 0, mrope_section sums to rotary_dim/2, ...). Called by
-    // both loaders; throws on inconsistency.
+    // all loaders; throws on inconsistency.
     void validate() const;
 };
 

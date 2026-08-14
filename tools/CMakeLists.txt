@@ -53,3 +53,4 @@ if(MSVC)
 else()
     target_compile_options(brolm_llm2vec_encode PRIVATE -Wall -Wextra)
 endif()
+

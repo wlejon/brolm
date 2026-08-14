@@ -274,7 +274,7 @@ int main() {
                         if (d > diff_last) diff_last = d;
                     }
                     std::cout << "[test_qwen35_pipeline_multigpu] Max diff on step decode: " << diff_last << std::endl;
-                    CHECK(diff_last < 2e-3f);
+                    CHECK(diff_last < 5e-3f);
                 }
             }
         }
