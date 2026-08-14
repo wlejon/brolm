@@ -44,11 +44,11 @@ const st::TensorView* find_in(const std::vector<const st::File*>& shards,
     return nullptr;
 }
 
-bt::Tensor make_idx_device(const int32_t* host, int n) {
+bt::Tensor make_idx_device(const int32_t* host, int n, bt::Device dev = bt::default_device()) {
     bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
     std::memcpy(cpu.host_raw_mut(), host,
                 static_cast<std::size_t>(n) * sizeof(int32_t));
-    return cpu.to(bt::default_device());
+    return cpu.to(dev);
 }
 
 // HF's Qwen3_5RMSNorm applies `(1 + weight)` as the gain (init zeros, centred
@@ -59,7 +59,7 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
 // `Qwen3_5RMSNorm.forward` and the `_init_weights` comment "We initialize
 // with 0s to be 1 centered as the RMSNorm here does (1 + weight)".
 void add_one_to_norm_weight(bt::Tensor& t) {
-    // Stage on host (FP32), add 1, re-upload at the original compute dtype.
+    // Stage on host (FP32), add 1, re-upload at the original compute dtype on the tensor's device.
     // Load-path only — runs once per layer.
     std::vector<float> h(static_cast<std::size_t>(t.size()));
     if (t.dtype == bt::Dtype::FP16) {
@@ -73,7 +73,16 @@ void add_one_to_norm_weight(bt::Tensor& t) {
     }
     const int r = t.rows;
     const int c = t.cols;
-    t = brolm::detail::upload_host(h.data(), r, c);
+    const bt::Device dev = t.device;
+    if (t.dtype == bt::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(h.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            bits[i] = bt::fp32_to_fp16_bits(h[i]);
+        }
+        t = bt::Tensor::from_host_fp16_on(dev, bits.data(), r, c);
+    } else {
+        t = bt::Tensor::from_host_on(dev, h.data(), r, c);
+    }
 }
 
 std::vector<float> download_fp32(const bt::Tensor& t) {
@@ -225,14 +234,15 @@ void split_q_gate_rows(const std::vector<float>& src,
 void build_axis_tables(int max_pos_inclusive, int d_axis, int rotary_dim,
                        float rope_theta,
                        const std::vector<int>& freq_indices,
-                       bt::Tensor& cos_t, bt::Tensor& sin_t) {
+                       bt::Tensor& cos_t, bt::Tensor& sin_t,
+                       bt::Device dev = bt::default_device()) {
     const int rows = std::max(1, max_pos_inclusive + 1);
     if (d_axis <= 0) {
         // Degenerate axis: brotensor still accepts a (rows, 0)-ish layout via
         // an empty (rows, 1) placeholder; we pass empty Tensors. The mrope op
         // skips them when d_axis==0.
-        cos_t = bt::Tensor::zeros_on(bt::default_device(), rows, 1, bt::Dtype::FP32);
-        sin_t = bt::Tensor::zeros_on(bt::default_device(), rows, 1, bt::Dtype::FP32);
+        cos_t = bt::Tensor::zeros_on(dev, rows, 1, bt::Dtype::FP32);
+        sin_t = bt::Tensor::zeros_on(dev, rows, 1, bt::Dtype::FP32);
         return;
     }
     if (static_cast<int>(freq_indices.size()) != d_axis) {
@@ -256,8 +266,8 @@ void build_axis_tables(int max_pos_inclusive, int d_axis, int rotary_dim,
             sin_h[static_cast<std::size_t>(p) * d_axis + i] = std::sin(angle);
         }
     }
-    cos_t = bt::Tensor::from_host_on(bt::default_device(), cos_h.data(), rows, d_axis);
-    sin_t = bt::Tensor::from_host_on(bt::default_device(), sin_h.data(), rows, d_axis);
+    cos_t = bt::Tensor::from_host_on(dev, cos_h.data(), rows, d_axis);
+    sin_t = bt::Tensor::from_host_on(dev, sin_h.data(), rows, d_axis);
 }
 
 }  // namespace
@@ -304,6 +314,34 @@ TextModel::TextModel(const Qwen35Config::Text& cfg) : cfg_(cfg) {
 
 TextModel::~TextModel() = default;
 
+bt::Device TextModel::stage_device(int stage_idx) const {
+    if (cfg_.pipeline_devices.empty()) return bt::default_device();
+    if (stage_idx < 0) stage_idx = 0;
+    if (stage_idx >= static_cast<int>(cfg_.pipeline_devices.size())) {
+        stage_idx = static_cast<int>(cfg_.pipeline_devices.size()) - 1;
+    }
+    return cfg_.pipeline_devices[static_cast<std::size_t>(stage_idx)];
+}
+
+bt::Device TextModel::layer_device(int layer_idx) const {
+    if (cfg_.pipeline_devices.empty()) return bt::default_device();
+    const int num_stages = static_cast<int>(cfg_.pipeline_devices.size());
+    if (num_stages <= 1) return cfg_.pipeline_devices[0];
+    const int total_layers = cfg_.num_hidden_layers;
+    int stage = (layer_idx * num_stages) / total_layers;
+    if (stage >= num_stages) stage = num_stages - 1;
+    return cfg_.pipeline_devices[static_cast<std::size_t>(stage)];
+}
+
+bt::Device TextModel::embed_device() const {
+    return stage_device(0);
+}
+
+bt::Device TextModel::final_device() const {
+    if (cfg_.pipeline_devices.empty()) return bt::default_device();
+    return cfg_.pipeline_devices.back();
+}
+
 // ─── load_weights ──────────────────────────────────────────────────────────
 
 void TextModel::load_weights(const st::File& f, const std::string& prefix) {
@@ -330,14 +368,15 @@ void TextModel::load_weights_impl_(
     const int kv_dim   = n_kv * HD;
     const int q_dim2   = 2 * q_dim;        // q_proj output width (q + gate)
 
-    upload_compute_checked(need(shards, prefix + "embed_tokens.weight"),
-                           V, H, embed_, "embed_tokens.weight");
-
-    upload_compute_checked(need(shards, prefix + "norm.weight"),
-                           H, 1, final_norm_, "language_model.norm.weight");
-    add_one_to_norm_weight(final_norm_);
+    {
+        bt::DeviceScope scope(embed_device());
+        upload_compute_checked(need(shards, prefix + "embed_tokens.weight"),
+                               V, H, embed_, "embed_tokens.weight");
+    }
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        const bt::Device dev = layer_device(i);
+        bt::DeviceScope scope(dev);
         const std::string p =
             prefix + "layers." + std::to_string(i) + ".";
         LayerSlot& L = layers_[static_cast<std::size_t>(i)];
@@ -453,7 +492,7 @@ void TextModel::load_weights_impl_(
                 } else {
                     fail("linear_attn '" + key + "': unsupported dtype");
                 }
-                dst = bt::Tensor::from_host(tmp.data(), rows, cols);
+                dst = bt::Tensor::from_host_on(dev, tmp.data(), rows, cols);
             };
             load_fp32(lp + "A_log",             L.lin.A_log);
             load_fp32(lp + "conv1d.weight",     L.lin.conv1d);
@@ -467,14 +506,25 @@ void TextModel::load_weights_impl_(
         }
     }
 
-    // tie_word_embeddings: lm_head is the same matrix as embed_tokens.
-    // No explicit lm_head load — the forward computes logits = embed @ h.
-    if (!cfg_.tie_word_embeddings) {
-        if (find_in(shards, prefix + "lm_head.weight") == nullptr) {
-            fail("tie_word_embeddings=false but lm_head.weight missing");
+    {
+        bt::DeviceScope scope(final_device());
+        upload_compute_checked(need(shards, prefix + "norm.weight"),
+                               H, 1, final_norm_, "language_model.norm.weight");
+        add_one_to_norm_weight(final_norm_);
+
+        if (find_in(shards, prefix + "lm_head.weight") != nullptr) {
+            upload_compute_checked(need(shards, prefix + "lm_head.weight"),
+                                   V, H, lm_head_, "lm_head.weight");
+        } else {
+            if (!cfg_.tie_word_embeddings) {
+                fail("tie_word_embeddings=false but lm_head.weight missing");
+            }
+            if (embed_.device == final_device()) {
+                lm_head_ = embed_.clone();
+            } else {
+                lm_head_ = embed_.to(final_device());
+            }
         }
-        // Untied path not exercised by Qwen3.5 releases; skip for now.
-        fail("tie_word_embeddings=false not supported in this chunk");
     }
 }
 
@@ -485,7 +535,6 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
     const int n_kv = cfg_.num_key_value_heads;
     const int cache_cols = n_kv * cfg_.head_dim;  // true KV width; decode does GQA
     const bt::Dtype dt = brolm::compute_dtype();
-    const bt::Device dev = bt::default_device();
 
     // Linear-attn shapes.
     const int lin_h    = cfg_.linear_num_value_heads;
@@ -497,6 +546,7 @@ std::vector<LayerCache> TextModel::make_cache(int max_seq) const {
 
     std::vector<LayerCache> out(static_cast<std::size_t>(cfg_.num_hidden_layers));
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        const bt::Device dev = layer_device(i);
         LayerCache& c = out[static_cast<std::size_t>(i)];
         if (cfg_.layer_types[static_cast<std::size_t>(i)] == LayerType::Full) {
             brolm::detail::resize_like(c.full.k, max_seq, cache_cols, dt, dev);
@@ -569,35 +619,16 @@ void TextModel::prepare_mrope_(const std::vector<int32_t>& pos_t,
     const int rd = rotary_dim_;
     if (rd == 0) return;
 
+    pos_t_host_ = pos_t;
+    pos_h_host_ = pos_h;
+    pos_w_host_ = pos_w;
+
     int max_pos = 0;
     auto upd = [&](const std::vector<int32_t>& v) {
         for (int32_t p : v) if (p > max_pos) max_pos = p;
     };
     upd(pos_t); upd(pos_h); upd(pos_w);
-
-    // (Re)build the per-axis tables only when the cached ones are too short.
-    // Bucketed growth: a decode loop advances max_pos by one per token, and
-    // rebuilding per token is the per-layer host-rebuild pathology this cache
-    // exists to kill. rope_apply_mrope indexes rows by position, so taller
-    // tables serve smaller positions unchanged.
-    if (max_pos > mrope_tbl_max_pos_) {
-        const int cap = std::max({max_pos, 2 * mrope_tbl_max_pos_, 1023});
-        // Per-axis global inv_freq indices follow HF's apply_interleaved_mrope.
-        MRopePairing pairing = mrope_pairing(d_t_, d_h_, d_w_);
-        build_axis_tables(cap, d_t_, rd, cfg_.rope.rope_theta,
-                          pairing.t_pairs, mrope_cos_t_, mrope_sin_t_);
-        build_axis_tables(cap, d_h_, rd, cfg_.rope.rope_theta,
-                          pairing.h_pairs, mrope_cos_h_, mrope_sin_h_);
-        build_axis_tables(cap, d_w_, rd, cfg_.rope.rope_theta,
-                          pairing.w_pairs, mrope_cos_w_, mrope_sin_w_);
-        mrope_tbl_max_pos_ = cap;
-    }
-
-    // brotensor's mrope op accepts host pointers on CPU, device on CUDA/Metal.
-    // Upload each stream once per forward; every layer reads the same buffers.
-    pos_t_dev_ = make_idx_device(pos_t.data(), L);
-    pos_h_dev_ = make_idx_device(pos_h.data(), L);
-    pos_w_dev_ = make_idx_device(pos_w.data(), L);
+    mrope_max_pos_ = max_pos;
 }
 
 void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L) {
@@ -606,27 +637,53 @@ void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L) {
     if (rd == 0) return;
     const int rot_cols = num_heads * rd;
 
-    // Choose a scratch tensor: q_rot_ or k_rot_ — caller passes us qk by ref
-    // so we route through a single internal scratch. We pick based on the
-    // num_heads value (n_q vs n_kv) — q_rot_ for the larger head count, k_rot_
-    // for the smaller. Match against cfg_ so we use the right buffer.
-    bt::Tensor& scratch = (num_heads == cfg_.num_attention_heads) ? q_rot_ : k_rot_;
-    brolm::detail::resize_like(scratch, L, rot_cols, qk.dtype, qk.device);
+    const bt::Device dev = qk.device;
 
-    // Rotary subrange qk -> scratch: the first rd columns of each head, one
-    // strided device copy over L*num_heads rows (was a copy_d2d per row per
-    // head).
+    MRopeDeviceState* dev_st = nullptr;
+    for (auto& s : mrope_states_) {
+        if (s.device == dev) {
+            dev_st = &s;
+            break;
+        }
+    }
+    if (!dev_st) {
+        mrope_states_.push_back(MRopeDeviceState{});
+        dev_st = &mrope_states_.back();
+        dev_st->device = dev;
+    }
+
+    if (mrope_max_pos_ > dev_st->tbl_max_pos) {
+        const int cap = std::max({mrope_max_pos_, 2 * dev_st->tbl_max_pos, 1023});
+        MRopePairing pairing = mrope_pairing(d_t_, d_h_, d_w_);
+        build_axis_tables(cap, d_t_, rd, cfg_.rope.rope_theta,
+                          pairing.t_pairs, dev_st->cos_t, dev_st->sin_t, dev);
+        build_axis_tables(cap, d_h_, rd, cfg_.rope.rope_theta,
+                          pairing.h_pairs, dev_st->cos_h, dev_st->sin_h, dev);
+        build_axis_tables(cap, d_w_, rd, cfg_.rope.rope_theta,
+                          pairing.w_pairs, dev_st->cos_w, dev_st->sin_w, dev);
+        dev_st->tbl_max_pos = cap;
+    }
+
+    dev_st->pos_t_dev = make_idx_device(pos_t_host_.data(), L, dev);
+    dev_st->pos_h_dev = make_idx_device(pos_h_host_.data(), L, dev);
+    dev_st->pos_w_dev = make_idx_device(pos_w_host_.data(), L, dev);
+
+    // Choose a scratch tensor: q_rot_ or k_rot_
+    bt::Tensor& scratch = (num_heads == cfg_.num_attention_heads) ? q_rot_ : k_rot_;
+    brolm::detail::resize_like(scratch, L, rot_cols, qk.dtype, dev);
+
+    // Rotary subrange qk -> scratch: the first rd columns of each head
     bt::copy_d2d_strided(qk, 0, HD, scratch, 0, rd,
                          /*width=*/rd, /*height=*/L * num_heads);
 
     bt::rope_apply_mrope(
         scratch,
-        mrope_cos_t_, mrope_sin_t_,
-        mrope_cos_h_, mrope_sin_h_,
-        mrope_cos_w_, mrope_sin_w_,
-        static_cast<const int32_t*>(pos_t_dev_.data),
-        static_cast<const int32_t*>(pos_h_dev_.data),
-        static_cast<const int32_t*>(pos_w_dev_.data),
+        dev_st->cos_t, dev_st->sin_t,
+        dev_st->cos_h, dev_st->sin_h,
+        dev_st->cos_w, dev_st->sin_w,
+        static_cast<const int32_t*>(dev_st->pos_t_dev.data),
+        static_cast<const int32_t*>(dev_st->pos_h_dev.data),
+        static_cast<const int32_t*>(dev_st->pos_w_dev.data),
         /*head_dim=*/rd,
         /*num_heads=*/num_heads,
         /*d_t=*/d_t_, /*d_h=*/d_h_, /*d_w=*/d_w_,
@@ -663,7 +720,7 @@ bt::Tensor TextModel::embed_tokens(const std::vector<int>& token_ids) const {
         ids32[static_cast<std::size_t>(i)] =
             static_cast<int32_t>(token_ids[static_cast<std::size_t>(i)]);
     }
-    bt::Tensor ids_dev = make_idx_device(ids32.data(), L);
+    bt::Tensor ids_dev = make_idx_device(ids32.data(), L, embed_device());
     bt::Tensor out;
     bt::embedding_lookup_forward(
         embed_, static_cast<const int32_t*>(ids_dev.data), L, out);
@@ -727,9 +784,29 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
     // don't mutate the caller's tensor across the layer stack.
     h_ = embeds.clone();
 
+    bt::Device prev_dev = bt::Device::CPU;
+
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
         LayerSlot& layer = layers_[static_cast<std::size_t>(li)];
         LayerCache& c    = cache[static_cast<std::size_t>(li)];
+        const bt::Device cur_dev = layer_device(li);
+
+        if (h_.device != cur_dev) {
+            h_ = h_.to(cur_dev);
+        }
+        if (cur_dev != prev_dev) {
+            norm_ = bt::Tensor();
+            q_ = bt::Tensor(); k_ = bt::Tensor(); v_ = bt::Tensor(); gate_ = bt::Tensor();
+            qn_ = bt::Tensor(); kn_ = bt::Tensor(); q_rot_ = bt::Tensor(); k_rot_ = bt::Tensor();
+            attn_ = bt::Tensor(); gate_sig_ = bt::Tensor(); proj_ = bt::Tensor();
+            mlp_gate_ = bt::Tensor(); mlp_up_ = bt::Tensor();
+            lin_qkv_ = bt::Tensor(); lin_qkv_ncl_ = bt::Tensor(); lin_conv_ncl_ = bt::Tensor();
+            lin_qkv_conv_ = bt::Tensor(); lin_q_ = bt::Tensor(); lin_k_ = bt::Tensor(); lin_v_ = bt::Tensor();
+            lin_a_raw_ = bt::Tensor(); lin_beta_ = bt::Tensor(); lin_z_ = bt::Tensor(); lin_zsilu_ = bt::Tensor();
+            lin_O_ = bt::Tensor(); lin_O_norm_ = bt::Tensor(); lin_log_A_ = bt::Tensor();
+            lin_x_fp32_ = bt::Tensor(); lin_proj_cast_ = bt::Tensor();
+            prev_dev = cur_dev;
+        }
 
         // ── attention sub-layer ───────────────────────────────────────────
         bt::rms_norm_forward(h_, layer.in_norm, eps, norm_);
@@ -962,9 +1039,15 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
         mlp_block_(layer.mlp, L);
     }
 
-    // Final RMSNorm + tied LM head.
+    // Final RMSNorm + tied LM head on final_device().
+    if (h_.device != final_device()) {
+        h_ = h_.to(final_device());
+    }
+    if (final_device() != prev_dev) {
+        norm_ = bt::Tensor();
+    }
     bt::rms_norm_forward(h_, final_norm_, eps, norm_);
-    detail::linear_batched(embed_, /*bias=*/nullptr, norm_, logits_out);
+    detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
     (void)q_dim;
 }
 

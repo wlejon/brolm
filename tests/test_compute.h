@@ -36,6 +36,14 @@ inline std::vector<float> bd_download(const brotensor::Tensor& t) {
         }
         return out;
     }
+    if (t.dtype == brotensor::Dtype::BF16) {
+        std::vector<uint16_t> bits = t.to_host_vector_bf16();
+        std::vector<float> out(bits.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            out[i] = brotensor::bf16_bits_to_fp32(bits[i]);
+        }
+        return out;
+    }
     return t.to_host_vector();
 }
 

@@ -186,7 +186,10 @@ int main() {
 
         CHECK(out.rows == L);
         CHECK(out.cols == D);
-        CHECK(out.dtype == brolm::compute_dtype());
+        const auto expected_dt =
+            (bt::default_device().is_cuda() ? bt::Dtype::BF16
+                                            : brolm::compute_dtype());
+        CHECK(out.dtype == expected_dt);
 
         out_vals1 = bdtest::bd_download(out);
         int nonfinite = 0;

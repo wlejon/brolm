@@ -192,6 +192,12 @@ public:
 
     const Qwen35Config::Text& config() const { return cfg_; }
 
+    // Multi-device pipeline device placement helpers.
+    brotensor::Device stage_device(int stage_idx) const;
+    brotensor::Device layer_device(int layer_idx) const;
+    brotensor::Device embed_device() const;
+    brotensor::Device final_device() const;
+
 private:
     // Per-layer weight bundle for a full_attention layer.
     struct FullAttnLayer {
@@ -263,6 +269,7 @@ private:
     // Weights.
     brotensor::Tensor embed_;       // (vocab, hidden)
     brotensor::Tensor final_norm_;  // (hidden,)
+    brotensor::Tensor lm_head_;     // (vocab, hidden) on final_device()
     std::vector<LayerSlot> layers_;
 
     // Per-call scratch buffers, kept alive across forwards to avoid realloc.
@@ -280,13 +287,19 @@ private:
                                             // activation in place
 
     // M-RoPE state staged by prepare_mrope_: per-axis cos/sin tables cached
-    // to `mrope_tbl_max_pos_` (inclusive), and the call's device-resident
+    // per device to `tbl_max_pos` (inclusive), and the call's device-resident
     // int32 position streams.
-    brotensor::Tensor mrope_cos_t_, mrope_sin_t_;
-    brotensor::Tensor mrope_cos_h_, mrope_sin_h_;
-    brotensor::Tensor mrope_cos_w_, mrope_sin_w_;
-    int mrope_tbl_max_pos_ = -1;
-    brotensor::Tensor pos_t_dev_, pos_h_dev_, pos_w_dev_;
+    struct MRopeDeviceState {
+        brotensor::Device device;
+        brotensor::Tensor cos_t, sin_t;
+        brotensor::Tensor cos_h, sin_h;
+        brotensor::Tensor cos_w, sin_w;
+        int tbl_max_pos = -1;
+        brotensor::Tensor pos_t_dev, pos_h_dev, pos_w_dev;
+    };
+    std::vector<MRopeDeviceState> mrope_states_;
+    std::vector<int32_t> pos_t_host_, pos_h_host_, pos_w_host_;
+    int mrope_max_pos_ = 0;
 
     // Linear-attention scratch (see qwen35_text.cpp linear_attn_block_).
     brotensor::Tensor lin_qkv_;        // (T, 3*num_heads*head_dim)

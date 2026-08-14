@@ -14,6 +14,8 @@
 // Field naming follows the HF JSON key names verbatim where possible. The few
 // places we diverge are commented at the field.
 
+#include "brotensor/tensor.h"
+
 #include <string>
 #include <vector>
 
@@ -78,6 +80,10 @@ struct Qwen35Config {
         // optionally for speculative decoding.
         int   mtp_num_hidden_layers      = 1;
         bool  mtp_use_dedicated_embeddings = false;
+
+        // Multi-device pipeline parallelism (empty = single device).
+        // Layers are partitioned across the specified devices.
+        std::vector<brotensor::Device> pipeline_devices;
 
         int rotary_dim() const;     // == round_even(head_dim * partial_rotary_factor)
     } text;

@@ -20,6 +20,8 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#include "test_compute.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -162,18 +164,7 @@ std::vector<float> run_forward(const st::File& file, const t5::T5Config& cfg,
     bt::Tensor out;
     enc.forward(ids.data(), static_cast<int>(ids.size()), out);
     bt::sync_all();
-    const std::size_t n = static_cast<std::size_t>(out.size());
-    if (out.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(n);
-        out.copy_to_host_fp16(bits.data());
-        bt::sync_all();
-        std::vector<float> vals(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            vals[i] = bt::fp16_bits_to_fp32(bits[i]);
-        }
-        return vals;
-    }
-    return out.to_host_vector();
+    return bdtest::bd_download(out);
 }
 
 }  // namespace
