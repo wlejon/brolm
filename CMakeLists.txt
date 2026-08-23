@@ -115,6 +115,8 @@ endif()
 
 target_sources(brolm PRIVATE
     src/version.cpp
+    src/grammar.cpp
+    src/sampler.cpp
     src/detail/byte_level_bpe.cpp
     src/detail/spm_unigram.cpp
     src/detail/spm_bpe.cpp
