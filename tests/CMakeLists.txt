@@ -19,6 +19,13 @@ brolm_add_test(brolm_test_nllb_decoder   test_nllb_decoder.cpp)
 brolm_add_test(brolm_test_nllb_beam      test_nllb_beam.cpp)
 brolm_add_test(brolm_test_nllb           test_nllb.cpp)
 brolm_add_test(brolm_test_qwen_tokenizer test_qwen_tokenizer.cpp)
+brolm_add_test(brolm_test_qwen_tokenizer_unicode test_qwen_tokenizer_unicode.cpp)
+# HF-oracle fixture lives in tests/ref/; the reference tokenizer.json files
+# are looked up in the sibling checkouts (or BROLM_OMNIVOICE_DIR /
+# BROLM_QWEN_TTS_DIR) and the comparison skips when absent.
+target_compile_definitions(brolm_test_qwen_tokenizer_unicode PRIVATE
+    BROLM_TEST_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ref"
+    BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")
 brolm_add_test(brolm_test_llama3_tokenizer test_llama3_tokenizer.cpp)
 brolm_add_test(brolm_test_gemma_tokenizer test_gemma_tokenizer.cpp)
 brolm_add_test(brolm_test_mistral_tokenizer test_mistral_tokenizer.cpp)

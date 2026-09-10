@@ -118,6 +118,7 @@ target_sources(brolm PRIVATE
     src/grammar.cpp
     src/sampler.cpp
     src/detail/byte_level_bpe.cpp
+    src/detail/unicode.cpp
     src/detail/spm_unigram.cpp
     src/detail/spm_bpe.cpp
     src/detail/spm_normalizer.cpp

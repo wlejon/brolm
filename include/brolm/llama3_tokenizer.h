@@ -13,10 +13,12 @@
 // the Llama-3 control tokens as named accessors, prepends the begin-of-text
 // token on encode, and renders the Llama-3 header/turn chat template.
 //
-// Pre-tokenization is inherited from qwen::Tokenizer — the ASCII-focused GPT-2
-// approximation, which matches HF behaviour on English and code (the LLM2Vec /
-// ARDY use case). Llama-3's tiktoken-style Unicode-property regex is not
-// reproduced; full-fidelity parity on non-English input is out of scope.
+// Pre-tokenization is inherited from qwen::Tokenizer, which reproduces the HF
+// Split regex over Unicode properties and reads the Llama-3 variants from the
+// tokenizer.json itself: no NFC normalizer, and \p{N}{1,3} (digit runs of up
+// to three) in place of Qwen's single-digit \p{N}. Parity is asserted against
+// HF for the Qwen regex (tests/test_qwen_tokenizer_unicode.cpp); the Llama-3
+// digit rule is covered by a synthetic file there, not by the real 128k vocab.
 
 #include "brolm/qwen_tokenizer.h"
 

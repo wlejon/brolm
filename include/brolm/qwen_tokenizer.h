@@ -15,16 +15,22 @@
 //     matched verbatim in the input and emitted as their single vocab id
 //     *before* byte-level BPE runs on the surrounding text.
 //
-// Pre-tokenization is ASCII-focused (mirrors clip::Tokenizer): runs of
-// letters, single digits, runs of other non-whitespace punctuation, and
-// contraction splits ('s, 't, 're, 've, 'm, 'll, 'd). Unlike CLIP, leading
-// whitespace is NOT dropped — it is folded into the following pre-token via
-// the GPT-2 leading-space (Ġ) convention, so " hello" is one pre-token.
-// Non-ASCII bytes still flow through the byte-level encoding correctly but are
-// lumped into the "punctuation run" category rather than the Unicode
-// letter/digit categories HF's full regex uses. In practice this matches HF
-// behavior on English and code prompts, which is the target use case. Full
-// Unicode-property regex pre-tokenization is out of scope.
+// Pre-tokenization reproduces the Hugging Face `tokenizers` Split regex of
+// the Qwen2/Qwen3 tokenizer.json exactly, over code points with real Unicode
+// properties (brolm/detail/unicode.h):
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}
+//   | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// so CJK, Cyrillic, Arabic, Indic, Thai, emoji and every other script get the
+// same pre-token boundaries — and therefore the same ids — as HF. Text is NFC-
+// normalized first, as the Qwen2 tokenizer.json's normalizer (and the slow
+// Qwen2Tokenizer) do. Unlike CLIP, leading whitespace is NOT dropped — it is
+// folded into the following pre-token via the GPT-2 leading-space (Ġ)
+// convention, so " hello" is one pre-token. Invalid UTF-8 bytes are treated as
+// "other" characters and round-trip through the byte-level encoding.
+//
+// A tokenizer.json's own normalizer / pre_tokenizer blocks are honoured on
+// load: Llama-3's file (no normalizer, \p{N}{1,3}) selects those variants;
+// vocab.json + merges.txt and GGUF loads use the Qwen2 conventions above.
 
 #include <cstdint>
 #include <string>
@@ -66,8 +72,14 @@ public:
     //   model.vocab   — object { "token": id, ... }
     //   model.merges  — array of "a b" strings, or ["a","b"] pairs (newer HF)
     //   added_tokens  — array of { "id", "content", "special" }; each is added
-    //                   to the vocab and, when "special" is true (the default),
-    //                   registered as an atomic special matched before BPE.
+    //                   to the vocab and registered as an atomic special
+    //                   matched before BPE, whatever its "special" flag (HF
+    //                   extracts every added token verbatim; the flag only
+    //                   governs skip_special_tokens on decode).
+    //   normalizer    — an NFC normalizer (Qwen2/Qwen3) turns on NFC
+    //                   normalization in encode(); null (Llama-3) turns it off.
+    //   pre_tokenizer — the Split regex's digit rule (\p{N} vs \p{N}{1,3})
+    //                   selects single-digit or up-to-three-digit pre-tokens.
     // This is the same GPT-2 byte-level BPE as load(); only the container
     // differs. Models that ship a single tokenizer.json instead of the
     // vocab.json + merges.txt pair — Llama-3 among them — load through here.
@@ -90,7 +102,10 @@ public:
 
     // Inverse of encode: ids -> vocab pieces -> byte-decode -> UTF-8 string.
     // Special-token ids decode to their literal string form. Unknown ids are
-    // skipped. decode(encode(s)) round-trips for ASCII text.
+    // skipped. decode(encode(s)) == s for any byte string that is already
+    // NFC-normalized (all ASCII, all precomposed text, and invalid UTF-8
+    // alike); input that is not in NFC comes back in NFC form, exactly as it
+    // does through HF.
     std::string decode(const std::vector<int32_t>& ids) const;
 
     // Render a ChatML conversation: for each (role, content) pair emit
@@ -103,6 +118,13 @@ public:
 
     std::size_t vocab_count() const { return vocab_.size(); }
     std::size_t merge_count() const { return merge_ranks_.size(); }
+
+    // Pre-tokenization conventions in effect: whether encode() NFC-normalizes
+    // its input, and the longest digit run one \p{N} pre-token may hold (1
+    // for Qwen2/Qwen3, 3 for Llama-3). Set from a tokenizer.json's normalizer
+    // and pre_tokenizer blocks; the other loaders use the Qwen2 defaults.
+    bool normalizes_nfc() const { return normalize_nfc_; }
+    int digit_run_max() const { return digit_run_max_; }
 
     // Register `token` as an atomic special with the given `id`. Updates the
     // forward / inverse special-token maps used by encode() and decode(); the
@@ -149,6 +171,10 @@ private:
     int im_start_id_   = -1;
     int im_end_id_     = -1;
     int endoftext_id_  = -1;
+
+    // Qwen2 defaults; from_tokenizer_json overrides from the file.
+    bool normalize_nfc_ = true;
+    int digit_run_max_  = 1;
 };
 
 }  // namespace brolm::qwen

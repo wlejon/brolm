@@ -2,6 +2,7 @@
 
 #include "brolm/detail/byte_level_bpe.h"
 #include "brolm/detail/json.h"
+#include "brolm/detail/unicode.h"
 #include "brotensor/gguf.h"
 
 #include <cstdint>
@@ -15,6 +16,7 @@
 namespace brolm::qwen {
 
 namespace bpe = brolm::detail::bpe;
+namespace j = brolm::detail::json;
 
 // ─── BPE delegation ────────────────────────────────────────────────────────
 
@@ -23,101 +25,209 @@ std::vector<std::string> Tokenizer::bpe_(const std::string& token) const {
     return bpe::bpe_merge(token, merge_ranks_, /*append_end_of_word=*/false);
 }
 
-// ─── Pre-tokenization (GPT-2 / Qwen) ───────────────────────────────────────
+// ─── Pre-tokenization (GPT-2 / Qwen2 / Llama-3) ────────────────────────────
 //
-// GPT-2 regex (simplified):
-//   's | 't | 're | 've | 'm | 'll | 'd
-//   | ?letters+ | ?digits+ | ?punctuation+ | whitespace-runs
+// The Hugging Face `tokenizers` Split regex these families share, run over
+// code points with Unicode properties (\p{L}, \p{N}, and \s = White_Space):
 //
-// where "?" is an optional single leading space folded into the token. ASCII-
-// focused (non-ASCII bytes lump into the punct run); unlike CLIP, whitespace
-// is preserved (folded in or emitted as its own piece) rather than dropped.
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)      contraction after an ASCII apostrophe
+//   | [^\r\n\p{L}\p{N}]?\p{L}+        one optional non-letter/digit lead-in
+//                                      (a space, tab, NBSP, CJK stop, ...),
+//                                      then a letter run
+//   | \p{N}                           one digit-like code point each (Qwen);
+//                                      Llama-3 has \p{N}{1,3}
+//   |  ?[^\s\p{L}\p{N}]+[\r\n]*       optional space, an "other" run, then
+//                                      any trailing CR/LF
+//   | \s*[\r\n]+                      whitespace ending in the run's last
+//                                      newline
+//   | \s+(?!\S)                       a whitespace run followed by non-space
+//                                      keeps its last char for the next piece
+//   | \s+                             the remaining whitespace
+//
+// Alternatives are tried in this order at every position, as a backtracking
+// engine would; each branch below is the leftmost alternative that matches,
+// with the backtracking cases worked out by hand. The (?i) uses Unicode simple
+// case folding, whose only non-ASCII member for these letters is U+017F LATIN
+// SMALL LETTER LONG S (folds to 's').
 
 namespace {
 
-std::vector<std::string> pre_tokenize(std::string_view text) {
-    std::vector<std::string> pieces;
+namespace uni = brolm::detail::unicode;
+
+// Lowercase the ASCII letters and the long s; everything else is unchanged.
+uint32_t fold_contraction_char(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
+    if (cp == 0x017F) return 's';
+    return cp;
+}
+
+bool is_newline(uint32_t cp) { return cp == '\r' || cp == '\n'; }
+
+// Neither white space nor a letter nor a number: [^\s\p{L}\p{N}].
+bool is_other(uint32_t cp) {
+    return !uni::is_white_space(cp) && !uni::is_letter(cp) && !uni::is_number(cp);
+}
+
+// Split `text` into the regex's pre-tokens, each a view into `text`. Digit
+// runs are capped at `digit_run_max` code points (1 for Qwen, 3 for Llama-3).
+std::vector<std::string_view> pre_tokenize(std::string_view text,
+                                           int digit_run_max) {
+    // Decode once; offs[k] is the byte offset of code point k, offs[n] the end.
+    std::vector<uint32_t> cps;
+    std::vector<std::size_t> offs;
+    cps.reserve(text.size());
+    offs.reserve(text.size() + 1);
+    for (std::size_t i = 0; i < text.size();) {
+        offs.push_back(i);
+        cps.push_back(uni::decode_utf8(text, i));
+    }
+    offs.push_back(text.size());
+    const std::size_t n = cps.size();
+
+    std::vector<std::string_view> pieces;
+    auto emit = [&](std::size_t a, std::size_t b) {
+        pieces.push_back(text.substr(offs[a], offs[b] - offs[a]));
+    };
+
     std::size_t i = 0;
-    while (i < text.size()) {
-        unsigned char c = static_cast<unsigned char>(text[i]);
+    while (i < n) {
+        const uint32_t c = cps[i];
 
-        if (c == '\'') {
-            if (bpe::starts_with(text, i, "'re")) { pieces.emplace_back("'re"); i += 3; continue; }
-            if (bpe::starts_with(text, i, "'ve")) { pieces.emplace_back("'ve"); i += 3; continue; }
-            if (bpe::starts_with(text, i, "'ll")) { pieces.emplace_back("'ll"); i += 3; continue; }
-            if (bpe::starts_with(text, i, "'s"))  { pieces.emplace_back("'s");  i += 2; continue; }
-            if (bpe::starts_with(text, i, "'t"))  { pieces.emplace_back("'t");  i += 2; continue; }
-            if (bpe::starts_with(text, i, "'m"))  { pieces.emplace_back("'m");  i += 2; continue; }
-            if (bpe::starts_with(text, i, "'d"))  { pieces.emplace_back("'d");  i += 2; continue; }
-        }
-
-        // Optional single leading space folds into the following run.
-        std::size_t start = i;
-        bool have_lead_space = false;
-        if (c == ' ') {
-            if (i + 1 < text.size()) {
-                unsigned char d = static_cast<unsigned char>(text[i + 1]);
-                if (!bpe::is_ascii_space(d)) {
-                    have_lead_space = true;
-                    ++i;
-                    c = d;
-                }
-            }
-            if (!have_lead_space) {
-                pieces.emplace_back(text.substr(i, 1));
-                ++i;
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (c == '\'' && i + 1 < n) {
+            const uint32_t d = fold_contraction_char(cps[i + 1]);
+            if (d == 's' || d == 't' || d == 'm' || d == 'd') {
+                emit(i, i + 2);
+                i += 2;
                 continue;
             }
-        } else if (bpe::is_ascii_space(c)) {
-            // Non-space whitespace (tab/newline/...) emits as its own run.
-            std::size_t j = i;
-            while (j < text.size() &&
-                   bpe::is_ascii_space(static_cast<unsigned char>(text[j])) &&
-                   text[j] != ' ') ++j;
-            pieces.emplace_back(text.substr(i, j - i));
-            i = j;
-            continue;
-        }
-
-        if (bpe::is_ascii_letter(c)) {
-            std::size_t j = i;
-            while (j < text.size() &&
-                   bpe::is_ascii_letter(static_cast<unsigned char>(text[j]))) ++j;
-            pieces.emplace_back(text.substr(start, j - start));
-            i = j;
-            continue;
-        }
-
-        if (bpe::is_ascii_digit(c)) {
-            std::size_t j = i;
-            while (j < text.size() &&
-                   bpe::is_ascii_digit(static_cast<unsigned char>(text[j]))) ++j;
-            pieces.emplace_back(text.substr(start, j - start));
-            i = j;
-            continue;
-        }
-
-        // Punct run.
-        std::size_t j = i;
-        while (j < text.size()) {
-            unsigned char u = static_cast<unsigned char>(text[j]);
-            if (bpe::is_ascii_space(u) || bpe::is_ascii_letter(u) ||
-                bpe::is_ascii_digit(u)) break;
-            if (u == '\'' && j != i) {
-                std::string_view rest = text.substr(j);
-                if (rest.substr(0, 3) == "'re" || rest.substr(0, 3) == "'ve" ||
-                    rest.substr(0, 3) == "'ll" ||
-                    rest.substr(0, 2) == "'s"  || rest.substr(0, 2) == "'t"  ||
-                    rest.substr(0, 2) == "'m"  || rest.substr(0, 2) == "'d") {
-                    break;
+            if (i + 2 < n) {
+                const uint32_t e = fold_contraction_char(cps[i + 2]);
+                if ((d == 'r' && e == 'e') || (d == 'v' && e == 'e') ||
+                    (d == 'l' && e == 'l')) {
+                    emit(i, i + 3);
+                    i += 3;
+                    continue;
                 }
             }
-            ++j;
         }
-        pieces.emplace_back(text.substr(start, j - start));
-        i = j;
+
+        // [^\r\n\p{L}\p{N}]?\p{L}+ — with the optional lead-in, the letter run
+        // must start at i+1; without it, at i. Both cannot hold at once, so
+        // there is nothing to backtrack over.
+        {
+            std::size_t j = i;
+            if (!uni::is_letter(c) && !uni::is_number(c) && !is_newline(c)) ++j;
+            if (j < n && uni::is_letter(cps[j])) {
+                std::size_t k = j + 1;
+                while (k < n && uni::is_letter(cps[k])) ++k;
+                emit(i, k);
+                i = k;
+                continue;
+            }
+        }
+
+        // \p{N} (or \p{N}{1,3})
+        if (uni::is_number(c)) {
+            std::size_t k = i + 1;
+            while (k < n && k - i < static_cast<std::size_t>(digit_run_max) &&
+                   uni::is_number(cps[k])) ++k;
+            emit(i, k);
+            i = k;
+            continue;
+        }
+
+        //  ?[^\s\p{L}\p{N}]+[\r\n]*
+        {
+            std::size_t j = i;
+            if (c == ' ') ++j;
+            if (j < n && is_other(cps[j])) {
+                std::size_t k = j + 1;
+                while (k < n && is_other(cps[k])) ++k;
+                while (k < n && is_newline(cps[k])) ++k;
+                emit(i, k);
+                i = k;
+                continue;
+            }
+        }
+
+        // The remaining alternatives all start with a whitespace run.
+        if (!uni::is_white_space(c)) {
+            emit(i, i + 1);  // unreachable: every code point is in some class
+            ++i;
+            continue;
+        }
+        std::size_t run_end = i + 1;
+        while (run_end < n && uni::is_white_space(cps[run_end])) ++run_end;
+
+        // \s*[\r\n]+ — greedy \s* backs off to the last CR/LF in the run, so
+        // the piece is the run up to and including that newline.
+        {
+            std::size_t after_last_nl = 0;
+            for (std::size_t k = run_end; k > i; --k) {
+                if (is_newline(cps[k - 1])) { after_last_nl = k; break; }
+            }
+            if (after_last_nl != 0) {
+                emit(i, after_last_nl);
+                i = after_last_nl;
+                continue;
+            }
+        }
+
+        // \s+(?!\S) — at end of input the whole run; before a non-space the
+        // run minus its last char (which then leads the next piece), unless
+        // that leaves nothing, in which case \s+ takes the single char.
+        if (run_end == n) {
+            emit(i, run_end);
+        } else if (run_end - i > 1) {
+            emit(i, run_end - 1);
+            i = run_end - 1;
+            continue;
+        } else {
+            emit(i, run_end);  // \s+
+        }
+        i = run_end;
     }
     return pieces;
+}
+
+// Read the pre-tokenizer conventions out of a tokenizer.json: whether an NFC
+// normalizer runs first, and how long a digit run the Split regex allows.
+// Anything unrecognised keeps the Qwen2 defaults.
+void read_pre_tokenizer_config(const j::Value& root, bool& nfc, int& digit_run_max) {
+    if (const j::Value* norm = root.find("normalizer"); norm && norm->is_object()) {
+        auto is_nfc = [](const j::Value& v) {
+            const j::Value* t = v.find("type");
+            return t && t->is_string() && t->as_string() == "NFC";
+        };
+        nfc = is_nfc(*norm);
+        if (const j::Value* seq = norm->find("normalizers"); seq && seq->is_array()) {
+            for (const auto& v : seq->as_array()) {
+                if (v.is_object() && is_nfc(v)) nfc = true;
+            }
+        }
+    } else if (norm && norm->is_null()) {
+        nfc = false;
+    }
+
+    const j::Value* pre = root.find("pre_tokenizer");
+    if (!pre || !pre->is_object()) return;
+    auto scan_split = [&](const j::Value& v) {
+        const j::Value* t = v.find("type");
+        if (!t || !t->is_string() || t->as_string() != "Split") return;
+        const j::Value* pat = v.find("pattern");
+        if (!pat || !pat->is_object()) return;
+        const j::Value* re = pat->find("Regex");
+        if (!re || !re->is_string()) return;
+        digit_run_max =
+            re->as_string().find("\\p{N}{1,3}") != std::string::npos ? 3 : 1;
+    };
+    scan_split(*pre);
+    if (const j::Value* seq = pre->find("pretokenizers"); seq && seq->is_array()) {
+        for (const auto& v : seq->as_array()) {
+            if (v.is_object()) scan_split(v);
+        }
+    }
 }
 
 }  // namespace
@@ -252,8 +362,6 @@ Tokenizer Tokenizer::from_gguf(
 
 namespace {
 
-namespace j = brolm::detail::json;
-
 std::string slurp_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error(
@@ -342,7 +450,10 @@ Tokenizer Tokenizer::from_tokenizer_json(
     // added_tokens: [{ "id": N, "content": "<|...|>", "special": true }, ...].
     // These carry the control specials (Llama-3's live at 128000..128255) that
     // may not appear in model.vocab. Add each to the vocab so decode() renders
-    // it, and register the special-flagged ones as atomic specials.
+    // it, and register every one as an atomic special: HF extracts all added
+    // tokens verbatim before the model runs, the special flag only governing
+    // skip_special_tokens on decode — Qwen's <think> / <tool_call> are
+    // "special": false yet still encode to their single id.
     if (const j::Value* at = root.find("added_tokens"); at && at->is_array()) {
         for (const auto& tok : at->as_array()) {
             if (!tok.is_object()) continue;
@@ -354,17 +465,18 @@ Tokenizer Tokenizer::from_tokenizer_json(
             const std::string& s = content->as_string();
             const int32_t id = static_cast<int32_t>(idv->as_number());
             t.vocab_[s] = id;
-            bool special = true;  // added_tokens default to special in HF
-            if (const j::Value* sp = tok.find("special"); sp && sp->is_bool()) {
-                special = sp->as_bool();
-            }
-            if (special) t.specials_.add(s, id);
+            t.specials_.add(s, id);
         }
     }
 
     for (const auto& [tok, id] : t.vocab_) {
         t.id_to_token_.emplace(id, tok);
     }
+
+    // Normalizer + Split-regex conventions: Qwen2/Qwen3 files carry an NFC
+    // normalizer and split digits singly; Llama-3's has no normalizer and
+    // \p{N}{1,3}. Absent blocks keep the Qwen2 defaults.
+    read_pre_tokenizer_config(root, t.normalize_nfc_, t.digit_run_max_);
 
     // Caller extras + Qwen built-ins (registered only if present in the vocab;
     // for a Llama-3 tokenizer.json none of the Qwen names exist, so these are
@@ -408,11 +520,20 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text,
     ids.reserve(text.size());
 
     // Walk the input, splitting out verbatim special-token substrings and
-    // BPE-encoding the spans between them via GPT-2 pre-tokenization.
+    // BPE-encoding the spans between them: NFC first (HF matches specials on
+    // the raw text and normalizes the segments between, which is the same
+    // order), then the Unicode-property pre-tokenizer.
     bpe::encode_with_specials(
         text, specials_,
         [this](std::string_view span, std::vector<int32_t>& out) {
-            for (const auto& p : pre_tokenize(span)) encode_piece_(p, out);
+            std::string normalized;
+            if (normalize_nfc_ && !uni::is_nfc(span)) {
+                normalized = uni::nfc(span);
+                span = normalized;
+            }
+            for (const auto p : pre_tokenize(span, digit_run_max_)) {
+                encode_piece_(p, out);
+            }
         },
         ids);
 
