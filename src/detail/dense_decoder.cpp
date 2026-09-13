@@ -6,6 +6,7 @@
 #include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
+#include "brotensor/ops/fused.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
@@ -493,8 +494,12 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
             dst.cols = num_heads * HD;
         };
 
-        for (Layer& layer : layers_) {
-            bt::rms_norm_forward(s.h, layer.input_ln, eps, s.norm);
+        if (!layers_.empty()) {
+            bt::rms_norm_forward(s.h, layers_[0].input_ln, eps, s.norm);
+        }
+
+        for (std::size_t i = 0; i < layers_.size(); ++i) {
+            Layer& layer = layers_[i];
 
             detail::linear_batched(layer.Wq, /*bias=*/nullptr, s.norm, s.q);
             detail::linear_batched(layer.Wk, /*bias=*/nullptr, s.norm, s.k);
@@ -520,9 +525,8 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
                 static_cast<const float*>(s.mask.data), n_q, n_kv, s.attn);
 
             detail::linear_batched(layer.Wo, /*bias=*/nullptr, s.attn, s.proj);
-            bt::add_inplace(s.h, s.proj);
+            bt::fused_residual_rmsnorm(s.h, s.proj, layer.post_attn_ln, eps, s.norm);
 
-            bt::rms_norm_forward(s.h, layer.post_attn_ln, eps, s.norm);
             detail::linear_batched(layer.gate_W, /*bias=*/nullptr, s.norm,
                                    s.gate);
             detail::linear_batched(layer.up_W, /*bias=*/nullptr, s.norm, s.up);
@@ -530,10 +534,13 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
             bt::mul_inplace(s.gate, s.up);
             detail::linear_batched(layer.down_W, /*bias=*/nullptr, s.gate,
                                    s.proj);
-            bt::add_inplace(s.h, s.proj);
+            if (i + 1 < layers_.size()) {
+                bt::fused_residual_rmsnorm(s.h, s.proj, layers_[i + 1].input_ln, eps, s.norm);
+            } else {
+                bt::fused_residual_rmsnorm(s.h, s.proj, final_norm_, eps, s.norm);
+            }
         }
 
-        bt::rms_norm_forward(s.h, final_norm_, eps, s.norm);
         detail::linear_batched(lm_head_, /*bias=*/nullptr, s.norm, s.logits);
     };
 
@@ -618,7 +625,9 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         // ── self-attention sub-layer ──────────────────────────────────────
         {
             prof::ScopedStage ps(PStage::rms_norm);
-            bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+            if (i == 0 || cur_dev != prev_dev) {
+                bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
+            }
         }
 
         {
@@ -675,15 +684,10 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         }
         {
             prof::ScopedStage ps(PStage::residual_add);
-            bt::add_inplace(h_, proj_);
+            bt::fused_residual_rmsnorm(h_, proj_, layer.post_attn_ln, eps, norm_);
         }
 
         // ── MLP sub-layer (SwiGLU) ────────────────────────────────────────
-        {
-            prof::ScopedStage ps(PStage::rms_norm);
-            bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
-        }
-
         {
             prof::ScopedStage ps(PStage::mlp_proj);
             detail::linear_batched(layer.gate_W, /*bias=*/nullptr, norm_, gate_);
@@ -704,7 +708,13 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         }
         {
             prof::ScopedStage ps(PStage::residual_add);
-            bt::add_inplace(h_, proj_);
+            if (i + 1 < cfg_.num_hidden_layers && layer_device(i + 1) == cur_dev) {
+                bt::fused_residual_rmsnorm(h_, proj_, layers_[static_cast<std::size_t>(i + 1)].input_ln, eps, norm_);
+            } else if (i + 1 == cfg_.num_hidden_layers && final_device() == cur_dev) {
+                bt::fused_residual_rmsnorm(h_, proj_, final_norm_, eps, norm_);
+            } else {
+                bt::add_inplace(h_, proj_);
+            }
         }
     }
 
@@ -717,7 +727,9 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
     }
     {
         prof::ScopedStage ps(PStage::final_norm);
-        bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+        if (final_device() != prev_dev) {
+            bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+        }
         if (hidden_out) {
             // norm_ is reused scratch across calls; hand the caller stable
             // storage.
@@ -838,13 +850,7 @@ void DenseDecoder::run_layers_encode_(int L, bt::Tensor& hidden_out) {
         }
         {
             prof::ScopedStage ps(PStage::residual_add);
-            bt::add_inplace(h_, proj_);
-        }
-
-        // ── MLP sub-layer (SwiGLU) ────────────────────────────────────────
-        {
-            prof::ScopedStage ps(PStage::rms_norm);
-            bt::rms_norm_forward(h_, layer.post_attn_ln, eps, norm_);
+            bt::fused_residual_rmsnorm(h_, proj_, layer.post_attn_ln, eps, norm_);
         }
         {
             prof::ScopedStage ps(PStage::mlp_proj);
