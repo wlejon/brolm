@@ -1,6 +1,7 @@
 #include "host_lm_internal.h"
 
 #include <chrono>
+#include <mutex>
 
 namespace brolm::api {
 
