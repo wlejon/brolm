@@ -217,6 +217,12 @@ if(BROLM_INSTALL)
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
+# --- Standalone Bronze JavaScript API (before tests, which add a test against it) ---
+option(BROLM_ENABLE_API "Build Bronze JavaScript API" ON)
+if(BROLM_ENABLE_API)
+    add_subdirectory(src/api)
+endif()
+
 # --- Tests ---
 option(BROLM_TESTS "Build brolm tests" ON)
 if(BROLM_TESTS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -228,11 +234,5 @@ endif()
 option(BROLM_TOOLS "Build brolm ad-hoc tool drivers" ON)
 if(BROLM_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tools)
-endif()
-
-# --- Standalone Bronze JavaScript API ---
-option(BROLM_ENABLE_API "Build Bronze JavaScript API" ON)
-if(BROLM_ENABLE_API)
-    add_subdirectory(src/api)
 endif()
 
