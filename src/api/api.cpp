@@ -69,6 +69,20 @@ void installLM() {
     lmObj.set("T5Model", g_t5ModelClass.constructor());
     lmObj.set("AsyncHandle", g_asyncHandleClass.constructor());
 
+    if (!ev::isUndefined(globalThisVal)) {
+        ev::setProperty(globalThisVal, "QwenTokenizer", g_qwenTokenizerClass.constructor());
+        ev::setProperty(globalThisVal, "MistralTokenizer", g_mistralTokenizerClass.constructor());
+        ev::setProperty(globalThisVal, "GemmaTokenizer", g_gemmaTokenizerClass.constructor());
+        ev::setProperty(globalThisVal, "Llama3Tokenizer", g_llama3TokenizerClass.constructor());
+        ev::setProperty(globalThisVal, "LMModel", g_lmModelClass.constructor());
+        ev::setProperty(globalThisVal, "Qwen35Model", g_qwen35ModelClass.constructor());
+        ev::setProperty(globalThisVal, "Qwen3VLModel", g_qwen3VLModelClass.constructor());
+        ev::setProperty(globalThisVal, "ClipModel", g_clipModelClass.constructor());
+        ev::setProperty(globalThisVal, "NllbModel", g_nllbModelClass.constructor());
+        ev::setProperty(globalThisVal, "T5Model", g_t5ModelClass.constructor());
+        ev::setProperty(globalThisVal, "AsyncHandle", g_asyncHandleClass.constructor());
+    }
+
     broP.set(ev::setProperty(broP.get(), "lm", lmObj.build()));
 }
 
