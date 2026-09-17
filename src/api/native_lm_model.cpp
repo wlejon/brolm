@@ -59,8 +59,11 @@ struct AsyncLmJob {
     }
 };
 
-static std::vector<std::shared_ptr<AsyncLmJob>> s_activeJobs;
-static std::mutex s_jobsMutex;
+// Per JS thread: a job's callbacks are Persistents of the realm that
+// launched it and must be delivered there, so a Worker's jobs are ticked by
+// the Worker's own bro.lm.tick() / wait() and never by the main thread's.
+static thread_local std::vector<std::shared_ptr<AsyncLmJob>> s_activeJobs;
+static thread_local std::mutex s_jobsMutex;
 
 void tickLMAsync() {
     std::vector<std::shared_ptr<AsyncLmJob>> jobsToTick;

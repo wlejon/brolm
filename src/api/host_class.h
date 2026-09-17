@@ -39,8 +39,23 @@ namespace brolm::api {
 namespace ev = bronze::embed;
 using Value = bronze::Value;
 
+// A host class: one constructor function + one prototype, with instances
+// born on that prototype by make()/createInstance().
+//
+// The class objects are process-global (`HostClass g_lmModelClass`), but
+// what they hold is PER THREAD: bronze's runtime is per-thread, and a
+// Persistent is a slot in its creating thread's registry, so a constructor
+// made on the main thread means nothing to a Worker's realm. Every accessor
+// reads the CALLING thread's slots and install() fills the calling thread's;
+// a realm installs each class once, and installed() answers for the calling
+// thread.
 class HostClass {
 public:
+    struct Slots {
+        ev::Persistent* proto = nullptr;
+        ev::Persistent* ctor = nullptr;
+    };
+
     void install(const char* name, uint32_t arity, ev::NativeFn body,
                  const std::function<void(ObjectBuilder&)>& decorate = nullptr);
 
@@ -62,9 +77,12 @@ public:
     Value prototype() const;
     Value constructor() const;
 
+    // Whether install() has run on the CALLING thread.
+    bool installed() const;
+
 private:
-    ev::Persistent* proto_ = nullptr;
-    ev::Persistent* ctor_ = nullptr;
+    Slots& slots() const;
+    const Slots* slotsIfAny() const;
 };
 
 Value hostArrayOf(size_t count, const std::function<Value(size_t)>& make);
