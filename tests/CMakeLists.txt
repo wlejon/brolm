@@ -66,6 +66,8 @@ brolm_add_test(brolm_test_qwen3vl_vl           test_qwen3vl_vl.cpp)
 brolm_add_test(brolm_test_pipeline_multigpu    test_pipeline_multigpu.cpp)
 brolm_add_test(brolm_test_qwen35_pipeline_multigpu test_qwen35_pipeline_multigpu.cpp)
 brolm_add_test(brolm_test_grammar_sampler         test_grammar_sampler.cpp)
+brolm_add_test(brolm_test_grammar_jit             test_grammar_jit.cpp)
+target_include_directories(brolm_test_grammar_jit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 # Bronze JavaScript binding (brolm_api): bro.lm mount points and the
 # constructors on globalThis, every loader rejecting no args / a non-string /

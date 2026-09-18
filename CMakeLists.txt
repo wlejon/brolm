@@ -125,12 +125,27 @@ target_include_directories(brolm PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_include_directories(brolm PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+)
 target_compile_features(brolm PUBLIC cxx_std_20)
 target_link_libraries(brolm PUBLIC
     bromath::bromath
     brotensor::brotensor
     broimage::broimage
 )
+
+if(NOT TARGET brass)
+    set(BRASS_DIR "${CMAKE_SOURCE_DIR}/../brass" CACHE PATH "Path to standalone brass repo")
+    if(EXISTS "${BRASS_DIR}/CMakeLists.txt")
+        add_subdirectory("${BRASS_DIR}" "${CMAKE_BINARY_DIR}/brass-build" EXCLUDE_FROM_ALL)
+    endif()
+endif()
+
+if(TARGET brass)
+    target_link_libraries(brolm PUBLIC brass)
+    target_compile_definitions(brolm PUBLIC BROLM_HAS_BRASS_JIT=1)
+endif()
 
 if(MSVC)
     target_compile_options(brolm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
@@ -143,6 +158,9 @@ endif()
 target_sources(brolm PRIVATE
     src/version.cpp
     src/grammar.cpp
+    src/grammar/dfa_compiler.cpp
+    src/grammar/vocab_indexer.cpp
+    src/grammar/grammar_jit.cpp
     src/sampler.cpp
     src/detail/byte_level_bpe.cpp
     src/detail/unicode.cpp
