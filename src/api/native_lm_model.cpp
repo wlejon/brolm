@@ -92,12 +92,13 @@ void tickLMAsync() {
             if (job->worker.joinable()) job->worker.join();
 
             // Deliver any last tokens
+            std::vector<int32_t> lastTokens;
             {
                 std::lock_guard<std::mutex> qLock(job->queueMutex);
-                tokens.swap(job->pendingTokens);
+                lastTokens.swap(job->pendingTokens);
             }
             if (ev::isFunction(job->onTokenCb.get())) {
-                for (int32_t tok : tokens) {
+                for (int32_t tok : lastTokens) {
                     Value arg = ev::fromDouble(tok);
                     ev::call(job->onTokenCb.get(), ev::undefined(), std::span<const Value>(&arg, 1));
                 }
@@ -113,6 +114,17 @@ void tickLMAsync() {
                     Value arrVal = makeInt32Array(job->allGenerated.data(), job->allGenerated.size());
                     ev::call(job->onDoneCb.get(), ev::undefined(), std::span<const Value>(&arrVal, 1));
                 }
+            }
+
+            // Clean up persistents so JS callbacks and model references are released
+            job->onTokenCb.set(ev::undefined());
+            job->onDoneCb.set(ev::undefined());
+            job->onErrorCb.set(ev::undefined());
+            job->modelRef.set(ev::undefined());
+
+            // Signal handle that all callbacks have been delivered and job is complete
+            if (job->handle) {
+                job->handle->finished.store(true, std::memory_order_release);
             }
         } else {
             remaining.push_back(job);
@@ -148,7 +160,7 @@ static void decorateAsyncHandle(ObjectBuilder& b) {
         if (wp && *wp) {
             while (!(*wp)->finished.load(std::memory_order_acquire)) {
                 tickLMAsync();
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             tickLMAsync();
         }
@@ -581,7 +593,6 @@ Value js_lm_generate(Value, std::span<const Value> a) {
             } catch (const std::exception& e) {
                 job->errorMessage = e.what();
             }
-            job->handle->finished.store(true, std::memory_order_release);
             job->done.store(true, std::memory_order_release);
         });
 
@@ -625,7 +636,6 @@ Value js_lm_generate(Value, std::span<const Value> a) {
             } catch (const std::exception& e) {
                 job->errorMessage = e.what();
             }
-            job->handle->finished.store(true, std::memory_order_release);
             job->done.store(true, std::memory_order_release);
         });
 
@@ -669,7 +679,6 @@ Value js_lm_generate(Value, std::span<const Value> a) {
             } catch (const std::exception& e) {
                 job->errorMessage = e.what();
             }
-            job->handle->finished.store(true, std::memory_order_release);
             job->done.store(true, std::memory_order_release);
         });
 

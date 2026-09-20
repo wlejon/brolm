@@ -6,12 +6,15 @@
 // silent success.
 
 #include "api/api.h"
+#include "host_lm_internal.h"
 #include "embed/embed.h"
 #include "eval/eval.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace ev = bronze::embed;
 using Value = bronze::Value;
@@ -226,6 +229,35 @@ static void test_script() {
     TEST_CHECK(ev::toUtf8(res.value) == "SUCCESS");
 }
 
+static void test_async_handle() {
+    std::cout << "[4/4] async handle lifecycle & wait..." << std::endl;
+
+    auto handle = std::make_shared<brolm::api::HostAsyncHandle>();
+    Value hVal = brolm::api::makeAsyncHandleValue(handle);
+    TEST_CHECK(ev::isObject(hVal));
+
+    // cancel()
+    Value cancelFn = ev::getProperty(hVal, "cancel");
+    TEST_CHECK(ev::isFunction(cancelFn));
+    TEST_CHECK(!handle->cancelled.load());
+    ev::call(cancelFn, hVal, {});
+    TEST_CHECK(handle->cancelled.load());
+
+    // wait() blocks until finished
+    Value waitFn = ev::getProperty(hVal, "wait");
+    TEST_CHECK(ev::isFunction(waitFn));
+    TEST_CHECK(!handle->finished.load());
+
+    std::thread backgroundWorker([handle]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        handle->finished.store(true, std::memory_order_release);
+    });
+
+    ev::call(waitFn, hVal, {});
+    TEST_CHECK(handle->finished.load());
+    if (backgroundWorker.joinable()) backgroundWorker.join();
+}
+
 int main() {
     std::cout << "Running brolm API test..." << std::endl;
 
@@ -236,6 +268,7 @@ int main() {
         test_mounts();
         test_loader_validation();
         test_script();
+        test_async_handle();
     }
     ev::destroyRealm(realm);
 
