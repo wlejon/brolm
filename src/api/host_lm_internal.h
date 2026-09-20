@@ -268,6 +268,28 @@ inline brolm::qwen::GenerateOptions parseGenerateOptions(Value v) {
         if (ev::isNumber(seed)) o.sampling.seed = static_cast<uint64_t>(ev::toDouble(seed));
         else if (ev::isBigInt(seed)) o.sampling.seed = ev::toUint64(seed);
     }
+
+    auto parseSamplingFloat = [&](const char* k1, const char* k2, float& target) {
+        if (ev::isObject(s)) {
+            Value val = ev::getProperty(s, k1);
+            if (ev::isUndefined(val) || ev::isNull(val)) val = ev::getProperty(s, k2);
+            if (ev::isNumber(val)) {
+                target = static_cast<float>(ev::toDouble(val));
+                return;
+            }
+        }
+        Value val = ev::getProperty(v, k1);
+        if (ev::isUndefined(val) || ev::isNull(val)) val = ev::getProperty(v, k2);
+        if (ev::isNumber(val)) {
+            target = static_cast<float>(ev::toDouble(val));
+        }
+    };
+
+    parseSamplingFloat("min_p", "minP", o.sampling.min_p);
+    parseSamplingFloat("repetition_penalty", "repetitionPenalty", o.sampling.repetition_penalty);
+    parseSamplingFloat("frequency_penalty", "frequencyPenalty", o.sampling.frequency_penalty);
+    parseSamplingFloat("presence_penalty", "presencePenalty", o.sampling.presence_penalty);
+
     return o;
 }
 

@@ -14,6 +14,8 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
     // 128000..128255), so no extra names are needed here.
     qwen::Tokenizer inner =
         qwen::Tokenizer::from_tokenizer_json(tokenizer_json_path, /*extras=*/{});
+    inner.set_digit_run_max(3);
+    inner.set_normalize_nfc(false);
     Tokenizer t(std::move(inner));
     t.resolve_named_ids_();
     return t;

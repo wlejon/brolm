@@ -219,8 +219,10 @@ void read_pre_tokenizer_config(const j::Value& root, bool& nfc, int& digit_run_m
         if (!pat || !pat->is_object()) return;
         const j::Value* re = pat->find("Regex");
         if (!re || !re->is_string()) return;
-        digit_run_max =
-            re->as_string().find("\\p{N}{1,3}") != std::string::npos ? 3 : 1;
+        const auto& s = re->as_string();
+        if (s.find("\\p{N}{1,3}") != std::string::npos || s.find("{1,3}") != std::string::npos) {
+            digit_run_max = 3;
+        }
     };
     scan_split(*pre);
     if (const j::Value* seq = pre->find("pretokenizers"); seq && seq->is_array()) {

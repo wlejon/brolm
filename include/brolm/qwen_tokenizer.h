@@ -145,6 +145,9 @@ public:
     int im_end_id() const { return im_end_id_; }
     int endoftext_id() const { return endoftext_id_; }
 
+    void set_digit_run_max(int m) { digit_run_max_ = m; }
+    void set_normalize_nfc(bool n) { normalize_nfc_ = n; }
+
 private:
     Tokenizer() = default;
 
