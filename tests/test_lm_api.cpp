@@ -81,6 +81,12 @@ static void test_mounts() {
         }
     }
 
+    Value q35Proto = ev::getProperty(ev::globalValue("Qwen35Model").value, "prototype");
+    TEST_CHECK(ev::isFunction(ev::getProperty(q35Proto, "generateStream")));
+
+    Value qvlProto = ev::getProperty(ev::globalValue("Qwen3VLModel").value, "prototype");
+    TEST_CHECK(ev::isFunction(ev::getProperty(qvlProto, "generateStream")));
+
     // tick() with nothing pending is a no-op.
     ev::CallResult tick = ev::call(ev::getProperty(lm, "tick"), lm, {});
     TEST_CHECK(!tick.thrown);

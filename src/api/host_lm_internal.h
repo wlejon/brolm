@@ -34,10 +34,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <span>
 #include <string>
@@ -55,7 +57,15 @@ namespace brolm::api {
 struct HostAsyncHandle {
     std::atomic<bool> cancelled{false};
     std::atomic<bool> finished{false};
+    std::atomic<uint64_t> event_seq{0};
+    std::mutex cvMutex;
+    std::condition_variable cv;
     std::thread worker;
+
+    void notify() {
+        event_seq.fetch_add(1, std::memory_order_release);
+        cv.notify_all();
+    }
 
     ~HostAsyncHandle() {
         if (worker.joinable()) {

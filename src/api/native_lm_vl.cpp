@@ -151,6 +151,73 @@ static void decorateQwen35Model(ObjectBuilder& b) {
             return ev::throwError(std::string("generate: ") + e.what());
         }
     });
+
+    b.def("generateStream", 2, [](Value self, std::span<const Value> a) -> Value {
+        auto* w = hostQwen35ModelOf(self);
+        if (!w || !w->vlm) return ev::throwTypeError("generateStream: not a Qwen35Model");
+        if (a.empty()) return ev::throwTypeError("generateStream: prompt required");
+
+        std::string prompt;
+        if (ev::isString(a[0])) {
+            prompt = ev::toUtf8(a[0]);
+        } else if (ev::isObject(a[0])) {
+            std::vector<int32_t> pIds = readInt32Array(a[0]);
+            if (pIds.empty()) return ev::throwTypeError("generateStream: promptIds must be non-empty");
+            prompt = w->vlm->tokenizer().decode(pIds);
+        } else {
+            return ev::throwTypeError("generateStream: prompt must be a string or Int32Array");
+        }
+
+        brolm::qwen::GenerateOptions opts;
+        std::vector<VlmImage> images;
+        Value onTokenVal = ev::undefined();
+
+        if (a.size() >= 3 && ev::isFunction(a[2])) {
+            onTokenVal = a[2];
+            if (ev::isObject(a[1])) {
+                opts = parseGenerateOptions(a[1]);
+                std::string imgErr;
+                if (!readVlmImages(a[1], images, imgErr))
+                    return ev::throwTypeError(imgErr);
+            }
+        } else if (a.size() >= 2 && ev::isFunction(a[1])) {
+            onTokenVal = a[1];
+        } else if (a.size() >= 2 && ev::isObject(a[1])) {
+            opts = parseGenerateOptions(a[1]);
+            onTokenVal = ev::getProperty(a[1], "onToken");
+            std::string imgErr;
+            if (!readVlmImages(a[1], images, imgErr))
+                return ev::throwTypeError(imgErr);
+        }
+
+        if (!ev::isFunction(onTokenVal))
+            return ev::throwTypeError("generateStream: onToken callback must be a function");
+
+        ev::Persistent tokenCb(onTokenVal);
+        brolm::qwen35::VLM::TokenCallback hook = [tokenCb](int id) -> bool {
+            Value arg = ev::fromDouble(id);
+            ev::CallResult r = ev::call(tokenCb.get(), ev::undefined(), std::span<const Value>(&arg, 1));
+            if (r.thrown) return false;
+            return ev::isUndefined(r.value) || ev::toBool(r.value);
+        };
+
+        try {
+            brotensor::DeviceScope scope(w->device);
+            w->vlm->set_generation(opts.max_new_tokens, opts.sampling.temperature,
+                                   opts.sampling.top_k, opts.sampling.top_p,
+                                   opts.sampling.seed);
+            std::vector<brolm::qwen35::ImageInput> inputs;
+            inputs.reserve(images.size());
+            for (auto& im : images)
+                inputs.push_back(brolm::qwen35::ImageInput{ im.chw.data(), im.H, im.W });
+
+            auto ids = w->vlm->generate_tokens(prompt, inputs, hook);
+            std::vector<int32_t> i32(ids.begin(), ids.end());
+            return makeInt32Array(i32.data(), i32.size());
+        } catch (const std::exception& e) {
+            return ev::throwError(std::string("generateStream: ") + e.what());
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -267,6 +334,73 @@ static void decorateQwen3VLModel(ObjectBuilder& b) {
             return makeInt32Array(i32.data(), i32.size());
         } catch (const std::exception& e) {
             return ev::throwError(std::string("generate: ") + e.what());
+        }
+    });
+
+    b.def("generateStream", 2, [](Value self, std::span<const Value> a) -> Value {
+        auto* w = hostQwen3VLModelOf(self);
+        if (!w || !w->vlm) return ev::throwTypeError("generateStream: not a Qwen3VLModel");
+        if (a.empty()) return ev::throwTypeError("generateStream: prompt required");
+
+        std::string prompt;
+        if (ev::isString(a[0])) {
+            prompt = ev::toUtf8(a[0]);
+        } else if (ev::isObject(a[0])) {
+            std::vector<int32_t> pIds = readInt32Array(a[0]);
+            if (pIds.empty()) return ev::throwTypeError("generateStream: promptIds must be non-empty");
+            prompt = w->vlm->tokenizer().decode(pIds);
+        } else {
+            return ev::throwTypeError("generateStream: prompt must be a string or Int32Array");
+        }
+
+        brolm::qwen::GenerateOptions opts;
+        std::vector<VlmImage> images;
+        Value onTokenVal = ev::undefined();
+
+        if (a.size() >= 3 && ev::isFunction(a[2])) {
+            onTokenVal = a[2];
+            if (ev::isObject(a[1])) {
+                opts = parseGenerateOptions(a[1]);
+                std::string imgErr;
+                if (!readVlmImages(a[1], images, imgErr))
+                    return ev::throwTypeError(imgErr);
+            }
+        } else if (a.size() >= 2 && ev::isFunction(a[1])) {
+            onTokenVal = a[1];
+        } else if (a.size() >= 2 && ev::isObject(a[1])) {
+            opts = parseGenerateOptions(a[1]);
+            onTokenVal = ev::getProperty(a[1], "onToken");
+            std::string imgErr;
+            if (!readVlmImages(a[1], images, imgErr))
+                return ev::throwTypeError(imgErr);
+        }
+
+        if (!ev::isFunction(onTokenVal))
+            return ev::throwTypeError("generateStream: onToken callback must be a function");
+
+        ev::Persistent tokenCb(onTokenVal);
+        brolm::qwen3vl::VLM::TokenCallback hook = [tokenCb](int id) -> bool {
+            Value arg = ev::fromDouble(id);
+            ev::CallResult r = ev::call(tokenCb.get(), ev::undefined(), std::span<const Value>(&arg, 1));
+            if (r.thrown) return false;
+            return ev::isUndefined(r.value) || ev::toBool(r.value);
+        };
+
+        try {
+            brotensor::DeviceScope scope(w->device);
+            w->vlm->set_generation(opts.max_new_tokens, opts.sampling.temperature,
+                                   opts.sampling.top_k, opts.sampling.top_p,
+                                   opts.sampling.seed);
+            std::vector<brolm::qwen3vl::ImageInput> inputs;
+            inputs.reserve(images.size());
+            for (auto& im : images)
+                inputs.push_back(brolm::qwen3vl::ImageInput{ im.chw.data(), im.H, im.W });
+
+            auto ids = w->vlm->generate_tokens(prompt, inputs, hook);
+            std::vector<int32_t> i32(ids.begin(), ids.end());
+            return makeInt32Array(i32.data(), i32.size());
+        } catch (const std::exception& e) {
+            return ev::throwError(std::string("generateStream: ") + e.what());
         }
     });
 }

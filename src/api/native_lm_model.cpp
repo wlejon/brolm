@@ -125,6 +125,7 @@ void tickLMAsync() {
             // Signal handle that all callbacks have been delivered and job is complete
             if (job->handle) {
                 job->handle->finished.store(true, std::memory_order_release);
+                job->handle->notify();
             }
         } else {
             remaining.push_back(job);
@@ -151,6 +152,7 @@ static void decorateAsyncHandle(ObjectBuilder& b) {
         auto* wp = static_cast<std::shared_ptr<HostAsyncHandle>*>(g_asyncHandleClass.unwrap(self));
         if (wp && *wp) {
             (*wp)->cancelled.store(true, std::memory_order_release);
+            (*wp)->notify();
         }
         return ev::undefined();
     });
@@ -158,9 +160,18 @@ static void decorateAsyncHandle(ObjectBuilder& b) {
     b.def("wait", 0, [](Value self, std::span<const Value>) -> Value {
         auto* wp = static_cast<std::shared_ptr<HostAsyncHandle>*>(g_asyncHandleClass.unwrap(self));
         if (wp && *wp) {
-            while (!(*wp)->finished.load(std::memory_order_acquire)) {
+            auto h = *wp;
+            while (!h->finished.load(std::memory_order_acquire)) {
                 tickLMAsync();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (h->finished.load(std::memory_order_acquire)) {
+                    break;
+                }
+                uint64_t cur_seq = h->event_seq.load(std::memory_order_acquire);
+                std::unique_lock<std::mutex> lock(h->cvMutex);
+                h->cv.wait_for(lock, std::chrono::milliseconds(5), [&]() {
+                    return h->finished.load(std::memory_order_acquire) ||
+                           h->event_seq.load(std::memory_order_acquire) != cur_seq;
+                });
             }
             tickLMAsync();
         }
@@ -587,6 +598,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                         std::lock_guard<std::mutex> qLock(job->queueMutex);
                         job->pendingTokens.push_back(tok);
                     }
+                    if (job->handle) job->handle->notify();
                     return !job->handle->cancelled.load(std::memory_order_acquire);
                 };
                 job->allGenerated = runDecode(*w->model, prompt, eos_id, opts, onTokenHook, &job->handle->cancelled);
@@ -594,6 +606,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                 job->errorMessage = e.what();
             }
             job->done.store(true, std::memory_order_release);
+            if (job->handle) job->handle->notify();
         });
 
         {
@@ -629,6 +642,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                         std::lock_guard<std::mutex> qLock(job->queueMutex);
                         job->pendingTokens.push_back(tok);
                     }
+                    if (job->handle) job->handle->notify();
                     return !job->handle->cancelled.load(std::memory_order_acquire);
                 };
                 auto ids = q35->vlm->generate_tokens(prompt, inputs, onTokenHook);
@@ -637,6 +651,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                 job->errorMessage = e.what();
             }
             job->done.store(true, std::memory_order_release);
+            if (job->handle) job->handle->notify();
         });
 
         {
@@ -672,6 +687,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                         std::lock_guard<std::mutex> qLock(job->queueMutex);
                         job->pendingTokens.push_back(tok);
                     }
+                    if (job->handle) job->handle->notify();
                     return !job->handle->cancelled.load(std::memory_order_acquire);
                 };
                 auto ids = qvl->vlm->generate_tokens(prompt, inputs, onTokenHook);
@@ -680,6 +696,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                 job->errorMessage = e.what();
             }
             job->done.store(true, std::memory_order_release);
+            if (job->handle) job->handle->notify();
         });
 
         {

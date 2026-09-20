@@ -1,4 +1,6 @@
 #include "host_lm_internal.h"
+#include "brolm/detail/json.h"
+#include <fstream>
 
 namespace brolm::api {
 
@@ -303,6 +305,179 @@ void registerLMClipClasses() {
     g_t5ModelClass.install("T5Model", 0, nullptr, decorateT5Model);
 }
 
+namespace json = brolm::detail::json;
+
+static void parseTextConfigJson(const json::Value& tc, brolm::clip::TextEncoderConfig& cfg) {
+    if (!tc.is_object()) return;
+    if (tc.contains("vocab_size")) cfg.vocab_size = tc.get_int("vocab_size", cfg.vocab_size);
+    else if (tc.contains("vocabSize")) cfg.vocab_size = tc.get_int("vocabSize", cfg.vocab_size);
+
+    if (tc.contains("max_position_embeddings")) cfg.max_position = tc.get_int("max_position_embeddings", cfg.max_position);
+    else if (tc.contains("max_position")) cfg.max_position = tc.get_int("max_position", cfg.max_position);
+    else if (tc.contains("maxPosition")) cfg.max_position = tc.get_int("maxPosition", cfg.max_position);
+
+    if (tc.contains("hidden_size")) cfg.hidden_dim = tc.get_int("hidden_size", cfg.hidden_dim);
+    else if (tc.contains("hidden_dim")) cfg.hidden_dim = tc.get_int("hidden_dim", cfg.hidden_dim);
+    else if (tc.contains("hiddenDim")) cfg.hidden_dim = tc.get_int("hiddenDim", cfg.hidden_dim);
+
+    if (tc.contains("num_attention_heads")) cfg.num_heads = tc.get_int("num_attention_heads", cfg.num_heads);
+    else if (tc.contains("num_heads")) cfg.num_heads = tc.get_int("num_heads", cfg.num_heads);
+    else if (tc.contains("numHeads")) cfg.num_heads = tc.get_int("numHeads", cfg.num_heads);
+
+    if (tc.contains("num_hidden_layers")) cfg.num_layers = tc.get_int("num_hidden_layers", cfg.num_layers);
+    else if (tc.contains("num_layers")) cfg.num_layers = tc.get_int("num_layers", cfg.num_layers);
+    else if (tc.contains("numLayers")) cfg.num_layers = tc.get_int("numLayers", cfg.num_layers);
+
+    if (tc.contains("intermediate_size")) cfg.intermediate_dim = tc.get_int("intermediate_size", cfg.intermediate_dim);
+    else if (tc.contains("intermediate_dim")) cfg.intermediate_dim = tc.get_int("intermediate_dim", cfg.intermediate_dim);
+    else if (tc.contains("intermediateDim")) cfg.intermediate_dim = tc.get_int("intermediateDim", cfg.intermediate_dim);
+
+    if (tc.contains("layer_norm_eps")) cfg.layer_norm_eps = tc.get_float("layer_norm_eps", cfg.layer_norm_eps);
+    else if (tc.contains("layerNormEps")) cfg.layer_norm_eps = tc.get_float("layerNormEps", cfg.layer_norm_eps);
+
+    if (tc.contains("eos_token_id")) cfg.eos_token_id = tc.get_int("eos_token_id", cfg.eos_token_id);
+    else if (tc.contains("eosTokenId")) cfg.eos_token_id = tc.get_int("eosTokenId", cfg.eos_token_id);
+}
+
+static void parseVisionConfigJson(const json::Value& vc, brolm::clip_image::ImageEncoderConfig& cfg) {
+    if (!vc.is_object()) return;
+    if (vc.contains("image_size")) cfg.image_size = vc.get_int("image_size", cfg.image_size);
+    else if (vc.contains("imageSize")) cfg.image_size = vc.get_int("imageSize", cfg.image_size);
+
+    if (vc.contains("patch_size")) cfg.patch_size = vc.get_int("patch_size", cfg.patch_size);
+    else if (vc.contains("patchSize")) cfg.patch_size = vc.get_int("patchSize", cfg.patch_size);
+
+    if (vc.contains("num_channels")) cfg.in_channels = vc.get_int("num_channels", cfg.in_channels);
+    else if (vc.contains("in_channels")) cfg.in_channels = vc.get_int("in_channels", cfg.in_channels);
+    else if (vc.contains("inChannels")) cfg.in_channels = vc.get_int("inChannels", cfg.in_channels);
+
+    if (vc.contains("hidden_size")) cfg.hidden_dim = vc.get_int("hidden_size", cfg.hidden_dim);
+    else if (vc.contains("hidden_dim")) cfg.hidden_dim = vc.get_int("hidden_dim", cfg.hidden_dim);
+    else if (vc.contains("hiddenDim")) cfg.hidden_dim = vc.get_int("hiddenDim", cfg.hidden_dim);
+
+    if (vc.contains("num_attention_heads")) cfg.num_heads = vc.get_int("num_attention_heads", cfg.num_heads);
+    else if (vc.contains("num_heads")) cfg.num_heads = vc.get_int("num_heads", cfg.num_heads);
+    else if (vc.contains("numHeads")) cfg.num_heads = vc.get_int("numHeads", cfg.num_heads);
+
+    if (vc.contains("num_hidden_layers")) cfg.num_layers = vc.get_int("num_hidden_layers", cfg.num_layers);
+    else if (vc.contains("num_layers")) cfg.num_layers = vc.get_int("num_layers", cfg.num_layers);
+    else if (vc.contains("numLayers")) cfg.num_layers = vc.get_int("numLayers", cfg.num_layers);
+
+    if (vc.contains("intermediate_size")) cfg.intermediate_dim = vc.get_int("intermediate_size", cfg.intermediate_dim);
+    else if (vc.contains("intermediate_dim")) cfg.intermediate_dim = vc.get_int("intermediate_dim", cfg.intermediate_dim);
+    else if (vc.contains("intermediateDim")) cfg.intermediate_dim = vc.get_int("intermediateDim", cfg.intermediate_dim);
+
+    if (vc.contains("layer_norm_eps")) cfg.layer_norm_eps = vc.get_float("layer_norm_eps", cfg.layer_norm_eps);
+    else if (vc.contains("layerNormEps")) cfg.layer_norm_eps = vc.get_float("layerNormEps", cfg.layer_norm_eps);
+}
+
+static void parseClipConfigJson(const json::Value& root,
+                                brolm::clip::TextEncoderConfig& textCfg,
+                                brolm::clip_image::ImageEncoderConfig& visionCfg,
+                                brolm::clip_score::Config& scoreCfg) {
+    if (!root.is_object()) return;
+    if (root.contains("projection_dim")) scoreCfg.projection_dim = root.get_int("projection_dim", scoreCfg.projection_dim);
+    else if (root.contains("projectionDim")) scoreCfg.projection_dim = root.get_int("projectionDim", scoreCfg.projection_dim);
+
+    if (root.contains("text_config")) parseTextConfigJson(root.at("text_config"), textCfg);
+    else if (root.contains("text_model")) parseTextConfigJson(root.at("text_model"), textCfg);
+    else if (root.contains("text")) parseTextConfigJson(root.at("text"), textCfg);
+    else parseTextConfigJson(root, textCfg);
+
+    if (root.contains("vision_config")) parseVisionConfigJson(root.at("vision_config"), visionCfg);
+    else if (root.contains("vision_model")) parseVisionConfigJson(root.at("vision_model"), visionCfg);
+    else if (root.contains("vision")) parseVisionConfigJson(root.at("vision"), visionCfg);
+    else parseVisionConfigJson(root, visionCfg);
+}
+
+static void parseTextConfigJs(Value tc, brolm::clip::TextEncoderConfig& cfg) {
+    if (!ev::isObject(tc)) return;
+    Value v;
+    v = ev::getProperty(tc, "vocabSize"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "vocab_size");
+    if (ev::isNumber(v)) cfg.vocab_size = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "maxPosition"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "max_position");
+    if (!ev::isNumber(v)) v = ev::getProperty(tc, "max_position_embeddings");
+    if (ev::isNumber(v)) cfg.max_position = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "hiddenDim"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "hidden_dim");
+    if (!ev::isNumber(v)) v = ev::getProperty(tc, "hidden_size");
+    if (ev::isNumber(v)) cfg.hidden_dim = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "numHeads"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_heads");
+    if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_attention_heads");
+    if (ev::isNumber(v)) cfg.num_heads = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "numLayers"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_layers");
+    if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_hidden_layers");
+    if (ev::isNumber(v)) cfg.num_layers = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "intermediateDim"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "intermediate_dim");
+    if (!ev::isNumber(v)) v = ev::getProperty(tc, "intermediate_size");
+    if (ev::isNumber(v)) cfg.intermediate_dim = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "layerNormEps"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "layer_norm_eps");
+    if (ev::isNumber(v)) cfg.layer_norm_eps = static_cast<float>(ev::toDouble(v));
+
+    v = ev::getProperty(tc, "eosTokenId"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "eos_token_id");
+    if (ev::isNumber(v)) cfg.eos_token_id = static_cast<int>(ev::toDouble(v));
+}
+
+static void parseVisionConfigJs(Value vc, brolm::clip_image::ImageEncoderConfig& cfg) {
+    if (!ev::isObject(vc)) return;
+    Value v;
+    v = ev::getProperty(vc, "imageSize"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "image_size");
+    if (ev::isNumber(v)) cfg.image_size = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "patchSize"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "patch_size");
+    if (ev::isNumber(v)) cfg.patch_size = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "inChannels"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "in_channels");
+    if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_channels");
+    if (ev::isNumber(v)) cfg.in_channels = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "hiddenDim"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "hidden_dim");
+    if (!ev::isNumber(v)) v = ev::getProperty(vc, "hidden_size");
+    if (ev::isNumber(v)) cfg.hidden_dim = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "numHeads"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_heads");
+    if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_attention_heads");
+    if (ev::isNumber(v)) cfg.num_heads = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "numLayers"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_layers");
+    if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_hidden_layers");
+    if (ev::isNumber(v)) cfg.num_layers = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "intermediateDim"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "intermediate_dim");
+    if (!ev::isNumber(v)) v = ev::getProperty(vc, "intermediate_size");
+    if (ev::isNumber(v)) cfg.intermediate_dim = static_cast<int>(ev::toDouble(v));
+
+    v = ev::getProperty(vc, "layerNormEps"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "layer_norm_eps");
+    if (ev::isNumber(v)) cfg.layer_norm_eps = static_cast<float>(ev::toDouble(v));
+}
+
+static void parseClipConfigJs(Value root,
+                              brolm::clip::TextEncoderConfig& textCfg,
+                              brolm::clip_image::ImageEncoderConfig& visionCfg,
+                              brolm::clip_score::Config& scoreCfg) {
+    if (!ev::isObject(root)) return;
+    Value v = ev::getProperty(root, "projectionDim");
+    if (!ev::isNumber(v)) v = ev::getProperty(root, "projection_dim");
+    if (ev::isNumber(v)) scoreCfg.projection_dim = static_cast<int>(ev::toDouble(v));
+
+    Value tc = ev::getProperty(root, "textConfig");
+    if (!ev::isObject(tc)) tc = ev::getProperty(root, "text_config");
+    if (!ev::isObject(tc)) tc = ev::getProperty(root, "text");
+    if (ev::isObject(tc)) parseTextConfigJs(tc, textCfg);
+    else parseTextConfigJs(root, textCfg);
+
+    Value vc = ev::getProperty(root, "visionConfig");
+    if (!ev::isObject(vc)) vc = ev::getProperty(root, "vision_config");
+    if (!ev::isObject(vc)) vc = ev::getProperty(root, "vision");
+    if (ev::isObject(vc)) parseVisionConfigJs(vc, visionCfg);
+    else parseVisionConfigJs(root, visionCfg);
+}
+
 Value js_loadClip(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isObject(a[0]))
         return ev::throwTypeError("loadClip(opts): opts object required");
@@ -345,6 +520,53 @@ Value js_loadClip(Value, std::span<const Value> a) {
     if (!parseDeviceOpt(opts, dev, err))
         return ev::throwTypeError(err);
 
+    brolm::clip::TextEncoderConfig textCfg;
+    brolm::clip_image::ImageEncoderConfig visionCfg;
+    brolm::clip_score::Config scoreCfg;
+
+    std::string configPath;
+    Value cpVal = ev::getProperty(opts, "configPath");
+    if (ev::isString(cpVal)) {
+        configPath = ev::toUtf8(cpVal);
+    } else {
+        Value cVal = ev::getProperty(opts, "config");
+        if (ev::isString(cVal)) {
+            configPath = ev::toUtf8(cVal);
+        }
+    }
+
+    if (configPath.empty()) {
+        std::vector<std::string> probeCandidates = { weights, textPath, vocab };
+        for (const auto& p : probeCandidates) {
+            if (!p.empty()) {
+                std::filesystem::path parent = std::filesystem::path(p).parent_path();
+                std::filesystem::path cand = parent / "config.json";
+                if (std::filesystem::exists(cand)) {
+                    configPath = cand.string();
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!configPath.empty() && std::filesystem::exists(configPath)) {
+        std::ifstream ifs(configPath);
+        if (ifs.is_open()) {
+            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            auto rootJson = brolm::detail::json::parse(content);
+            parseClipConfigJson(rootJson, textCfg, visionCfg, scoreCfg);
+        }
+    }
+
+    Value cVal = ev::getProperty(opts, "config");
+    if (ev::isObject(cVal)) {
+        parseClipConfigJs(cVal, textCfg, visionCfg, scoreCfg);
+    }
+
+    Value pdVal = ev::getProperty(opts, "projectionDim");
+    if (!ev::isNumber(pdVal)) pdVal = ev::getProperty(opts, "projection_dim");
+    if (ev::isNumber(pdVal)) scoreCfg.projection_dim = static_cast<int>(ev::toDouble(pdVal));
+
     try {
         auto w = std::make_unique<HostClipModel>();
         w->device = dev;
@@ -353,22 +575,20 @@ Value js_loadClip(Value, std::span<const Value> a) {
         w->tok = std::make_unique<brolm::clip::Tokenizer>(
             brolm::clip::Tokenizer::load(vocab, merges));
 
-        w->text = std::make_unique<brolm::clip::TextEncoder>(
-            brolm::clip::TextEncoderConfig{});
+        w->text = std::make_unique<brolm::clip::TextEncoder>(textCfg);
         {
             auto f = brotensor::safetensors::File::open(textPath);
             w->text->load_weights(f, textPrefix);
         }
 
-        w->image = std::make_unique<brolm::clip_image::ImageEncoder>(
-            brolm::clip_image::ImageEncoderConfig{});
+        w->image = std::make_unique<brolm::clip_image::ImageEncoder>(visionCfg);
         {
             auto f = brotensor::safetensors::File::open(imagePath);
             w->image->load_weights(f, visionPrefix);
         }
 
         w->scorer = std::make_unique<brolm::clip_score::CLIPScorer>(
-            *w->tok, *w->text, *w->image);
+            *w->tok, *w->text, *w->image, scoreCfg);
         {
             auto f = brotensor::safetensors::File::open(projPath);
             w->scorer->load_projections(f, projPrefix);
