@@ -68,6 +68,8 @@ struct HostAsyncHandle {
     }
 
     ~HostAsyncHandle() {
+        cancelled.store(true, std::memory_order_release);
+        notify();
         if (worker.joinable()) {
             worker.join();
         }

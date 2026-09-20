@@ -14,7 +14,8 @@ HostClass g_lmModelClass;
 
 HostAsyncHandle* hostAsyncHandleOf(Value v) {
     if (!ev::isObject(v)) return nullptr;
-    return static_cast<HostAsyncHandle*>(g_asyncHandleClass.unwrap(v));
+    auto* wp = static_cast<std::shared_ptr<HostAsyncHandle>*>(g_asyncHandleClass.unwrap(v));
+    return (wp && *wp) ? wp->get() : nullptr;
 }
 
 Value makeAsyncHandleValue(std::shared_ptr<HostAsyncHandle> h) {
