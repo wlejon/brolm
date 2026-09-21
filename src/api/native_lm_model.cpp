@@ -632,7 +632,11 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                 brotensor::DeviceScope scope(q35->device);
                 q35->vlm->set_generation(opts.max_new_tokens, opts.sampling.temperature,
                                          opts.sampling.top_k, opts.sampling.top_p,
-                                         opts.sampling.seed);
+                                         opts.sampling.seed, opts.sampling.min_p,
+                                         opts.sampling.repetition_penalty,
+                                         opts.sampling.frequency_penalty,
+                                         opts.sampling.presence_penalty,
+                                         opts.stop_on_eos);
                 std::vector<brolm::qwen35::ImageInput> inputs;
                 inputs.reserve(imgs.size());
                 for (auto& im : imgs)
@@ -677,7 +681,11 @@ Value js_lm_generate(Value, std::span<const Value> a) {
                 brotensor::DeviceScope scope(qvl->device);
                 qvl->vlm->set_generation(opts.max_new_tokens, opts.sampling.temperature,
                                          opts.sampling.top_k, opts.sampling.top_p,
-                                         opts.sampling.seed);
+                                         opts.sampling.seed, opts.sampling.min_p,
+                                         opts.sampling.repetition_penalty,
+                                         opts.sampling.frequency_penalty,
+                                         opts.sampling.presence_penalty,
+                                         opts.stop_on_eos);
                 std::vector<brolm::qwen3vl::ImageInput> inputs;
                 inputs.reserve(imgs.size());
                 for (auto& im : imgs)

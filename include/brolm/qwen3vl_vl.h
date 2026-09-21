@@ -66,11 +66,16 @@ struct VLMConfig {
     PreprocessConfig pp;
     int              max_seq_len    = 4096;
     // Sampling.
-    int              max_new_tokens = 64;
-    float            temperature    = 0.0f;   // 0 => greedy (argmax)
-    int              top_k          = 0;      // 0 => disabled
-    float            top_p          = 1.0f;
-    uint64_t         seed           = 0;
+    int              max_new_tokens     = 64;
+    float            temperature        = 0.0f;   // 0 => greedy (argmax)
+    int              top_k              = 0;      // 0 => disabled
+    float            top_p              = 1.0f;
+    uint64_t         seed               = 0;
+    float            min_p              = 0.0f;
+    float            repetition_penalty = 1.0f;
+    float            frequency_penalty  = 0.0f;
+    float            presence_penalty   = 0.0f;
+    bool             stop_on_eos        = true;
 };
 
 class VLM {
@@ -118,7 +123,12 @@ public:
 
     // Adjust the sampling/budget knobs between generate() calls.
     void set_generation(int max_new_tokens, float temperature, int top_k,
-                        float top_p, uint64_t seed);
+                        float top_p, uint64_t seed,
+                        float min_p = 0.0f,
+                        float repetition_penalty = 1.0f,
+                        float frequency_penalty = 0.0f,
+                        float presence_penalty = 0.0f,
+                        bool stop_on_eos = true);
 
     const Tokenizer&     tokenizer() const;
     const Qwen3VLConfig& config()    const { return cfg_.model_cfg; }

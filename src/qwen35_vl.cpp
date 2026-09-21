@@ -306,12 +306,20 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
 }
 
 void VLM::set_generation(int max_new_tokens, float temperature, int top_k,
-                         float top_p, uint64_t seed) {
-    cfg_.max_new_tokens = max_new_tokens;
-    cfg_.temperature    = temperature;
-    cfg_.top_k          = top_k;
-    cfg_.top_p          = top_p;
-    cfg_.seed           = seed;
+                         float top_p, uint64_t seed,
+                         float min_p, float repetition_penalty,
+                         float frequency_penalty, float presence_penalty,
+                         bool stop_on_eos) {
+    cfg_.max_new_tokens     = max_new_tokens;
+    cfg_.temperature        = temperature;
+    cfg_.top_k              = top_k;
+    cfg_.top_p              = top_p;
+    cfg_.seed               = seed;
+    cfg_.min_p              = min_p;
+    cfg_.repetition_penalty = repetition_penalty;
+    cfg_.frequency_penalty  = frequency_penalty;
+    cfg_.presence_penalty   = presence_penalty;
+    cfg_.stop_on_eos        = stop_on_eos;
 }
 
 std::vector<int> VLM::generate_tokens(const std::string& prompt,
@@ -391,11 +399,17 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
 
     // 8. Sample loop. Use the existing qwen_generate sampler for parity.
     qwen::SamplingParams sp;
-    sp.temperature = cfg_.temperature;
-    sp.top_k       = cfg_.top_k;
-    sp.top_p       = cfg_.top_p;
-    sp.seed        = cfg_.seed;
+    sp.temperature        = cfg_.temperature;
+    sp.top_k              = cfg_.top_k;
+    sp.top_p              = cfg_.top_p;
+    sp.seed               = cfg_.seed;
+    sp.min_p              = cfg_.min_p;
+    sp.repetition_penalty = cfg_.repetition_penalty;
+    sp.frequency_penalty  = cfg_.frequency_penalty;
+    sp.presence_penalty   = cfg_.presence_penalty;
     std::mt19937_64 rng(cfg_.seed);
+
+    std::vector<int32_t> context(expanded.begin(), expanded.end());
 
     const int vocab = cfg_.model_cfg.text.vocab_size;
     std::vector<int> generated;
@@ -403,6 +417,7 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
     generated.reserve(static_cast<std::size_t>(cfg_.max_new_tokens));
 
     auto stop_token = [&](int t) {
+        if (!cfg_.stop_on_eos) return false;
         if (im_end_id >= 0 && t == im_end_id) return true;
         if (eot_id    >= 0 && t == eot_id)    return true;
         return false;
@@ -415,7 +430,8 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
         // garbage tokens.
         fail("prefill produced non-finite logits");
     }
-    int next = qwen::sample_token(row.data(), vocab, sp, rng);
+    int next = qwen::sample_token(row.data(), vocab, sp, rng,
+                                  context.data(), static_cast<int>(context.size()));
 
     // Position advancement during decode: HF advances all three axes by
     // (max(t,h,w) + 1) of the prefill — see MRopePositions::delta which is
@@ -426,6 +442,7 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
     int steps_remaining = cfg_.max_new_tokens;
     while (steps_remaining > 0 && !stop_token(next)) {
         generated.push_back(next);
+        context.push_back(static_cast<int32_t>(next));
         --steps_remaining;
         if (on_token && !on_token(next)) break;   // streaming / early stop
         if (steps_remaining == 0) break;
@@ -447,7 +464,8 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
         if (!row_finite(row.data(), vocab)) {
             fail("decode step produced non-finite logits");
         }
-        next = qwen::sample_token(row.data(), vocab, sp, rng);
+        next = qwen::sample_token(row.data(), vocab, sp, rng,
+                                  context.data(), static_cast<int>(context.size()));
     }
     // Final-token check: only append the last-sampled token if it isn't a
     // stop. (If the budget ran out exactly at the loop's start it was
