@@ -823,16 +823,25 @@ void TextModel::run_decoder_layers_(
         linear_(layer.Wo, layer.Wo_q, attn_, proj_);
         bt::add_inplace(h_, proj_);
 
+        bt::rms_norm_forward(h_, layer.post_attn_norm, eps, norm_);
+        mlp_block_(layer, L);
+
         // DeepStack injection: this decoder layer receives image i's feature
         // if it's within that image's per-layer list.
+        //
+        // AFTER the whole layer — attention residual and MLP residual both —
+        // not between the two. HF adds it to the layer's OUTPUT
+        // (Qwen3VLTextModel's loop calls _deepstack_process on the value the
+        // decoder layer returned), so injecting it before the MLP would let
+        // the post-attention norm and the feed-forward see a feature the
+        // trained model only ever meets on the way into the next layer. The
+        // difference is invisible in the text rows and large in the image
+        // rows, which is exactly the shape of the error it used to produce.
         for (const DeepstackSplice& d : deepstack) {
             if (static_cast<std::size_t>(li) < d.per_layer.size()) {
                 add_inplace_rows(h_, d.row_start, d.per_layer[static_cast<std::size_t>(li)]);
             }
         }
-
-        bt::rms_norm_forward(h_, layer.post_attn_norm, eps, norm_);
-        mlp_block_(layer, L);
 
         if (capture_layers != nullptr &&
             capture_cursor < capture_layers->size() &&
