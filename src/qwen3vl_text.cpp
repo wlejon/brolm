@@ -826,6 +826,22 @@ void TextModel::run_decoder_layers_(
         bt::rms_norm_forward(h_, layer.post_attn_norm, eps, norm_);
         mlp_block_(layer, L);
 
+        // Hidden-state capture happens BEFORE the DeepStack injection, because
+        // that is where HF's `output_hidden_states` reads from: the recorder is
+        // a forward hook on Qwen3VLTextDecoderLayer, so it sees the value the
+        // decoder layer returned, while `_deepstack_process` runs afterwards in
+        // Qwen3VLTextModel's own loop and never touches the recorded tensor.
+        // Only the tap that lands on a DeepStack-injected layer can tell the
+        // difference (hidden_states[k] is layer k-1's output, and DeepStack
+        // covers layers [0, num_deepstack)), and on those the difference is the
+        // whole visual feature — large, and confined to the image rows.
+        if (capture_layers != nullptr &&
+            capture_cursor < capture_layers->size() &&
+            (*capture_layers)[capture_cursor] == li + 1) {
+            hidden_states_out->push_back(h_.clone());
+            ++capture_cursor;
+        }
+
         // DeepStack injection: this decoder layer receives image i's feature
         // if it's within that image's per-layer list.
         //
@@ -841,13 +857,6 @@ void TextModel::run_decoder_layers_(
             if (static_cast<std::size_t>(li) < d.per_layer.size()) {
                 add_inplace_rows(h_, d.row_start, d.per_layer[static_cast<std::size_t>(li)]);
             }
-        }
-
-        if (capture_layers != nullptr &&
-            capture_cursor < capture_layers->size() &&
-            (*capture_layers)[capture_cursor] == li + 1) {
-            hidden_states_out->push_back(h_.clone());
-            ++capture_cursor;
         }
     }
 }

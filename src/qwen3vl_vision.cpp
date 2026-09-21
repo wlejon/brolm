@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -145,6 +147,21 @@ void build_vision_position_ids(int grid_t, int grid_h, int grid_w, int merge,
             }
         }
     }
+}
+
+// Parity debugging: when BROLM_VISION_DUMP names a directory, every stage
+// boundary of VisionTower::forward() is written there as raw FP32
+// (<dir>/vis_mine_<name>.f32) for diffing against the reference hooks in
+// brodiffusion's scripts/krea2_text_ref.py (KREA2_TEXT_REF_VISION_DUMP).
+void maybe_dump(const char* name, const bt::Tensor& t) {
+    const char* dir = std::getenv("BROLM_VISION_DUMP");
+    if (!dir || !dir[0]) return;
+    const std::vector<float> v = to_host_f32(t);
+    const std::string path = std::string(dir) + "/vis_mine_" + name + ".f32";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
 }
 
 }  // namespace
@@ -539,11 +556,15 @@ void VisionTower::forward(const bt::Tensor& patches,
     const int head_dim = D / H;
 
     // ── patch embed: (N, C*tps*P²) -> (N, D) via linear (=Conv3d collapsed) ──
+    maybe_dump("patches", patches);
     detail::linear_batched(patch_W_, &patch_b_, patches, x_);
+    maybe_dump("patch_embed", x_);
 
     // ── add positional embedding (bilinear-interpolated -> grid_h×grid_w) ──
     build_pos_embed_(grid_t, grid_h, grid_w);
+    maybe_dump("pos_embed", pos_embed_);
     bt::add_inplace(x_, pos_embed_);
+    maybe_dump("block_in", x_);
 
     // ── rotary tables for this image ─────────────────────────────────────
     build_rotary_tables_(grid_t, grid_h, grid_w);
@@ -590,6 +611,7 @@ void VisionTower::forward(const bt::Tensor& patches,
         bt::gelu_forward(fc_mid_, fc_act_);
         detail::linear_batched(B.fc2_W, &B.fc2_b, fc_act_, fc_out_);
         bt::add_inplace(x_, fc_out_);
+        maybe_dump(("block" + std::to_string(li)).c_str(), x_);
 
         // DeepStack extraction: this block's 0-based index feeds a dedicated
         // post-shuffle-norm merger on the CURRENT residual stream.
@@ -598,6 +620,8 @@ void VisionTower::forward(const bt::Tensor& patches,
             run_merger_(deepstack_mergers_[next_deepstack],
                        /*postshuffle_norm=*/true,
                        N, grid_t, grid_h, grid_w,
+                       deepstack_tokens_out[next_deepstack]);
+            maybe_dump(("ds" + std::to_string(next_deepstack)).c_str(),
                        deepstack_tokens_out[next_deepstack]);
             ++next_deepstack;
         }
@@ -609,6 +633,7 @@ void VisionTower::forward(const bt::Tensor& patches,
     // ── main merger (pre-shuffle norm) ────────────────────────────────────
     run_merger_(main_merger_, /*postshuffle_norm=*/false,
                N, grid_t, grid_h, grid_w, tokens_out);
+    maybe_dump("merged", tokens_out);
 }
 
 }  // namespace brolm::qwen3vl
