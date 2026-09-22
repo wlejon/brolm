@@ -376,4 +376,15 @@ LayaResult DecisionModel::predict(const std::string& state_json_or_text,
     return res;
 }
 
+LayaResult DecisionModel::predict(const std::string& state_json_or_text,
+                                 const std::unordered_map<std::string, LayaQuestion>& questions) {
+    std::vector<LayaQuestion> q_vec;
+    q_vec.reserve(questions.size());
+    for (const auto& [id, q] : questions) {
+        q_vec.push_back(q);
+        q_vec.back().id = id;
+    }
+    return predict(state_json_or_text, q_vec);
+}
+
 }  // namespace brolm::laya

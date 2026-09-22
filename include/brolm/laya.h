@@ -88,6 +88,8 @@ public:
 
     LayaResult predict(const std::string& state_json_or_text,
                        const std::vector<LayaQuestion>& questions);
+    LayaResult predict(const std::string& state_json_or_text,
+                       const std::unordered_map<std::string, LayaQuestion>& questions);
 
     const modernbert::ModernBertModel& encoder() const { return encoder_; }
     const Config& config() const { return cfg_; }
@@ -137,3 +139,10 @@ private:
 };
 
 }  // namespace brolm::laya
+
+namespace brolm {
+using LayaModel = laya::DecisionModel;
+using LayaQuestion = laya::LayaQuestion;
+using LayaAnswer = laya::LayaAnswer;
+using LayaResult = laya::LayaResult;
+}  // namespace brolm

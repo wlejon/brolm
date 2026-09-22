@@ -30,6 +30,7 @@
 #include <brolm/t5.h>
 #include <brolm/tokenizer_t5.h>
 #include <brolm/sampler.h>
+#include <brolm/laya.h>
 #include <brolm/detail/generate.h>
 
 #include <algorithm>
@@ -211,6 +212,7 @@ extern HostClass g_qwen3VLModelClass;
 extern HostClass g_clipModelClass;
 extern HostClass g_nllbModelClass;
 extern HostClass g_t5ModelClass;
+extern HostClass g_layaModelClass;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Conversions and Helpers
@@ -493,6 +495,13 @@ Value makeNllbModelValue(std::unique_ptr<brolm::nllb::Translator> tr, brotensor:
 HostT5Model* hostT5ModelOf(Value v);
 Value makeT5ModelValue(std::unique_ptr<HostT5Model> t5);
 
+brolm::LayaModel* hostLayaModelOf(Value v);
+Value makeLayaModelValue(std::unique_ptr<brolm::LayaModel> model);
+
+// Path resolution for file loaders (api.h setPathResolver).
+void setPathResolver(std::function<std::string(const std::string&)> resolver);
+std::string resolvePath(const std::string& path);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Registration Functions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -501,6 +510,7 @@ void registerLMTokenizerClasses();
 void registerLMModelClasses();
 void registerLMVLClasses();
 void registerLMClipClasses();
+void registerLMLayaClasses();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // bro.lm Namespace Bindings
@@ -517,6 +527,7 @@ Value js_loadTokenizer(Value, std::span<const Value>);
 Value js_loadLlama3Tokenizer(Value, std::span<const Value>);
 Value js_loadClip(Value, std::span<const Value>);
 Value js_loadT5(Value, std::span<const Value>);
+Value js_loadLaya(Value, std::span<const Value>);
 Value js_lm_generate(Value, std::span<const Value>);
 Value js_lm_tick(Value, std::span<const Value>);
 

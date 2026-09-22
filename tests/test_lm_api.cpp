@@ -10,8 +10,10 @@
 #include "embed/embed.h"
 #include "eval/eval.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -37,13 +39,13 @@ static std::string errorMessage(Value thrown) {
 static const char* kLoaders[] = {
     "loadQwen", "loadMistral", "loadGemma2", "loadModel", "loadQwen35",
     "loadQwen3VL", "loadNllb", "loadTokenizer", "loadLlama3Tokenizer",
-    "loadClip", "loadClipModel", "loadT5",
+    "loadClip", "loadClipModel", "loadT5", "loadLaya",
 };
 
 static const char* kClasses[] = {
     "QwenTokenizer", "MistralTokenizer", "GemmaTokenizer", "Llama3Tokenizer",
     "LMModel", "Qwen35Model", "Qwen3VLModel", "ClipModel", "NllbModel",
-    "T5Model", "AsyncHandle",
+    "T5Model", "LayaModel", "AsyncHandle",
 };
 
 static Value lmNamespace() {
@@ -151,6 +153,13 @@ static void test_loader_validation() {
         TEST_CHECK(r.thrown);
         TEST_CHECK(errorMessage(r.value).find("loadLlama3Tokenizer") != std::string::npos);
     }
+    {
+        Value arg = missing.get();
+        Value fn = ev::getProperty(lm, "loadLaya");
+        ev::CallResult r = ev::call(fn, lm, std::span<const Value>(&arg, 1));
+        TEST_CHECK(r.thrown);
+        TEST_CHECK(errorMessage(r.value).find("loadLaya") != std::string::npos);
+    }
 
     // loadTokenizer({}) : an options object with none of the doc'd keys.
     {
@@ -187,6 +196,7 @@ static void test_script() {
             if (typeof lm !== "object") throw new Error("bro.lm missing");
             if (globalThis.QwenTokenizer !== lm.QwenTokenizer) throw new Error("QwenTokenizer global is not bro.lm.QwenTokenizer");
             if (globalThis.LMModel !== lm.LMModel) throw new Error("LMModel global is not bro.lm.LMModel");
+            if (globalThis.LayaModel !== lm.LayaModel) throw new Error("LayaModel global is not bro.lm.LayaModel");
 
             function expectType(fn, name) {
                 let caught = null;
@@ -211,9 +221,12 @@ static void test_script() {
             expectType(() => lm.loadQwen3VL(undefined), "loadQwen3VL(undefined)");
             expectType(() => lm.loadTokenizer(), "loadTokenizer()");
             expectType(() => lm.loadTokenizer({ vocabPath: "v.json" }), "loadTokenizer missing mergesPath");
+            expectType(() => lm.loadLaya(), "loadLaya()");
+            expectType(() => lm.loadLaya(null), "loadLaya(null)");
             expectType(() => lm.generate(), "generate()");
             expectType(() => new QwenTokenizer(), "new QwenTokenizer()");
             expectType(() => new LMModel(), "new LMModel()");
+            expectType(() => new LayaModel(), "new LayaModel()");
 
             const e1 = expectThrows(() => lm.loadQwen("./does-not-exist/model.gguf"), "loadQwen(missing)");
             if (e1.message.indexOf("loadQwen") < 0) throw new Error("loadQwen(missing) message: " + e1.message);
@@ -221,6 +234,8 @@ static void test_script() {
             if (e2.message.indexOf("loadTokenizer") < 0) throw new Error("loadTokenizer(missing) message: " + e2.message);
             const e3 = expectThrows(() => lm.loadTokenizer({ vocabPath: "./nope/vocab.json", mergesPath: "./nope/merges.txt" }), "loadTokenizer(missing pair)");
             if (e3.message.indexOf("loadTokenizer") < 0) throw new Error("loadTokenizer(missing pair) message: " + e3.message);
+            const e4 = expectThrows(() => lm.loadLaya("./does-not-exist"), "loadLaya(missing)");
+            if (e4.message.indexOf("loadLaya") < 0) throw new Error("loadLaya(missing) message: " + e4.message);
 
             if (lm.tick() !== undefined) throw new Error("tick() should return undefined");
             return "SUCCESS";
@@ -264,6 +279,119 @@ static void test_async_handle() {
     if (backgroundWorker.joinable()) backgroundWorker.join();
 }
 
+static void test_laya() {
+    std::cout << "[5/5] laya inference test..." << std::endl;
+
+    const char* env_dir = std::getenv("LAYA_MODEL_DIR");
+    std::string model_dir = (env_dir && env_dir[0]) ? env_dir : "D:/projects/laya";
+    std::replace(model_dir.begin(), model_dir.end(), '\\', '/');
+
+    if (!std::filesystem::exists(model_dir + "/model.safetensors")) {
+        std::cout << "Skipping Laya inference test: checkpoint not found at " << model_dir << std::endl;
+        return;
+    }
+
+    std::string script = R"JS(
+        (function() {
+            const laya = bro.lm.loadLaya(")JS" + model_dir + R"JS(");
+            if (!laya || typeof laya.predict !== "function") {
+                throw new Error("loadLaya failed or predict is not a function");
+            }
+
+            const state = {
+                from: "user@acme.com",
+                subject: "Duplicate charge on invoice #4411",
+                body: "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."
+            };
+
+            const questions = {
+                department: {
+                    type: "choice",
+                    instructions: "Which department should handle this request?",
+                    criteria: {
+                        billing: "invoices, payments, refunds",
+                        technical: "bugs, outages, system errors",
+                        sales: "pricing, new contracts",
+                        other: "everything else"
+                    }
+                },
+                urgency: {
+                    type: "score",
+                    instructions: "How urgent is this request?",
+                    criteria: ["not urgent", "soon", "critical deadline or blocking issue"]
+                },
+                churn_risk: {
+                    type: "noul",
+                    instructions: "Does the user threaten to cancel or leave?"
+                }
+            };
+
+            const res = laya.predict(state, questions);
+            if (typeof res !== "object" || res === null) {
+                throw new Error("predict result must be an object");
+            }
+            if (res.model !== "rl-agent") {
+                throw new Error("expected model to be rl-agent, got: " + res.model);
+            }
+            if (typeof res.usage !== "object" || typeof res.usage.input_tokens !== "number") {
+                throw new Error("expected usage.input_tokens number");
+            }
+            if (res.usage.input_tokens <= 0) {
+                throw new Error("input_tokens should be > 0");
+            }
+            if (typeof res.answers !== "object" || res.answers === null) {
+                throw new Error("expected answers object");
+            }
+
+            const dept = res.answers.department;
+            if (!dept || dept.type !== "choice") throw new Error("department must have type choice");
+            if (dept.choice !== "billing") throw new Error("expected department choice billing, got: " + dept.choice);
+            if (typeof dept.confidence !== "number" || dept.confidence <= 0) {
+                throw new Error("expected positive confidence");
+            }
+            if (typeof dept.probabilities !== "object" || typeof dept.probabilities.billing !== "number") {
+                throw new Error("expected probabilities.billing number");
+            }
+            if (typeof dept.rl_agent !== "object" || typeof dept.rl_agent.act_probability !== "number") {
+                throw new Error("expected rl_agent.act_probability");
+            }
+
+            const urg = res.answers.urgency;
+            if (!urg || urg.type !== "score") throw new Error("urgency must have type score");
+            if (typeof urg.score !== "number") throw new Error("urgency score must be number");
+            if (typeof urg.legend !== "object" || urg.legend["0"] !== "not urgent") {
+                throw new Error("urgency legend missing or incorrect");
+            }
+            if (typeof urg.probabilities !== "object" || typeof urg.probabilities["0"] !== "number") {
+                throw new Error("urgency probabilities missing");
+            }
+
+            const churn = res.answers.churn_risk;
+            if (!churn || churn.type !== "noul") throw new Error("churn_risk must have type noul");
+            if (typeof churn.noul !== "number") throw new Error("churn_risk noul must be number");
+            if (typeof churn.rl_agent !== "object" || typeof churn.rl_agent.act_probability !== "number") {
+                throw new Error("expected churn rl_agent.act_probability");
+            }
+
+            // Also test constructor form: new bro.lm.LayaModel(...)
+            const layaCtor = new bro.lm.LayaModel(")JS" + model_dir + R"JS(");
+            const res2 = layaCtor.predict(JSON.stringify(state), questions);
+            if (!res2 || !res2.answers || res2.answers.department.choice !== "billing") {
+                throw new Error("new LayaModel() predict failed");
+            }
+
+            return "SUCCESS";
+        })()
+    )JS";
+
+    ev::CallResult res = bronze::eval::evalScript(script);
+    if (res.thrown) {
+        std::cerr << "laya eval threw: " << ev::toUtf8(res.value) << std::endl;
+        std::exit(1);
+    }
+    TEST_CHECK(ev::toUtf8(res.value) == "SUCCESS");
+}
+
 int main() {
     std::cout << "Running brolm API test..." << std::endl;
 
@@ -275,6 +403,7 @@ int main() {
         test_loader_validation();
         test_script();
         test_async_handle();
+        test_laya();
     }
     ev::destroyRealm(realm);
 

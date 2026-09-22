@@ -5,6 +5,7 @@ add_library(brolm_api STATIC
     native_lm_model.cpp
     native_lm_vl.cpp
     native_lm_clip.cpp
+    native_lm_laya.cpp
 )
 
 target_include_directories(brolm_api PUBLIC

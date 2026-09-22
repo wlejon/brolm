@@ -4,11 +4,26 @@
 
 namespace brolm::api {
 
+static std::function<std::string(const std::string&)>& pathResolverSlot() {
+    static std::function<std::string(const std::string&)> slot;
+    return slot;
+}
+
+void setPathResolver(std::function<std::string(const std::string&)> resolver) {
+    pathResolverSlot() = std::move(resolver);
+}
+
+std::string resolvePath(const std::string& path) {
+    auto& r = pathResolverSlot();
+    return r ? r(path) : path;
+}
+
 void installLM() {
     registerLMTokenizerClasses();
     registerLMModelClasses();
     registerLMVLClasses();
     registerLMClipClasses();
+    registerLMLayaClasses();
 
     Value globalThisVal = ev::undefined();
     auto gt = ev::globalValue("globalThis");
@@ -54,6 +69,7 @@ void installLM() {
     lmObj.def("loadClip", 1, js_loadClip);
     lmObj.def("loadClipModel", 1, js_loadClip);
     lmObj.def("loadT5", 1, js_loadT5);
+    lmObj.def("loadLaya", 1, js_loadLaya);
     lmObj.def("generate", 2, js_lm_generate);
     lmObj.def("tick", 0, js_lm_tick);
 
@@ -67,6 +83,7 @@ void installLM() {
     lmObj.set("ClipModel", g_clipModelClass.constructor());
     lmObj.set("NllbModel", g_nllbModelClass.constructor());
     lmObj.set("T5Model", g_t5ModelClass.constructor());
+    lmObj.set("LayaModel", g_layaModelClass.constructor());
     lmObj.set("AsyncHandle", g_asyncHandleClass.constructor());
 
     if (!ev::isUndefined(globalThisVal)) {
@@ -80,6 +97,7 @@ void installLM() {
         ev::setProperty(globalThisVal, "ClipModel", g_clipModelClass.constructor());
         ev::setProperty(globalThisVal, "NllbModel", g_nllbModelClass.constructor());
         ev::setProperty(globalThisVal, "T5Model", g_t5ModelClass.constructor());
+        ev::setProperty(globalThisVal, "LayaModel", g_layaModelClass.constructor());
         ev::setProperty(globalThisVal, "AsyncHandle", g_asyncHandleClass.constructor());
     }
 
