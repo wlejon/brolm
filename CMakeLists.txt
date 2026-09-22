@@ -213,6 +213,11 @@ target_sources(brolm PRIVATE
     src/qwen3vl_text.cpp
     src/qwen3vl_vl.cpp
     src/qwen3vl_prompt.cpp
+    src/modernbert_config.cpp
+    src/modernbert.cpp
+    src/laya_config.cpp
+    src/laya_tokenizer.cpp
+    src/laya.cpp
 )
 
 # --- Install ---
