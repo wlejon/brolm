@@ -417,6 +417,30 @@ void run_synthetic() {
             CHECK(id >= 0);
             CHECK(id < cfg.text.vocab_size);
         }
+
+        // Grammar-constrained decode (see test_qwen35_vl).
+        auto text_of = [&](const std::vector<int>& ids) {
+            return vlm.tokenizer().decode(std::vector<int32_t>(ids.begin(), ids.end()));
+        };
+        vlm.set_generation(6, 0.0f, 0, 1.0f, 0, 0.0f, 1.0f, 0.0f, 0.0f, /*stop_on_eos=*/false);
+        brolm::Grammar exact = brolm::Grammar::exact("42");
+        vlm.set_grammar(&exact);
+        std::vector<int> g_ids = vlm.generate_tokens(prompt, no_images);
+        std::printf("vl synthetic: exact(\"42\") -> \"%s\"\n", text_of(g_ids).c_str());
+        CHECK(text_of(g_ids) == "42");
+        CHECK(!exact.is_accepted());
+
+        brolm::Grammar digits = brolm::Grammar::regex("[0-9]+");
+        vlm.set_grammar(&digits);
+        std::vector<int> d_ids = vlm.generate_tokens(prompt, no_images);
+        const std::string d_text = text_of(d_ids);
+        std::printf("vl synthetic: regex([0-9]+) -> \"%s\"\n", d_text.c_str());
+        CHECK(static_cast<int>(d_ids.size()) == 6);
+        for (char c : d_text) CHECK(c >= '0' && c <= '9');
+
+        vlm.set_grammar(nullptr);
+        vlm.set_generation(vcfg.max_new_tokens, 0.0f, 0, 1.0f, 0);
+        CHECK(vlm.generate_tokens(prompt, no_images) == out_ids);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "qwen3vl_vl synthetic threw: %s\n", e.what());
         ++g_failures;

@@ -66,6 +66,11 @@ public:
     // any byte string (the vocab contains every single byte).
     std::string decode(const std::vector<int32_t>& ids) const;
 
+    // The bytes one id adds to generated text: its raw token bytes, or "" for
+    // a special (control) token and an unknown id — the table a grammar mask
+    // reads (see qwen::Tokenizer::token_text).
+    std::string token_text(int32_t id) const;
+
     // Render a Mistral instruction conversation as plain text (feed to
     // encode() with add_special=false — the leading <s> is included):
     //   <s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{user}[/INST]{assistant}</s>...

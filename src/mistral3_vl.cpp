@@ -1,6 +1,7 @@
 #include "brolm/mistral3_vl.h"
 
 #include "brolm/detail/compute.h"
+#include "brolm/detail/grammar_decode.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
@@ -112,37 +113,48 @@ std::vector<int32_t> VLModel::generate(
     const std::vector<int32_t>& prompt_ids,
     const std::vector<PreprocessedImage>& images,
     int image_token_id, int eos_id,
-    const brolm::detail::GenerateOptions& opts) {
+    const brolm::detail::GenerateOptions& opts,
+    const std::vector<std::string>* token_text) {
     std::vector<int32_t> generated;
     const int L = static_cast<int>(prompt_ids.size());
     if (L <= 0 || opts.max_new_tokens <= 0) return generated;
 
     const int vocab = cfg_.text.vocab_size;
+    // Throws before any device work when a grammar comes without token text.
+    brolm::detail::GrammarDecode gd(opts.grammar, token_text);
     allocate_cache(L + opts.max_new_tokens);
 
     std::mt19937_64 rng(opts.sampling.seed);
+    const bool stop = opts.stop_on_eos && eos_id >= 0;
+    const int grammar_eos = stop ? eos_id : -1;
+    // Penalties read the whole context (prompt + generated), as detail::generate.
+    std::vector<int32_t> context = prompt_ids;
+    static const std::string kNoText;
+    auto text_of = [&](int id) -> const std::string& {
+        return token_text && id >= 0 && static_cast<size_t>(id) < token_text->size()
+            ? (*token_text)[static_cast<size_t>(id)] : kNoText;
+    };
 
     // Prefill: build the fused image+text stream, run forward_embeds, sample
-    // the first new token from the last logits row.
+    // the first new token from the last logits row; then decode text-only,
+    // one token at a time.
     bt::Tensor fused;
     fuse_embeds(prompt_ids, images, image_token_id, fused);
     bt::Tensor logits;
     text_.forward_embeds(fused, L, logits);
-    std::vector<float> row = brolm::detail::last_row_fp32(logits);
-    int next = brolm::detail::sample_token(row.data(), vocab, opts.sampling, rng);
-
-    const bool stop = opts.stop_on_eos && eos_id >= 0;
-    if (stop && next == eos_id) return generated;
-    generated.push_back(static_cast<int32_t>(next));
-
-    // Decode: text-only forward, one token at a time.
-    while (static_cast<int>(generated.size()) < opts.max_new_tokens) {
-        int32_t cur = generated.back();
-        text_.forward(&cur, 1, logits);
-        row = brolm::detail::last_row_fp32(logits);
-        next = brolm::detail::sample_token(row.data(), vocab, opts.sampling, rng);
+    while (true) {
+        std::vector<float> row = brolm::detail::last_row_fp32(logits);
+        if (!gd.mask(row.data(), vocab, grammar_eos)) break;
+        const int next = brolm::detail::sample_token(row.data(), vocab, opts.sampling, rng,
+                                                     context.data(), static_cast<int>(context.size()));
         if (stop && next == eos_id) break;
         generated.push_back(static_cast<int32_t>(next));
+        context.push_back(static_cast<int32_t>(next));
+        gd.accept(next);
+        if (opts.on_token && !opts.on_token(static_cast<int32_t>(next), text_of(next))) break;
+        if (static_cast<int>(generated.size()) >= opts.max_new_tokens) break;
+        const int32_t cur = generated.back();
+        text_.forward(&cur, 1, logits);
     }
     return generated;
 }

@@ -34,6 +34,7 @@
 // calls; the caller is responsible for not exceeding VLMConfig::max_seq_len
 // in a single call.
 
+#include "brolm/grammar.h"
 #include "brolm/qwen3vl_config.h"
 #include "brolm/qwen3vl_preprocessor.h"
 #include "brolm/qwen3vl_text.h"
@@ -43,6 +44,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -130,6 +132,10 @@ public:
                         float presence_penalty = 0.0f,
                         bool stop_on_eos = true);
 
+    // Constrain every later generate call to `grammar`; same contract as
+    // qwen35::VLM::set_grammar. nullptr removes the constraint.
+    void set_grammar(const Grammar* grammar);
+
     const Tokenizer&     tokenizer() const;
     const Qwen3VLConfig& config()    const { return cfg_.model_cfg; }
 
@@ -140,6 +146,8 @@ private:
     std::unique_ptr<TextModel>      text_;
     std::vector<LayerCache>         cache_;
     bool                            cache_allocated_ = false;
+    std::optional<Grammar>          grammar_;
+    std::vector<std::string>        token_text_;  // per-id grammar text, built on first use
 };
 
 }  // namespace brolm::qwen3vl

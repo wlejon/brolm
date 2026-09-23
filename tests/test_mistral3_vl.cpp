@@ -259,6 +259,39 @@ int main() {
             CHECK(a == bb);
         }
 
+        // ── 4b. grammar-constrained generation + on_token ────────────────
+        {
+            // ids 20..29 are the digits, 30..35 letters; the rest (EOS at 0
+            // included) have no text, so the mask never lets them through.
+            std::vector<std::string> text(static_cast<std::size_t>(V));
+            for (int d = 0; d < 10; ++d) text[static_cast<std::size_t>(20 + d)] = std::string(1, static_cast<char>('0' + d));
+            for (int l = 0; l < 6; ++l) text[static_cast<std::size_t>(30 + l)] = std::string(1, static_cast<char>('a' + l));
+            const int eos = 0;
+
+            brolm::Grammar three = brolm::Grammar::regex("[0-9]{3}");
+            brolm::detail::GenerateOptions opts;
+            opts.max_new_tokens = 8; opts.stop_on_eos = true; opts.sampling.temperature = 0.0f;
+            opts.grammar = &three;
+            std::string streamed;
+            opts.on_token = [&](int32_t, const std::string& t) { streamed += t; return true; };
+
+            m3::VLModel vl(cfg); vl.load_weights(file);
+            std::vector<int32_t> g = vl.generate(prompt, {imgA}, IMG, eos, opts, &text);
+            std::string out;
+            for (int32_t id : g) out += text[static_cast<std::size_t>(id)];
+            std::printf("mistral3_vl: regex([0-9]{3}) -> \"%s\"\n", out.c_str());
+            // Three digits, then only EOS is allowed and the decode stops.
+            CHECK(static_cast<int>(g.size()) == 3);
+            for (int32_t id : g) CHECK(id >= 20 && id < 30);
+            CHECK(streamed == out);
+            CHECK(!three.is_accepted());
+
+            bool threw = false;
+            try { (void)vl.generate(prompt, {imgA}, IMG, eos, opts); }  // grammar, no token text
+            catch (const std::exception&) { threw = true; }
+            CHECK(threw);
+        }
+
         // ── 5. mismatched image-token count raises ────────────────────────
         {
             m3::VLModel vl(cfg); vl.load_weights(file);

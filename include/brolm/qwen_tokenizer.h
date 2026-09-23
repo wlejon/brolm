@@ -108,6 +108,13 @@ public:
     // does through HF.
     std::string decode(const std::vector<int32_t>& ids) const;
 
+    // The bytes one id adds to generated text: its decoded piece, or "" for
+    // a special (control) token and for an id outside the vocabulary. This
+    // is the table a grammar mask reads (Grammar::mask_logits masks every
+    // empty entry), so a constrained decode never emits a control token as
+    // though it were text.
+    std::string token_text(int32_t id) const;
+
     // Render a ChatML conversation: for each (role, content) pair emit
     // "<|im_start|>role\ncontent<|im_end|>\n". When `add_generation_prompt` is
     // true a trailing "<|im_start|>assistant\n" is appended to cue generation.

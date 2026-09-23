@@ -424,7 +424,12 @@ struct BuiltLM {
 template <class Tok>
 static void pairTokenizer(HostLMModel& mw, const std::shared_ptr<Tok>& tok) {
     mw.defaultEos = tok->eos_id();
-    mw.tokenText = [tok](int32_t id) { return tok->decode(std::vector<int32_t>{id}); };
+    // A tokenizer that can tell control tokens apart gives them no text, so
+    // the grammar mask never lets one through as though it were text.
+    if constexpr (requires { tok->token_text(int32_t{0}); })
+        mw.tokenText = [tok](int32_t id) { return tok->token_text(id); };
+    else
+        mw.tokenText = [tok](int32_t id) { return tok->decode(std::vector<int32_t>{id}); };
 }
 
 static void buildQwen(const std::string& path, brotensor::Device dev, BuiltLM<brolm::qwen::Tokenizer>& out) {
@@ -642,7 +647,12 @@ static void finishGenerate(const std::shared_ptr<GenResult>& res, AsyncJob& j) {
 // The VLM families share one driver shape: set_generation + generate_tokens.
 template <class VLM, class ImageInput, class HostT>
 static Value launchVlmGenerate(HostT* w, std::shared_ptr<AsyncJob> job, std::string prompt,
-                               const brolm::qwen::GenerateOptions& opts, std::vector<VlmImage> images) {
+                               brolm::qwen::GenerateOptions opts, std::vector<VlmImage> images) {
+    // opts.grammar: the VLM copies it here on the JS thread (the caller holds
+    // the model's busy claim, so no decode is running), and the worker never
+    // reads the JS Grammar object. nullptr clears a previous call's grammar.
+    w->vlm->set_grammar(opts.grammar);
+    opts.grammar = nullptr;
     auto res = std::make_shared<GenResult>();
     job->finish = [res](AsyncJob& j) { finishGenerate(res, j); };
     return launchAsyncJob(job, [w, res, prompt = std::move(prompt), opts,

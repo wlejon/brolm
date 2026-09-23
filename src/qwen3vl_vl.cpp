@@ -3,6 +3,7 @@
 #include "brolm/qwen3vl_vl.h"
 
 #include "brolm/detail/compute.h"
+#include "brolm/detail/grammar_decode.h"
 #include "brolm/qwen3vl_prompt.h"
 #include "brolm/qwen_generate.h"
 
@@ -167,6 +168,11 @@ void VLM::set_generation(int max_new_tokens, float temperature, int top_k,
     cfg_.stop_on_eos        = stop_on_eos;
 }
 
+void VLM::set_grammar(const Grammar* grammar) {
+    if (grammar) grammar_.emplace(grammar->clone());
+    else grammar_.reset();
+}
+
 std::vector<int> VLM::generate_tokens(const std::string& prompt,
                                       const std::vector<ImageInput>& images,
                                       const TokenCallback& on_token) {
@@ -270,10 +276,19 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
         return false;
     };
 
+    // Grammar constraint (see qwen35::VLM::generate_tokens).
+    if (grammar_ && token_text_.empty()) {
+        token_text_.resize(static_cast<std::size_t>(vocab));
+        for (int i = 0; i < vocab; ++i) token_text_[static_cast<std::size_t>(i)] = tokenizer_->token_text(i);
+    }
+    brolm::detail::GrammarDecode gd(grammar_ ? &*grammar_ : nullptr, &token_text_);
+    const int grammar_eos = cfg_.stop_on_eos ? im_end_id : -1;
+
     std::vector<float> row = last_row_fp32(logits);
     if (!row_finite(row.data(), vocab)) {
         fail("prefill produced non-finite logits");
     }
+    if (!gd.mask(row.data(), vocab, grammar_eos)) return generated;
     int next = qwen::sample_token(row.data(), vocab, sp, rng,
                                   context.data(), static_cast<int>(context.size()));
 
@@ -285,6 +300,7 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
     while (steps_remaining > 0 && !stop_token(next)) {
         generated.push_back(next);
         context.push_back(static_cast<int32_t>(next));
+        gd.accept(next);
         --steps_remaining;
         if (on_token && !on_token(next)) break;
         if (steps_remaining == 0) break;
@@ -305,6 +321,7 @@ std::vector<int> VLM::generate_tokens(const std::string& prompt,
         if (!row_finite(row.data(), vocab)) {
             fail("decode step produced non-finite logits");
         }
+        if (!gd.mask(row.data(), vocab, grammar_eos)) break;
         next = qwen::sample_token(row.data(), vocab, sp, rng,
                                   context.data(), static_cast<int>(context.size()));
     }

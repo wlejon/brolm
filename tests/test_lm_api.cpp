@@ -467,10 +467,24 @@ static void test_generation_weights() {
         std::string launch = R"JS(
             (function() {
                 const m = bro.lm.loadQwen35(")JS" + q35 + R"JS(", { maxSeqLen: 512 });
-                const st = globalThis.__q35 = { ids: null, err: null };
-                bro.lm.generate(m, "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n", {
-                    maxNewTokens: 4, sampling: { temperature: 0 },
-                    onDone: (ids, info) => { st.ids = ids; st.info = info; },
+                const prompt = "<|im_start|>user\nIs the sky blue? Answer yes or no.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+                // Grammar-constrained VLM decode (sync): the reply is exactly
+                // one of the choices, whatever the model would have said.
+                const g = bro.lm.Grammar.choice(["maybe", "certainly not"]);
+                const ids = m.generate(prompt, { maxNewTokens: 8, grammar: g, sampling: { temperature: 0 } });
+                const text = m.decode(ids);
+                if (text !== "maybe" && text !== "certainly not") throw new Error("vlm grammar output: " + JSON.stringify(text));
+                if (g.isAccepted()) throw new Error("generation advanced the caller's Grammar");
+                // No grammar on the next call: the previous one does not linger.
+                const free = m.decode(m.generate(prompt, { maxNewTokens: 4, sampling: { temperature: 0 } }));
+                if (free === text) throw new Error("grammar lingered into an unconstrained call: " + JSON.stringify(free));
+
+                // The same through bro.lm.generate on a worker.
+                const st = globalThis.__q35 = { ids: null, err: null, text: null };
+                bro.lm.generate(m, prompt, {
+                    maxNewTokens: 8, sampling: { temperature: 0 }, grammar: bro.lm.Grammar.regex("[0-9]{2}"),
+                    onDone: (ids, info) => { st.ids = ids; st.info = info; st.text = m.decode(ids); },
                     onError: (e) => { st.err = e; },
                 });
                 return "LAUNCHED";
@@ -478,13 +492,13 @@ static void test_generation_weights() {
         )JS";
         std::string state;
         const bool ok = evalUntilDone(launch,
-            "(function(){ const s = globalThis.__q35; return s.err ? 'BAD ' + s.err : (s.ids ? (s.ids.length > 0 ? 'DONE' : 'BAD empty') : 'WAIT'); })()",
+            "(function(){ const s = globalThis.__q35; return s.err ? 'BAD ' + s.err : (s.ids ? (/^[0-9]{2}$/.test(s.text) ? 'DONE' : 'BAD ' + JSON.stringify(s.text)) : 'WAIT'); })()",
             300, state);
         if (!ok) {
             std::cerr << "qwen35 async: " << state << std::endl;
             std::exit(1);
         }
-        std::cout << "  qwen3.5: bro.lm.generate OK" << std::endl;
+        std::cout << "  qwen3.5: grammar (sync + bro.lm.generate) OK" << std::endl;
     }
 }
 

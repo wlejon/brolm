@@ -576,6 +576,12 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     return out;
 }
 
+std::string Tokenizer::token_text(int32_t id) const {
+    if (specials_.token_for_id(id)) return {};
+    if (id_to_token_.find(id) == id_to_token_.end()) return {};
+    return decode(std::vector<int32_t>{id});
+}
+
 std::string Tokenizer::apply_chat_template(
     const std::vector<std::pair<std::string, std::string>>& messages,
     bool add_generation_prompt) const {

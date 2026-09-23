@@ -40,6 +40,7 @@ public:
     std::string decode(const std::vector<int32_t>& ids) const {
         return inner_.decode(ids);
     }
+    std::string token_text(int32_t id) const { return inner_.token_text(id); }
     std::string apply_chat_template(
         const std::vector<std::pair<std::string, std::string>>& messages,
         bool add_generation_prompt = true) const {

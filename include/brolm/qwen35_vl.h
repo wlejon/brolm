@@ -36,6 +36,7 @@
 // generate() calls; the caller is responsible for not exceeding
 // VLMConfig::max_seq_len in a single call.
 
+#include "brolm/grammar.h"
 #include "brolm/qwen35_config.h"
 #include "brolm/qwen35_preprocessor.h"
 #include "brolm/qwen35_text.h"
@@ -45,6 +46,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -138,6 +140,15 @@ public:
                         float presence_penalty = 0.0f,
                         bool stop_on_eos = true);
 
+    // Constrain every later generate call to `grammar` (brolm/grammar.h); a
+    // copy is kept, and each call decodes against a fresh clone of it, so
+    // the caller's object is never advanced. nullptr removes the constraint.
+    // Each step masks the logits to tokens the grammar can take (control
+    // tokens are never text, so never allowed), and <|im_end|> is allowed
+    // only once the grammar accepts. The decode ends early when no token is
+    // left (the grammar is complete and stop_on_eos is off).
+    void set_grammar(const Grammar* grammar);
+
     // Accessors. The tokenizer's underlying Qwen3 BPE handle is exposed so
     // callers can encode/decode arbitrary text outside the generate() path.
     const Tokenizer&    tokenizer() const;
@@ -153,6 +164,8 @@ private:
     std::unique_ptr<TextModel>      text_;
     std::vector<LayerCache>         cache_;
     bool                            cache_allocated_ = false;
+    std::optional<Grammar>          grammar_;
+    std::vector<std::string>        token_text_;  // per-id grammar text, built on first use
 };
 
 }  // namespace brolm::qwen35

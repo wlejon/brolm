@@ -34,6 +34,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace brotensor::safetensors { class File; }
@@ -83,10 +84,15 @@ public:
     // Autoregressive generation for an image+text prompt. Sizes the KV cache for
     // (prompt + max_new_tokens), prefills the fused stream, then decodes token
     // by token (text-only forward). Returns ONLY the newly generated ids.
+    // opts.grammar constrains the decode against `token_text` (per-id text,
+    // "" for control tokens — build it with mistral::Tokenizer::token_text;
+    // required with a grammar); opts.on_token is called per token with its
+    // text from the same table ("" without one).
     std::vector<int32_t> generate(const std::vector<int32_t>& prompt_ids,
                                   const std::vector<PreprocessedImage>& images,
                                   int image_token_id, int eos_id,
-                                  const brolm::detail::GenerateOptions& opts);
+                                  const brolm::detail::GenerateOptions& opts,
+                                  const std::vector<std::string>* token_text = nullptr);
 
     TextModel&             text()      { return text_; }
     VisionTower&           vision()    { return vision_; }

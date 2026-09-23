@@ -111,6 +111,9 @@ static Value vlmGenerate(const VlmOps<HostT, ImageInput>& ops, const char* what,
                                opts.sampling.frequency_penalty,
                                opts.sampling.presence_penalty,
                                opts.stop_on_eos);
+        // opts.grammar: the VLM keeps its own copy (nullptr clears the last
+        // call's), so the JS Grammar object is never advanced.
+        w->vlm->set_grammar(opts.grammar);
         std::vector<ImageInput> inputs;
         inputs.reserve(images.size());
         for (auto& im : images) inputs.push_back(ImageInput{ im.chw.data(), im.H, im.W });
