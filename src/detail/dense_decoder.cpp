@@ -608,7 +608,11 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         if (h_.device != cur_dev) {
             h_ = h_.to(cur_dev);
         }
-        if (cur_dev != prev_dev) {
+        // A new pipeline stage starts with emptied scratch, and the previous
+        // layer (on the old device) skipped fusing this layer's input norm,
+        // so it is recomputed here. Captured before prev_dev moves on.
+        const bool stage_start = (cur_dev != prev_dev);
+        if (stage_start) {
             norm_ = bt::Tensor();
             q_    = bt::Tensor();
             k_    = bt::Tensor();
@@ -625,7 +629,7 @@ void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,
         // ── self-attention sub-layer ──────────────────────────────────────
         {
             prof::ScopedStage ps(PStage::rms_norm);
-            if (i == 0 || cur_dev != prev_dev) {
+            if (i == 0 || stage_start) {
                 bt::rms_norm_forward(h_, layer.input_ln, eps, norm_);
             }
         }
