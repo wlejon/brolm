@@ -72,6 +72,14 @@ struct LayaItem {
     const int32_t* marker_pos = nullptr;  // positions inside this item's sequence
     int num_markers = 0;
     int qtype = 0;
+    // Soft-token (embedding) input, for a state that is not text (projected
+    // audio frames): positions [soft_pos, soft_pos + soft_count) of this
+    // item's sequence take rows [soft_row, soft_row + soft_count) of the
+    // `soft` table passed to forward_items() in place of their token
+    // embeddings; the ids there are placeholders. soft_count 0 = text only.
+    int soft_pos = 0;
+    int soft_count = 0;
+    int soft_row = 0;
 
     static LayaItem of(const SequenceResult& seq, int qtype) {
         return LayaItem{seq.input_ids.data(), static_cast<int>(seq.input_ids.size()),
@@ -172,7 +180,14 @@ public:
     // call. On CUDA, the device work replays a CUDA graph cached per
     // (token-count, item-count, marker-count) bucket.
     // Not thread-safe: one call at a time per model.
-    std::vector<LayaItemLogits> forward_items(const std::vector<LayaItem>& items);
+    //
+    // `soft`: the soft-token table items with soft_count > 0 read from — a
+    // (rows, hidden_size) tensor at the compute dtype on the compute device
+    // (see LayaItem::soft_pos). Its rows are copied into the forward's own
+    // scratch before the device work, so graphs never capture the caller's
+    // pointer. Null when every item is text.
+    std::vector<LayaItemLogits> forward_items(const std::vector<LayaItem>& items,
+                                              const brotensor::Tensor* soft = nullptr);
 
     // Calibrate one item's raw outputs into the reference answer shape
     // (host only: temperature softmax, confidence, option labels).
@@ -231,6 +246,9 @@ public:
     const LayaTokenizer& tokenizer() const { return tokenizer_; }
 
 private:
+    // The training-side forward/backward (laya_grad.cpp) reads the weights.
+    friend class LayaGrad;
+
     SequenceResult build_sequence_ids_(const std::vector<int32_t>& state_ids,
                                        const LayaQuestion& q,
                                        const PredictOptions& opts) const;
@@ -280,7 +298,8 @@ private:
     // Y = epilogue(act(X · Wᵀ + b)) on the encoder's split-K workspace.
     void linear_(const brotensor::Tensor& W, const brotensor::Tensor& b, const brotensor::Tensor& X, int act,
                  int epilogue, brotensor::Tensor& Y);
-    void run_device_(Arena& a, int T, int N, int K);
+    // S: soft-token rows (0 = the text-only forward, unchanged).
+    void run_device_(Arena& a, int T, int N, int K, int S);
 };
 
 }  // namespace brolm::laya

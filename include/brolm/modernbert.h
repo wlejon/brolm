@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+namespace brolm::laya {
+class LayaGrad;
+}
+
 namespace brolm::modernbert {
 
 struct LayerWeights {
@@ -50,10 +54,18 @@ struct EncoderTimings {
 //   bounds: (T, 2) [start, end) row range of each row's sequence.
 // Rows only ever attend inside their own sequence, so the result for a
 // sequence is the same as encoding it alone.
+//   soft, soft_idx (optional, both or neither): soft-token input. soft is
+//           (S, hidden_size) at the compute dtype; row s REPLACES the token
+//           embedding of row soft_idx[s] (INT32 (S, 1)) before the embedding
+//           norm, so a projected non-text signal (audio frames) enters the
+//           encoder where a token would. The ids at those rows are ignored.
+//           Duplicate soft_idx entries must carry identical rows.
 struct PackedInputs {
     const brotensor::Tensor* ids = nullptr;
     const brotensor::Tensor* pos = nullptr;
     const brotensor::Tensor* bounds = nullptr;
+    const brotensor::Tensor* soft = nullptr;
+    const brotensor::Tensor* soft_idx = nullptr;
 };
 
 class ModernBertModel {
@@ -67,6 +79,10 @@ public:
     ModernBertModel& operator=(ModernBertModel&&) noexcept = default;
 
     const Config& config() const { return cfg_; }
+
+    // (vocab_size, hidden_size) token embedding table at the compute dtype —
+    // the space soft-token inputs (PackedInputs::soft) live in.
+    const brotensor::Tensor& token_embeddings() const { return tok_embeddings_; }
 
     void load_weights(const brolm::detail::weights::Source& src,
                       const std::string& prefix = "encoder.");
@@ -123,6 +139,10 @@ public:
     EncoderTimings& timings() { return timings_; }
 
 private:
+    // The training-side forward/backward (laya_grad.cpp) reads the weights
+    // and rotary tables directly.
+    friend class ::brolm::laya::LayaGrad;
+
     Config cfg_;
     bool profiling_ = false;
     EncoderTimings timings_;

@@ -76,6 +76,11 @@ brolm_add_test(brolm_test_laya_parity test_laya_parity.cpp)
 # shutdown); same weights lookup, skips without them.
 brolm_add_test(brolm_test_laya_scheduler test_laya_scheduler.cpp)
 target_compile_definitions(brolm_test_laya_scheduler PRIVATE BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")
+# Soft-token input and its gradient (LayaGrad): soft rows equal to the token
+# embeddings reproduce the text answer; the backward matches directional
+# finite differences of the forward. Same weights lookup, skips without them.
+brolm_add_test(brolm_test_laya_grad test_laya_grad.cpp)
+target_compile_definitions(brolm_test_laya_grad PRIVATE BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(brolm_test_laya_parity PRIVATE
     BROLM_TEST_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ref"
     BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")

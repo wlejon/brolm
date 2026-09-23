@@ -223,6 +223,8 @@ target_sources(brolm PRIVATE
     src/laya_batch.cpp
     src/laya_questions.cpp
     src/laya_scheduler.cpp
+    src/laya_grad.cpp
+    src/laya_grad_encoder.cpp
 )
 
 # --- Install ---

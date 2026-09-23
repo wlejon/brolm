@@ -287,6 +287,7 @@ void ModernBertModel::forward_packed(const PackedInputs& in, bt::Tensor& h_out) 
         FamilyTimer t(prof, T.embed_ms);
         bt::embedding_lookup_forward(tok_embeddings_, static_cast<const int32_t*>(in.ids->data),
                                      seq_len, S.embeds);
+        if (in.soft && in.soft_idx && in.soft_idx->rows > 0) bt::scatter_rows(*in.soft, *in.soft_idx, S.embeds);
         layernorm_bias_free(S.embeds, embed_norm_, S.h, eps);
     }
 

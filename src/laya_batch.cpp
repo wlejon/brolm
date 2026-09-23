@@ -109,8 +109,11 @@ struct DecisionModel::Arena {
     std::shared_ptr<modernbert::ModernBertModel::Scratch> enc;
     const void* ws_data = nullptr;  // the encoder split-K workspace graphs on this arena captured
 
-    bt::Tensor idx;  // INT32 index block: ids | pos | bounds | type | markers | starts | segs
-    bt::Tensor v_ids, v_pos, v_bounds, v_type, v_markers, v_starts, v_segs;
+    bt::Tensor idx;  // INT32 index block: ids | pos | bounds | type | markers | starts | segs | soft rows
+    bt::Tensor v_ids, v_pos, v_bounds, v_type, v_markers, v_starts, v_segs, v_soft_idx;
+    // Soft-token rows (cap_T, D), allocated on the first forward that has any;
+    // v_soft views its first S rows.
+    bt::Tensor soft, v_soft;
     bt::Tensor h, h_norm, qkv, attn, ffn1, type_rows;
     bt::Tensor m, s0, s2, wide, logits, feats, h0, act_in, act_h2, out;
 
@@ -132,7 +135,7 @@ struct DecisionModel::Batch {
         bt::CudaGraph graph;
         std::shared_ptr<Arena> arena;  // keeps the buffers it captured alive
     };
-    std::map<std::tuple<int, int, int>, Cached> graphs;
+    std::map<std::tuple<int, int, int, int>, Cached> graphs;  // (T, N, K, soft rows) buckets
 #endif
 
     void clear_graphs() {
@@ -288,17 +291,23 @@ void DecisionModel::linear_(const bt::Tensor& W, const bt::Tensor& bias, const b
 // arena `a` (whose scratch the encoder is pointed at): T packed rows, N items,
 // K markers. Issues device work only (no host transfer, no allocation within
 // capacity) so it can be graph-captured.
-void DecisionModel::run_device_(Arena& b, int T, int N, int K) {
+void DecisionModel::run_device_(Arena& b, int T, int N, int K, int S) {
     const int D = encoder_.config().hidden_size;
     const int H = std::max(1, D / 64);  // nn.TransformerEncoderLayer(d, d // 64 heads)
     const bt::Dtype dt = brolm::compute_dtype();
     const bool prof = profiling_;
     LayaTimings& Tm = timings_;
 
-    // 1. ModernBERT encoder over the packed rows.
+    // 1. ModernBERT encoder over the packed rows (soft rows replace their
+    //    token embeddings when there are any).
     {
         StageTimer t(prof, Tm.encoder_ms);
-        encoder_.forward_packed(modernbert::PackedInputs{&b.v_ids, &b.v_pos, &b.v_bounds}, b.h);
+        modernbert::PackedInputs in{&b.v_ids, &b.v_pos, &b.v_bounds};
+        if (S > 0) {
+            in.soft = &b.v_soft;
+            in.soft_idx = &b.v_soft_idx;
+        }
+        encoder_.forward_packed(in, b.h);
     }
 
     // 2-3. Question-type embedding on every row (each row its item's type),
@@ -374,7 +383,7 @@ DecisionModel::Arena& DecisionModel::reserve_batch_(int T, int N, int K) {
     encoder_.reserve_rows(cT);
     a->ws_data = encoder_.workspace_data();
     using brolm::detail::resize_like;
-    resize_like(a->idx, 5 * cT + cK + 2 * cN + 1, 1, bt::Dtype::INT32, dev);
+    resize_like(a->idx, 6 * cT + cK + 2 * cN + 1, 1, bt::Dtype::INT32, dev);
     resize_like(a->h, cT, D, dt, dev);
     resize_like(a->h_norm, cT, D, dt, dev);
     resize_like(a->qkv, cT, 3 * D, dt, dev);
@@ -395,15 +404,29 @@ DecisionModel::Arena& DecisionModel::reserve_batch_(int T, int N, int K) {
     return *b.cur;
 }
 
-std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaItem>& items) {
+std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaItem>& items,
+                                                         const bt::Tensor* soft) {
     timings_.encoder_ms = timings_.head_ms = timings_.scorer_ms = 0;
     timings_.act_ms = timings_.download_ms = 0;
     timings_.uploads = timings_.downloads = 0;
     if (items.empty()) return {};
 
-    int T = 0, K = 0, max_len = 0;
+    int T = 0, K = 0, S = 0, max_len = 0;
     const int32_t vocab = encoder_.config().vocab_size;
     for (const LayaItem& it : items) {
+        if (it.soft_count < 0) fail("forward_items: negative soft_count");
+        if (it.soft_count > 0) {
+            if (!soft) fail("forward_items: an item has soft rows but no soft table was given");
+            if (soft->cols != encoder_.config().hidden_size || soft->dtype != brolm::compute_dtype() ||
+                soft->device != bt::default_device()) {
+                fail("forward_items: the soft table must be (rows, hidden_size) at the compute dtype and device");
+            }
+            if (it.soft_pos < 0 || it.soft_pos + it.soft_count > it.num_ids || it.soft_row < 0 ||
+                it.soft_row + it.soft_count > soft->rows) {
+                fail("forward_items: soft rows outside the item or the soft table");
+            }
+            S += it.soft_count;
+        }
         if (it.num_ids <= 0 || !it.input_ids) fail("forward_items: an item has no input ids");
         for (int i = 0; i < it.num_ids; ++i) {
             if (static_cast<uint32_t>(it.input_ids[i]) >= static_cast<uint32_t>(vocab)) {
@@ -441,6 +464,9 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     const int Tb = use_graphs ? bucket_rows(T) : T;
     const int Nb = use_graphs ? pow2_at_least(std::max(N, (Tb + 63) / 64), 4) : N;
     const int Kb = use_graphs ? pow2_at_least(std::max(K, (Tb + 7) / 8), 8) : K;
+    // Soft rows: padded with repeats of the last real (row, target) pair,
+    // which rewrite identical values. 0 for a text-only batch.
+    const int Sb = S == 0 ? 0 : use_graphs ? std::min(Tb, pow2_at_least(S, 16)) : S;
 
     if (encoder_.reserve_positions(max_len)) b.clear_graphs();
 
@@ -448,7 +474,7 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     // be an older, smaller arena), else the current one (grown if short).
     std::shared_ptr<Arena> arena;
 #if defined(BROTENSOR_HAS_CUDA)
-    const auto key = std::make_tuple(Tb, Nb, Kb);
+    const auto key = std::make_tuple(Tb, Nb, Kb, Sb);
     auto cached = use_graphs ? b.graphs.find(key) : b.graphs.end();
     const bool replay = cached != b.graphs.end();
     if (replay) arena = cached->second.arena;
@@ -465,13 +491,14 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     // Host index block. Padding rows [T, Tb) are singleton sequences of token
     // 0; padding items have empty marker segments and read row 0.
     const int o_pos = Tb, o_bounds = 2 * Tb, o_type = 4 * Tb, o_markers = 5 * Tb;
-    const int o_starts = o_markers + Kb, o_segs = o_starts + Nb, total = o_segs + Nb + 1;
+    const int o_starts = o_markers + Kb, o_segs = o_starts + Nb, o_soft = o_segs + Nb + 1, total = o_soft + Sb;
     std::vector<int32_t>& hi = b.host_idx;
     hi.assign(static_cast<std::size_t>(total), 0);
     {
-        int row = 0, mk = 0;
+        int row = 0, mk = 0, sr = 0;
         for (int n = 0; n < N; ++n) {
             const LayaItem& it = items[static_cast<std::size_t>(n)];
+            for (int s = 0; s < it.soft_count; ++s) hi[static_cast<std::size_t>(o_soft + sr++)] = row + it.soft_pos + s;
             std::memcpy(hi.data() + row, it.input_ids, static_cast<std::size_t>(it.num_ids) * sizeof(int32_t));
             for (int i = 0; i < it.num_ids; ++i) {
                 hi[static_cast<std::size_t>(o_pos + row + i)] = i;
@@ -492,6 +519,7 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
             hi[static_cast<std::size_t>(o_bounds + 2 * r + 1)] = r + 1;
         }
         for (int n = N; n <= Nb; ++n) hi[static_cast<std::size_t>(o_segs + n)] = K;
+        for (int s = S; s < Sb; ++s) hi[static_cast<std::size_t>(o_soft + s)] = hi[static_cast<std::size_t>(o_soft + S - 1)];
     }
     A.idx.resize(total, 1, bt::Dtype::INT32);  // within capacity: pointer unchanged
     {
@@ -507,6 +535,21 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     A.v_markers = bt::Tensor::view(dev, base + o_markers, Kb, 1, bt::Dtype::INT32);
     A.v_starts = bt::Tensor::view(dev, base + o_starts, Nb, 1, bt::Dtype::INT32);
     A.v_segs = bt::Tensor::view(dev, base + o_segs, Nb + 1, 1, bt::Dtype::INT32);
+    if (Sb > 0) {
+        // Stage the soft rows into the arena (outside any graph): each item's
+        // block, then repeats of the last row for the padding entries.
+        const int D = encoder_.config().hidden_size;
+        if (A.soft.rows < A.cap_T) brolm::detail::resize_like(A.soft, A.cap_T, D, dt, dev);
+        int sr = 0;
+        for (const LayaItem& it : items) {
+            if (it.soft_count <= 0) continue;
+            bt::copy_d2d(*soft, it.soft_row * D, A.soft, sr * D, it.soft_count * D);
+            sr += it.soft_count;
+        }
+        for (int s = S; s < Sb; ++s) bt::copy_d2d(A.soft, (S - 1) * D, A.soft, s * D, D);
+        A.v_soft = bt::Tensor::view(dev, A.soft.data, Sb, D, dt);
+        A.v_soft_idx = bt::Tensor::view(dev, base + o_soft, Sb, 1, bt::Dtype::INT32);
+    }
 
     bool ran = false;
 #if defined(BROTENSOR_HAS_CUDA)
@@ -514,7 +557,7 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
         cached->second.graph.launch();
         ran = true;
     } else if (use_graphs) {
-        run_device_(A, Tb, Nb, Kb);  // eager: sizes every output, gives this call's result
+        run_device_(A, Tb, Nb, Kb, Sb);  // eager: sizes every output, gives this call's result
         ran = true;
         // A grown split-K workspace moved; graphs captured on the old one are stale.
         if (encoder_.workspace_data() != A.ws_data) {
@@ -525,7 +568,7 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
             bt::CudaGraph g;
             {
                 bt::CudaGraphCapture cap;
-                run_device_(A, Tb, Nb, Kb);
+                run_device_(A, Tb, Nb, Kb, Sb);
                 g = cap.finish();
             }
             if (b.graphs.size() >= kMaxGraphs) b.graphs.clear();
@@ -537,7 +580,7 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
         }
     }
 #endif
-    if (!ran) run_device_(A, Tb, Nb, Kb);
+    if (!ran) run_device_(A, Tb, Nb, Kb, Sb);
 
     // One readback: logits (Kb) then act logits (2 * Nb). A replayed graph
     // skips run_device_, so `out` still has the shape of the last EAGER run;
