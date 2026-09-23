@@ -77,6 +77,7 @@ void DecisionModel::load_model(const std::string& model_dir) {
     // pipeline and special-token roles (tokenizer/).
     cfg_ = Config::load(model_dir + "/rl_agent_config.json");
     cfg_.variant = checkpoint_variant(cfg_, model_dir);
+    cfg_.model_dir = model_dir;
     modernbert::Config enc_cfg =
         modernbert::Config::load(model_dir + "/encoder/config.json");
     tokenizer_ = LayaTokenizer::load(model_dir + "/tokenizer/tokenizer.json");

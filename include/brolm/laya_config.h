@@ -19,6 +19,7 @@ struct Config {
     // "typed-decisions", or the checkpoint directory's name for anything else
     // (DecisionModel::load_model sets it; see checkpoint_variant()).
     std::string variant = "english";
+    std::string model_dir;  // the directory load_model read (empty when synthetic)
     // Training-only: the reference slices a multi-turn conversation episode
     // into at most this many prefixes (episode_prefix_lengths) for TD(lambda)
     // targets. Inference (RLAgent.system_one) never reads it; carried for

@@ -29,11 +29,15 @@ HostLaya* hostLayaOf(Value v) {
 
 std::vector<std::string> getObjectKeys(Value obj) {
     std::vector<std::string> keys;
+    // obj and Object are rooted: getProperty allocates (embed.h GC contract).
+    ev::Persistent target(obj);
     auto g = ev::globalValue("Object");
     if (!g.found || !ev::isObject(g.value)) return keys;
-    Value keysFn = ev::getProperty(g.value, "keys");
-    if (!ev::isFunction(keysFn)) return keys;
-    auto res = ev::call(keysFn, g.value, std::span<const Value>(&obj, 1));
+    ev::Persistent objectCtor(g.value);
+    ev::Persistent keysFn(ev::getProperty(objectCtor.get(), "keys"));
+    if (!ev::isFunction(keysFn.get())) return keys;
+    const Value arg = target.get();
+    auto res = ev::call(keysFn.get(), objectCtor.get(), std::span<const Value>(&arg, 1));
     if (res.thrown || !ev::isObject(res.value)) return keys;
     ev::Persistent arr(res.value);
     Value lenVal = ev::getProperty(arr.get(), "length");
@@ -51,11 +55,14 @@ std::vector<std::string> getObjectKeys(Value obj) {
 // (", " / ": ") — the reference serialises dict/list states and non-string
 // instructions with json.dumps, and the model was trained on that spacing.
 bool pythonStyleJson(Value v, std::string& out) {
+    ev::Persistent value(v);
     auto g = ev::globalValue("JSON");
     if (!g.found || !ev::isObject(g.value)) return false;
-    Value stringifyFn = ev::getProperty(g.value, "stringify");
-    if (!ev::isFunction(stringifyFn)) return false;
-    auto res = ev::call(stringifyFn, g.value, std::span<const Value>(&v, 1));
+    ev::Persistent json(g.value);
+    ev::Persistent stringifyFn(ev::getProperty(json.get(), "stringify"));
+    if (!ev::isFunction(stringifyFn.get())) return false;
+    const Value arg = value.get();
+    auto res = ev::call(stringifyFn.get(), json.get(), std::span<const Value>(&arg, 1));
     if (res.thrown || !ev::isString(res.value)) return false;
     out = brolm::laya::python_json_spacing(ev::toUtf8(res.value));
     return true;
@@ -63,16 +70,18 @@ bool pythonStyleJson(Value v, std::string& out) {
 
 // Optional numeric property under a camelCase or snake_case name.
 bool numProp(Value obj, const char* camel, const char* snake, double& out) {
-    Value v = ev::getProperty(obj, camel);
-    if (!ev::isNumber(v) && snake) v = ev::getProperty(obj, snake);
+    ev::Persistent o(obj);  // the first read allocates; the second needs o current
+    Value v = ev::getProperty(o.get(), camel);
+    if (!ev::isNumber(v) && snake) v = ev::getProperty(o.get(), snake);
     if (!ev::isNumber(v)) return false;
     out = ev::toDouble(v);
     return true;
 }
 
 bool boolProp(Value obj, const char* camel, const char* snake, bool& out) {
-    Value v = ev::getProperty(obj, camel);
-    if (!ev::isBool(v) && snake) v = ev::getProperty(obj, snake);
+    ev::Persistent o(obj);
+    Value v = ev::getProperty(o.get(), camel);
+    if (!ev::isBool(v) && snake) v = ev::getProperty(o.get(), snake);
     if (!ev::isBool(v)) return false;
     out = ev::toBool(v);
     return true;
@@ -176,11 +185,12 @@ bool readQuestions(Value qsVal, std::vector<LayaQuestion>& out, std::string& err
 }
 
 // { maxLen, headMaxLen, truncateLeft, priority, deadlineMs } (snake_case accepted).
-bool readRequestOptions(Value o, laya::RequestOptions& ro, std::string& err) {
-    if (!ev::isObject(o)) return true;
+bool readRequestOptions(Value opts, laya::RequestOptions& ro, std::string& err) {
+    if (!ev::isObject(opts)) return true;
+    ev::Persistent o(opts);  // each read below allocates; o.get() is always current
     double d = 0;
-    if (numProp(o, "maxLen", "max_len", d)) ro.predict.max_len = static_cast<int>(d);
-    if (numProp(o, "headMaxLen", "head_max_len", d)) ro.predict.head_max_len = static_cast<int>(d);
+    if (numProp(o.get(), "maxLen", "max_len", d)) ro.predict.max_len = static_cast<int>(d);
+    if (numProp(o.get(), "headMaxLen", "head_max_len", d)) ro.predict.head_max_len = static_cast<int>(d);
     if (ro.predict.max_len < 0 || ro.predict.head_max_len < 0) {
         err = "maxLen / headMaxLen must be positive";
         return false;
@@ -341,7 +351,9 @@ laya::Scheduler* liveScheduler(Value self, const char* what, std::string& err) {
 }
 
 void decorateLayaModel(ObjectBuilder& b) {
-    // config() -> { max_len, head_max_len, temperature, temperature_by_options,
+    // config() -> { checkpoint, model_dir, encoder, model_name, tokenizer,
+    //               vocab_size, hidden_size, num_layers, max_prefixes,
+    //               max_len, head_max_len, temperature, temperature_by_options,
     //               devices, tokenBudget, maxBatchTokens, targetForwardMs, deadlineMs }
     b.def("config", 0, [](Value self, std::span<const Value>) -> Value {
         HostLaya* h = hostLayaOf(self);
@@ -349,7 +361,19 @@ void decorateLayaModel(ObjectBuilder& b) {
         const laya::Config& c = h->sched->model().config();
         const laya::SchedulerOptions& so = h->sched->options();
         const std::vector<int> devs = h->sched->devices();
+        const laya::DecisionModel& m = h->sched->model();
+        const auto& enc = m.encoder().config();
         ObjectBuilder o;
+        // Which checkpoint of the family this is, and its shape.
+        o.set("checkpoint", ev::fromUtf8(c.variant));
+        o.set("model_dir", ev::fromUtf8(c.model_dir));
+        o.set("encoder", ev::fromUtf8(c.encoder));
+        o.set("model_name", ev::fromUtf8(c.model_name));
+        o.set("tokenizer", ev::fromUtf8(m.tokenizer().kind_name()));
+        o.set("vocab_size", static_cast<double>(enc.vocab_size));
+        o.set("hidden_size", static_cast<double>(enc.hidden_size));
+        o.set("num_layers", static_cast<double>(enc.num_hidden_layers));
+        o.set("max_prefixes", static_cast<double>(c.max_prefixes));
         o.set("max_len", static_cast<double>(c.max_len));
         o.set("head_max_len", static_cast<double>(c.head_max_len));
         o.set("temperature", makeFloat32Array(c.temperature.data(), c.temperature.size()));
