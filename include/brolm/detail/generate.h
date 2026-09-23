@@ -17,6 +17,7 @@
 
 #include "brolm/sampler.h"
 #include "brolm/grammar.h"
+#include "brolm/detail/grammar_decode.h"
 #include "brotensor/tensor.h"
 
 #include <atomic>
@@ -146,18 +147,22 @@ std::vector<int32_t> generate(Model& model,
                        logits);
     std::vector<float> row = last_row_fp32(logits);
 
+    // The grammar lets the stop token through only when it would stop the
+    // decode; with no token left allowed the decode ends (any_allowed).
+    const bool stop = opts.stop_on_eos && eos_id >= 0;
+    const int grammar_eos = stop ? eos_id : -1;
     if (has_grammar) {
         grammar_state.mask_logits(row.data(), vocab, [&](int id) -> std::string_view {
             static thread_local std::string s;
             s = get_token_str(static_cast<int32_t>(id));
             return s;
-        }, eos_id);
+        }, grammar_eos);
+        if (!any_allowed(row.data(), vocab)) return generated;
     }
 
     int next = sample_token(row.data(), vocab, opts.sampling, rng,
                             context.data(), static_cast<int>(context.size()));
 
-    const bool stop = opts.stop_on_eos && eos_id >= 0;
     if (stop && next == eos_id) {
         return generated;
     }
@@ -187,7 +192,8 @@ std::vector<int32_t> generate(Model& model,
                 static thread_local std::string s;
                 s = get_token_str(static_cast<int32_t>(id));
                 return s;
-            }, eos_id);
+            }, grammar_eos);
+            if (!any_allowed(row.data(), vocab)) break;
         }
 
         next = sample_token(row.data(), vocab, opts.sampling, rng,

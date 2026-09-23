@@ -487,6 +487,32 @@ struct MockModel {
     }
 };
 
+// A grammar that is complete with no stop token allowed leaves no token: the
+// decode must end there, not sample from an all -inf row (argmax -> id 0).
+void test_grammar_exhaustion_stops() {
+    std::printf("Running test_grammar_exhaustion_stops...\n");
+    MockModel model;
+    brolm::detail::GenerateOptions opts;
+    opts.max_new_tokens = 10;
+    opts.sampling.temperature = 0.0f;
+    opts.stop_on_eos = false;
+    brolm::Grammar g = brolm::Grammar::exact("tok_5tok_1");
+    opts.grammar = &g;
+    auto decode_fn = [](int32_t id) -> std::string { return "tok_" + std::to_string(id); };
+    std::vector<int32_t> out = brolm::detail::generate(model, {1, 2}, 0, opts, decode_fn);
+    CHECK(out.size() == 2);
+    if (out.size() == 2) {
+        CHECK(out[0] == 5);
+        CHECK(out[1] == 1);
+    }
+    // stop_on_eos with eos 0: once accepted the grammar lets eos through and
+    // the decode stops on it.
+    opts.stop_on_eos = true;
+    MockModel model2;
+    out = brolm::detail::generate(model2, {1, 2}, 0, opts, decode_fn);
+    CHECK(out.size() == 2);
+}
+
 void test_streaming_generation() {
     std::printf("Running test_streaming_generation...\n");
 
@@ -538,6 +564,7 @@ int main() {
         test_dry_penalty();
         test_sampler_class();
         test_streaming_generation();
+        test_grammar_exhaustion_stops();
 
     } catch (const std::exception& e) {
         std::fprintf(stderr, "test_grammar_sampler threw: %s\n", e.what());

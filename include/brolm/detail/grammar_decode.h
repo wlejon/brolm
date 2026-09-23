@@ -15,6 +15,15 @@
 
 namespace brolm::detail {
 
+// True when some token of a masked row is still allowed. A sampler handed a
+// row of all -inf falls back to argmax and returns id 0, a masked token, so a
+// constrained decode must stop instead of sampling it.
+inline bool any_allowed(const float* row, int vocab) {
+    for (int i = 0; i < vocab; ++i)
+        if (!(std::isinf(row[i]) && row[i] < 0)) return true;
+    return false;
+}
+
 class GrammarDecode {
 public:
     // `grammar` null = unconstrained (every call below is a no-op). The
@@ -37,9 +46,7 @@ public:
     bool mask(float* row, int vocab, int eos_id) const {
         if (!state_) return true;
         state_->mask_logits(row, vocab, *text_, eos_id);
-        for (int i = 0; i < vocab; ++i)
-            if (!(std::isinf(row[i]) && row[i] < 0)) return true;
-        return false;
+        return any_allowed(row, vocab);
     }
 
     void accept(int id) {
