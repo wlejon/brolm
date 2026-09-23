@@ -83,6 +83,7 @@ private:
     }
 
     std::pair<int, int> parse_factor() {
+        const size_t atom_start = p_;
         auto atom = parse_atom();
         char c = peek();
         if (c == '*' || c == '+' || c == '?' || c == '{') {
@@ -143,10 +144,43 @@ private:
                     graph_.add_epsilon(atom.second, exit);
                     return {entry, exit};
                 }
-                // Otherwise general repeat:
-                graph_.add_epsilon(entry, atom.first);
-                graph_.add_epsilon(atom.second, exit);
-                if (min_c == 0) graph_.add_epsilon(entry, exit);
+                // General {m}, {m,n}, {m,}: m mandatory copies of the atom,
+                // then (n - m) optional ones (or a starred one when unbounded).
+                // Each copy is a fresh fragment, re-parsed from the atom's
+                // source text; the first reuses the fragment parsed above.
+                if (max_c != -1 && max_c < min_c) max_c = min_c;
+                const size_t quant_end = p_;
+                bool atom_used = false;
+                auto copy = [&]() -> std::pair<int, int> {
+                    if (!atom_used) {
+                        atom_used = true;
+                        return atom;
+                    }
+                    p_ = atom_start;
+                    auto frag = parse_atom();
+                    p_ = quant_end;
+                    return frag;
+                };
+                int cur = entry;
+                for (int i = 0; i < min_c; ++i) {
+                    auto frag = copy();
+                    graph_.add_epsilon(cur, frag.first);
+                    cur = frag.second;
+                }
+                if (max_c == -1) {
+                    auto frag = copy();
+                    graph_.add_epsilon(cur, frag.first);
+                    graph_.add_epsilon(frag.second, frag.first);
+                    graph_.add_epsilon(frag.second, exit);
+                } else {
+                    for (int i = min_c; i < max_c; ++i) {
+                        auto frag = copy();
+                        graph_.add_epsilon(cur, exit);  // stop before this optional copy
+                        graph_.add_epsilon(cur, frag.first);
+                        cur = frag.second;
+                    }
+                }
+                graph_.add_epsilon(cur, exit);
                 return {entry, exit};
             }
         }
