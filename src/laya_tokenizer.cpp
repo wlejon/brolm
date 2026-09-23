@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -150,8 +151,36 @@ std::vector<std::string_view> pre_tokenize(std::string_view text) {
 
 }  // namespace
 
+struct LayaTokenizer::PieceCache {
+    static constexpr std::size_t kMaxEntries = 1 << 16;
+    std::mutex mu;
+    std::unordered_map<std::string, std::vector<int32_t>> ids;
+};
+
+void LayaTokenizer::encode_piece_cached_(std::string_view piece, std::vector<int32_t>& out) const {
+    if (!cache_) {
+        bpe::encode_piece(piece, byte_to_unicode_, vocab_, merge_ranks_, /*append_end_of_word=*/false, out);
+        return;
+    }
+    const std::string key(piece);
+    {
+        std::lock_guard<std::mutex> lock(cache_->mu);
+        const auto it = cache_->ids.find(key);
+        if (it != cache_->ids.end()) {
+            out.insert(out.end(), it->second.begin(), it->second.end());
+            return;
+        }
+    }
+    const std::size_t at = out.size();
+    bpe::encode_piece(piece, byte_to_unicode_, vocab_, merge_ranks_, /*append_end_of_word=*/false, out);
+    std::lock_guard<std::mutex> lock(cache_->mu);
+    if (cache_->ids.size() >= PieceCache::kMaxEntries) cache_->ids.clear();
+    cache_->ids.emplace(key, std::vector<int32_t>(out.begin() + static_cast<std::ptrdiff_t>(at), out.end()));
+}
+
 LayaTokenizer LayaTokenizer::load(const std::string& tokenizer_json_path) {
     LayaTokenizer t;
+    t.cache_ = std::make_shared<PieceCache>();
     std::unordered_map<uint32_t, unsigned char> inv;
     bpe::build_byte_unicode_maps(t.byte_to_unicode_, inv);
 
@@ -235,10 +264,7 @@ std::vector<int32_t> LayaTokenizer::encode(std::string_view text) const {
                 normalized = uni::nfc(span);
                 span = normalized;
             }
-            for (const auto p : pre_tokenize(span)) {
-                bpe::encode_piece(p, byte_to_unicode_, vocab_, merge_ranks_,
-                                  /*append_end_of_word=*/false, out);
-            }
+            for (const auto p : pre_tokenize(span)) encode_piece_cached_(p, out);
         },
         ids);
 

@@ -3,6 +3,7 @@
 #include "brolm/detail/byte_level_bpe.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -73,6 +74,13 @@ private:
     std::string byte_to_unicode_[256];
     brolm::detail::bpe::SpecialTokens specials_;
     bool normalize_nfc_ = true;
+
+    // Pre-token -> BPE ids memo (the merge loop dominates encode(); real text
+    // repeats words heavily). Thread-safe; shared by copies of a tokenizer,
+    // which share its vocabulary. Cleared wholesale when it reaches its cap.
+    struct PieceCache;
+    std::shared_ptr<PieceCache> cache_;
+    void encode_piece_cached_(std::string_view piece, std::vector<int32_t>& out) const;
 };
 
 }  // namespace brolm::laya

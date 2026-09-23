@@ -382,10 +382,13 @@ static void test_laya() {
             }
 
             // An object state is serialised like Python's json.dumps: the same
-            // text passed as a string must give the same logits.
+            // text passed as a string must give the same logits. Same question
+            // set, so the packed batch is identical too (results can move by
+            // ~1e-2 with batch composition: split-K GEMM plans follow the
+            // packed row count).
             const pyText = '{"from": "user@acme.com", "subject": "Duplicate charge on invoice #4411", ' +
                 '"body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."}';
-            const resText = laya.predict(pyText, { department: questions.department });
+            const resText = laya.predict(pyText, questions);
             for (let k = 0; k < 4; ++k) {
                 if (Math.abs(resText.answers.department.logits[k] - dept.logits[k]) > 1e-3) {
                     throw new Error("object state and json.dumps text disagree at logit " + k);
