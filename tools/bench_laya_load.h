@@ -22,6 +22,14 @@ struct OpenLoopConfig {
     unsigned seed = 1234;
 };
 
+// One measured request, for tail analysis (--tail).
+struct OpenLoopSample {
+    double arrival_ms = 0;  // its Poisson arrival time, since the window opened
+    double late_ms = 0;     // how far after that arrival the client actually submitted
+    double total_ms = 0, tokenize_ms = 0, queue_ms = 0, forward_ms = 0;
+    int forwards = 0, batch_tokens = 0, batch_requests = 0, device = 0;
+};
+
 struct OpenLoopResult {
     int submitted = 0;      // in the window
     int completed = 0;      // of those
@@ -30,7 +38,13 @@ struct OpenLoopResult {
     double offered_rps = 0, achieved_rps = 0;
     double deadline_missed_pct = 0;  // of window requests, against the scheduler's deadline
     brolm::laya::SchedulerStats stats;  // over the window
+    std::vector<OpenLoopSample> samples;  // every completed window request
 };
+
+// The slowest 1 % of a cell's requests, taken apart: where their time went
+// (submit lateness, tokenize, queue, forward) and what else arrived in the
+// few ms before them, against the median request.
+void print_tail(const OpenLoopResult& r, const char* key);
 
 // Run one cell. `state_of(i)` is request i's state; every request asks `questions`.
 OpenLoopResult run_open_loop(brolm::laya::Scheduler& sched, const std::function<std::string(int)>& state_of,

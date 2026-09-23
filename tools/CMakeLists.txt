@@ -32,6 +32,10 @@ endif()
 
 add_executable(brolm_bench_laya bench_laya.cpp bench_laya_load.cpp)
 target_link_libraries(brolm_bench_laya PRIVATE brolm)
+if(WIN32)
+    # timeBeginPeriod: the open-loop client's arrival timer
+    target_link_libraries(brolm_bench_laya PRIVATE winmm)
+endif()
 if(MSVC)
     target_compile_options(brolm_bench_laya PRIVATE /W4)
 else()

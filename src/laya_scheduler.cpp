@@ -282,6 +282,18 @@ std::vector<Scheduler::Impl::Taken> Scheduler::Impl::pick(int& budget_out) {
     int rows = 0;
     for (auto& r : queue) {
         const int n = static_cast<int>(r->item_tokens.size());
+        // Past the first request, take a request whole or leave it for the
+        // next forward. A request cut at the budget waits for that next
+        // forward with its answers half done — two forwards of latency, the
+        // open-loop p99 tail — while the rows it would have filled are at
+        // most one request's worth of occupancy. The head still splits (it
+        // may be bigger than any budget, and a fair-share cap spreads it
+        // across idle devices).
+        if (!out.empty()) {
+            int left = 0;
+            for (int i = r->next_item; i < n; ++i) left += r->item_tokens[static_cast<std::size_t>(i)];
+            if (rows + left > cap) break;
+        }
         while (r->next_item < n) {
             const int t = r->item_tokens[static_cast<std::size_t>(r->next_item)];
             if (!out.empty() && rows + t > cap) break;
