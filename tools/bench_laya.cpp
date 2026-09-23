@@ -7,16 +7,27 @@
 // op family. Unprofiled and profiled runs are separate: the stage syncs
 // serialise the stream, so only the unprofiled numbers are latency.
 //
+// Then the open-loop cells (bench_laya_load.cpp): the request scheduler on 1
+// and on every GPU, clients submitting 5-question requests as Poisson
+// arrivals at fixed offered rates, reporting submit -> result percentiles,
+// the achieved rate and how full the forwards ran. --sweep instead raises
+// the rate until p99 passes --sweep-p99 ms and prints the sustained rate.
+//
 // Usage:
 //   brolm_bench_laya [model_dir] [--iters N] [--warmup N] [--questions 1,5,10,50]
-//                    [--states short,medium,max] [--packed 8x5,16x5,32x5] [--profile-iters N]
+//                    [--states short,medium,max|none] [--packed 8x5,16x5,32x5|none] [--profile-iters N]
 //                    [--json out.json] [--compare baseline.json] [--label text]
+//                    [--open short,medium|none] [--open-q 5] [--open-replicas 1,2]
+//                    [--open-rates 75,150] [--open-clients 8] [--open-seconds 3] [--sweep] [--sweep-p99 30]
 //
 // model_dir defaults to $LAYA_MODEL_DIR or ../laya beside the brolm checkout.
 // --json writes the scoreboard; --compare prints each cell's p50 / p95 /
 // throughput against a previously written scoreboard (ratio < 1 = faster).
 
+#include "bench_laya_load.h"
+
 #include "brolm/laya.h"
+#include "brolm/laya_scheduler.h"
 #include "brolm/detail/json.h"
 
 #include "brotensor/runtime.h"
@@ -51,13 +62,25 @@ struct Args {
     // the short and medium states that are listed in `states`.
     std::vector<std::string> packed = {"8x5", "16x5", "32x5"};
     std::string json_out, compare, label;
+    // Open-loop cells: the request scheduler under Poisson arrivals.
+    std::vector<std::string> open_states = {"short", "medium"};
+    int open_q = 5;
+    std::vector<int> open_replicas = {1, 2};  // replica counts (clamped to the GPUs present)
+    std::vector<double> open_rates = {75, 150};  // per replica, short state (medium: half)
+    int open_clients = 8;
+    double open_seconds = 3.0;
+    bool sweep = false;
+    double sweep_p99 = 30.0;
 };
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
                  "usage: brolm_bench_laya [model_dir] [--iters N] [--warmup N] [--questions 1,5,10,50]\n"
                  "                        [--states short,medium,max] [--packed 8x5,16x5,32x5] [--profile-iters N]\n"
-                 "                        [--json out.json] [--compare baseline.json] [--label text]\n");
+                 "                        [--json out.json] [--compare baseline.json] [--label text]\n"
+                 "                        [--open short,medium|none] [--open-q 5] [--open-replicas 1,2]\n"
+                 "                        [--open-rates 75,150] [--open-clients 8] [--open-seconds 3]\n"
+                 "                        [--sweep] [--sweep-p99 30]\n");
     std::exit(2);
 }
 
@@ -86,11 +109,30 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--questions") {
             a.questions.clear();
             for (const auto& t : split(val())) a.questions.push_back(std::stoi(t));
-        } else if (k == "--states") a.states = split(val());
-        else if (k == "--packed") a.packed = split(val());
+        } else if (k == "--states") {
+            const std::string v = val();
+            a.states = v == "none" ? std::vector<std::string>{} : split(v);
+        } else if (k == "--packed") {
+            const std::string v = val();
+            a.packed = v == "none" ? std::vector<std::string>{} : split(v);
+        }
         else if (k == "--json") a.json_out = val();
         else if (k == "--compare") a.compare = val();
         else if (k == "--label") a.label = val();
+        else if (k == "--open") {
+            const std::string v = val();
+            a.open_states = v == "none" ? std::vector<std::string>{} : split(v);
+        } else if (k == "--open-q") a.open_q = std::stoi(val());
+        else if (k == "--open-replicas") {
+            a.open_replicas.clear();
+            for (const auto& t : split(val())) a.open_replicas.push_back(std::stoi(t));
+        } else if (k == "--open-rates") {
+            a.open_rates.clear();
+            for (const auto& t : split(val())) a.open_rates.push_back(std::stod(t));
+        } else if (k == "--open-clients") a.open_clients = std::stoi(val());
+        else if (k == "--open-seconds") a.open_seconds = std::stod(val());
+        else if (k == "--sweep") a.sweep = true;
+        else if (k == "--sweep-p99") a.sweep_p99 = std::stod(val());
         else if (k.rfind("--", 0) == 0) usage();
         else a.model_dir = k;
     }
@@ -164,6 +206,11 @@ struct Cell {
     double p50 = 0, p95 = 0, p99 = 0, mean = 0, min = 0;
     double qps = 0, tok_s = 0;
     brolm::laya::LayaTimings stages;  // mean over profile iters
+    // Open-loop cells only (replicas > 0).
+    int replicas = 0, clients = 0;
+    double offered_rps = 0, achieved_rps = 0, max = 0, missed_pct = 0;
+    double batch_items = 0, batch_requests = 0, occupancy = 0;
+    int budget = 0;
 };
 
 void accumulate(brolm::laya::LayaTimings& acc, const brolm::laya::LayaTimings& t, double w) {
@@ -287,12 +334,116 @@ Cell run_packed_cell(brolm::LayaModel& model, int R, int nq, const std::string& 
     return c;
 }
 
+// Open-loop cells: a Scheduler over `replicas` devices, `open_clients`
+// Poisson clients each submitting a distinct `open_q`-question request. With
+// --sweep, the offered rate climbs until p99 passes --sweep-p99 or the
+// scheduler stops keeping up; otherwise the fixed --open-rates run.
+Cell open_cell(const bench_laya::OpenLoopResult& r, int replicas, int nq, const std::string& state, int clients) {
+    Cell c;
+    c.replicas = replicas;
+    c.clients = clients;
+    c.questions = nq;
+    c.state = state;
+    char key[96];
+    std::snprintf(key, sizeof key, "open_d%d_q%d_%s_%.0frps", replicas, nq, state.c_str(), r.offered_rps);
+    c.key = key;
+    c.tokens = r.tokens;
+    c.p50 = r.p50;
+    c.p95 = r.p95;
+    c.p99 = r.p99;
+    c.mean = r.mean;
+    c.min = r.min;
+    c.max = r.max;
+    c.offered_rps = r.offered_rps;
+    c.achieved_rps = r.achieved_rps;
+    c.qps = r.achieved_rps * nq;
+    c.tok_s = r.achieved_rps * r.tokens;
+    c.missed_pct = r.deadline_missed_pct;
+    c.batch_items = r.stats.mean_batch_items;
+    c.batch_requests = r.stats.mean_batch_requests;
+    c.occupancy = r.stats.mean_occupancy;
+    c.budget = r.stats.token_budget;
+    return c;
+}
+
+void run_open_cells(const Args& a, std::vector<Cell>& cells) {
+    const std::vector<int> all = brolm::laya::Scheduler::all_devices();
+    std::vector<int> counts;
+    for (int n : a.open_replicas) {
+        const int k = std::clamp(n, 1, static_cast<int>(all.size()));
+        if (std::find(counts.begin(), counts.end(), k) == counts.end()) counts.push_back(k);
+    }
+    const auto qs = make_questions(a.open_q);
+    for (int n : counts) {
+        brolm::laya::SchedulerOptions so;
+        so.devices.assign(all.begin(), all.begin() + n);
+        const auto t0 = Clock::now();
+        brolm::laya::Scheduler sched(a.model_dir, so);
+        sched.wait_ready();
+        std::fprintf(stderr, "  scheduler: %d replica(s) ready in %.0f ms, token budget %d\n", n,
+                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), sched.token_budget());
+        for (const std::string& s : a.open_states) {
+            const std::string base = make_state(s);
+            auto state_of = [&base](int i) {
+                std::string st = base;
+                st.insert(1, "\"request\": \"req-" + std::to_string(i * 7919) + "\", ");
+                return st;
+            };
+            bench_laya::OpenLoopConfig cfg;
+            cfg.clients = a.open_clients;
+            cfg.seconds = a.open_seconds;
+            if (a.sweep) {
+                const double start = 50.0 * n, step = 25.0 * n;
+                const auto tried = bench_laya::sweep_open_loop(sched, state_of, qs, cfg, start, step, a.sweep_p99, 4000);
+                const bench_laya::OpenLoopResult* best = nullptr;
+                for (const auto& r : tried) {
+                    cells.push_back(open_cell(r, n, a.open_q, s, cfg.clients));
+                    std::fprintf(stderr, "  %s p99 %.1f ms, achieved %.0f rps\n", cells.back().key.c_str(), r.p99,
+                                 r.achieved_rps);
+                    if (r.p99 <= a.sweep_p99 && r.achieved_rps >= 0.95 * r.offered_rps) best = &r;
+                }
+                std::printf("sustained (p99 <= %.0f ms): %d replica(s), q%d %s: %s\n", a.sweep_p99, n, a.open_q,
+                            s.c_str(),
+                            best ? (std::to_string(static_cast<int>(best->offered_rps)) + " req/s").c_str()
+                                 : "below the first step");
+            } else {
+                for (double rate : a.open_rates) {
+                    // Rates are per replica, for the short state; the medium
+                    // state (~2.2x the tokens) runs at half.
+                    cfg.rate_rps = rate * n * (s == "short" ? 1.0 : 0.5);
+                    cells.push_back(open_cell(bench_laya::run_open_loop(sched, state_of, qs, cfg), n, a.open_q, s,
+                                              cfg.clients));
+                    std::fprintf(stderr, "  %s done\n", cells.back().key.c_str());
+                }
+            }
+        }
+    }
+}
+
 // ─── Output ────────────────────────────────────────────────────────────────
+
+void print_open(const std::vector<Cell>& cells) {
+    bool any = false;
+    for (const Cell& c : cells) any = any || c.replicas > 0;
+    if (!any) return;
+    std::printf("\nopen loop (Poisson arrivals, latency = submit -> result incl. tokenize, ms)\n");
+    std::printf("%-30s %7s %7s %7s %7s %7s %7s %6s %6s %6s %5s %6s\n", "cell", "offered", "achvd", "p50", "p95",
+                "p99", "max", "items", "reqs", "occ", "miss%", "budget");
+    for (const Cell& c : cells) {
+        if (c.replicas == 0) continue;
+        std::printf("%-30s %7.0f %7.0f %7.2f %7.2f %7.2f %7.2f %6.1f %6.1f %6.2f %5.1f %6d\n", c.key.c_str(),
+                    c.offered_rps, c.achieved_rps, c.p50, c.p95, c.p99, c.max, c.batch_items, c.batch_requests,
+                    c.occupancy, c.missed_pct, c.budget);
+    }
+    std::printf("(items / reqs = mean per forward; occ = mean forward rows / token budget; miss = past the 30 ms "
+                "default deadline)\n");
+}
 
 void print_latency(const std::vector<Cell>& cells) {
     std::printf("\n%-12s %6s %8s %8s %8s %8s %8s %9s %10s %6s\n", "cell", "tokens", "p50", "p95", "p99",
                 "mean", "min", "q/s", "tok/s", "xfers");
     for (const Cell& c : cells) {
+        if (c.replicas > 0) continue;  // print_open
         std::printf("%-12s %6d %8.2f %8.2f %8.2f %8.2f %8.2f %9.1f %10.0f %3d/%-3d\n", c.key.c_str(), c.tokens,
                     c.p50, c.p95, c.p99, c.mean, c.min, c.qps, c.tok_s, c.uploads, c.downloads);
     }
@@ -334,7 +485,16 @@ std::string to_json(const std::vector<Cell>& cells, const Args& a, const std::st
           << "\", \"tokens\": " << c.tokens << ", \"p50\": " << c.p50 << ", \"p95\": " << c.p95
           << ", \"p99\": " << c.p99 << ", \"mean\": " << c.mean << ", \"min\": " << c.min
           << ", \"qps\": " << c.qps << ", \"tok_s\": " << c.tok_s << ", \"uploads\": " << c.uploads
-          << ", \"downloads\": " << c.downloads << ",\n      \"stages\": {\"tokenize\": " << s.tokenize_ms
+          << ", \"downloads\": " << c.downloads;
+        if (c.replicas > 0) {
+            o << ",\n      \"open\": {\"replicas\": " << c.replicas << ", \"clients\": " << c.clients
+              << ", \"offered_rps\": " << c.offered_rps << ", \"achieved_rps\": " << c.achieved_rps
+              << ", \"max\": " << c.max << ", \"missed_pct\": " << c.missed_pct << ", \"batch_items\": "
+              << c.batch_items << ", \"batch_requests\": " << c.batch_requests << ", \"occupancy\": " << c.occupancy
+              << ", \"budget\": " << c.budget << "}}" << (i + 1 < cells.size() ? "," : "") << "\n";
+            continue;
+        }
+        o << ",\n      \"stages\": {\"tokenize\": " << s.tokenize_ms
           << ", \"encoder\": " << s.encoder_ms << ", \"head\": " << s.head_ms << ", \"scorer\": " << s.scorer_ms
           << ", \"act\": " << s.act_ms << ", \"download\": " << s.download_ms << ", \"calibrate\": "
           << s.calibrate_ms << ", \"total\": " << s.total_ms << "},\n      \"encoder\": {\"embed\": " << e.embed_ms
@@ -410,8 +570,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  %s done\n", cells.back().key.c_str());
         }
     }
+    if (!a.open_states.empty()) run_open_cells(a, cells);
     print_latency(cells);
     if (a.profile_iters > 0) print_stages(cells);
+    print_open(cells);
     if (!a.compare.empty()) print_compare(cells, a.compare);
     if (!a.json_out.empty()) {
         std::ofstream(a.json_out, std::ios::binary) << to_json(cells, a, gpu, load_ms);

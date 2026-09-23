@@ -72,6 +72,10 @@ brolm_add_test(brolm_test_laya test_laya.cpp)
 # Numeric parity against the PyTorch reference (tests/ref/gen_laya_parity.py
 # writes the fixture); weights from LAYA_MODEL_DIR or the ../laya sibling.
 brolm_add_test(brolm_test_laya_parity test_laya_parity.cpp)
+# Request scheduler behaviour (priority, split across GPUs, deadlines,
+# shutdown); same weights lookup, skips without them.
+brolm_add_test(brolm_test_laya_scheduler test_laya_scheduler.cpp)
+target_compile_definitions(brolm_test_laya_scheduler PRIVATE BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(brolm_test_laya_parity PRIVATE
     BROLM_TEST_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ref"
     BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")

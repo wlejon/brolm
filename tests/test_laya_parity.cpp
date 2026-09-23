@@ -10,11 +10,14 @@
 //   - the options-do-not-fit error;
 //   - raw scorer logits, act probability and calibrated probabilities against
 //     the fp32 reference, with the tolerance judged against how far the
-//     reference's own bf16 autocast run lands from fp32.
+//     reference's own bf16 autocast run lands from fp32;
+//   - the same answers through the request scheduler, on every device, with
+//     the calls submitted concurrently from several threads.
 // Weights are looked up at LAYA_MODEL_DIR or ../laya; the model half skips
 // (tokenizer half still runs) when they are absent.
 
 #include "brolm/laya.h"
+#include "brolm/laya_scheduler.h"
 #include "brolm/detail/json.h"
 
 #include "brotensor/runtime.h"
@@ -28,6 +31,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -225,9 +229,99 @@ void test_model(brolm::laya::DecisionModel& model, const j::Value& calls) {
                 items.size(), packed.size(), pk.logit, pk.prob);
 }
 
+// The request scheduler over every device: every fixture call submitted
+// several times from several threads at once, so items from different calls
+// share forwards, big calls split across forwards and devices, and replicas
+// on every GPU answer. Each answer must still match its reference.
+void test_scheduler(const std::string& model_dir, const j::Value& calls) {
+    brolm::laya::SchedulerOptions so;
+    so.devices = brolm::laya::Scheduler::all_devices();
+    brolm::laya::Scheduler sched(model_dir, so);
+    sched.wait_ready();
+
+    struct Job {
+        std::string name, state;
+        brolm::laya::RequestOptions opts;
+        std::vector<brolm::laya::LayaQuestion> questions;
+        const j::Value* ref;
+    };
+    std::vector<Job> jobs;
+    for (const auto& call : calls.as_array()) {
+        Job jb;
+        jb.name = call.at("name").as_string();
+        jb.state = call.at("state").as_string();
+        jb.opts.predict.max_len = static_cast<int>(call.at("max_len").as_number());
+        jb.opts.predict.head_max_len = static_cast<int>(call.at("head_max_len").as_number());
+        jb.opts.predict.truncate_left = call.at("truncate_left").as_bool();
+        jb.questions = brolm::laya::parse_questions_json(call.at("questions_json").as_string());
+        jb.ref = &call.at("questions");
+        if (call.find("error")) {
+            bool threw = false;
+            try {
+                sched.submit(jb.state, jb.questions, jb.opts);
+            } catch (const std::exception& e) {
+                threw = std::string(e.what()).find("options do not fit") != std::string::npos;
+            }
+            check(threw, "scheduler/" + jb.name + ": option-fit error must throw at submit");
+            continue;
+        }
+        jobs.push_back(std::move(jb));
+    }
+
+    constexpr int kThreads = 4, kRounds = 3;
+    std::vector<std::vector<std::pair<const Job*, std::future<brolm::laya::ScheduledResult>>>> futs(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int r = 0; r < kRounds; ++r) {
+                for (std::size_t k = t; k < jobs.size() * 2; k += kThreads) {
+                    const Job& jb = jobs[k % jobs.size()];
+                    brolm::laya::RequestOptions o = jb.opts;
+                    o.priority = static_cast<int>(k % 3);
+                    futs[static_cast<std::size_t>(t)].emplace_back(&jb, sched.submit(jb.state, jb.questions, o));
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    Worst all;
+    int results = 0;
+    for (auto& per : futs) {
+        for (auto& [jb, f] : per) {
+            brolm::laya::ScheduledResult r;
+            try {
+                r = f.get();
+            } catch (const std::exception& e) {
+                check(false, "scheduler/" + jb->name + ": " + e.what());
+                continue;
+            }
+            ++results;
+            check(r.order.size() == jb->questions.size(), "scheduler/" + jb->name + ": answer count");
+            check(r.timing.total_ms > 0 && r.timing.forwards >= 1, "scheduler/" + jb->name + ": timing");
+            const auto& ref_qs = jb->ref->as_array();
+            for (std::size_t i = 0; i < jb->questions.size(); ++i) {
+                check_answer("sched/" + jb->name, jb->questions[i], r.result.answers.at(jb->questions[i].id),
+                             ref_qs[i], all, /*print=*/false);
+            }
+        }
+    }
+    const brolm::laya::SchedulerStats st = sched.stats();
+    check(st.completed == static_cast<uint64_t>(results) && st.failed == 0, "scheduler: completion count");
+    std::printf("scheduler: %d requests over %zu device(s), %llu forwards (mean %.1f items, %.0f rows, budget %d); "
+                "worst |dlogit| %.4f, |dprob| %.5f\n",
+                results, st.devices.size(), static_cast<unsigned long long>(st.forwards), st.mean_batch_items,
+                st.mean_batch_tokens, st.token_budget, all.logit, all.prob);
+    for (const auto& d : st.devices) {
+        std::printf("  device %d (%s): %llu forwards, %zu graphs\n", d.device, d.name.c_str(),
+                    static_cast<unsigned long long>(d.forwards), d.graphs);
+    }
+}
+
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep the table if a later phase dies
     const std::string fixture = std::string(BROLM_TEST_REF_DIR) + "/laya_parity.json";
     if (!fs::exists(fixture)) {
         std::cout << "SKIP: fixture not found at " << fixture << "\n";
@@ -250,6 +344,7 @@ int main() {
         brolm::laya::DecisionModel model;
         model.load_model(model_dir);
         test_model(model, root.at("calls"));
+        test_scheduler(model_dir, root.at("calls"));
     } else {
         std::cout << "SKIP model half: no model.safetensors in " << model_dir << "\n";
     }

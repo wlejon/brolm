@@ -186,6 +186,25 @@ public:
     // Enable / disable CUDA-graph replay (default on; env BROLM_LAYA_GRAPHS=0
     // turns it off). Graphs are never used while profiling.
     void set_graphs_enabled(bool on);
+    bool graphs_enabled() const;
+    std::size_t cached_graphs() const;
+
+    // The padded row count forward_items runs `tokens` packed rows at when
+    // replaying graphs (16 steps per power of two, 16-row floor): the graph
+    // cache key, and the unit of a forward's cost.
+    static int token_bucket(int tokens);
+
+    // Pre-warm: capture the CUDA graph of every token bucket up to
+    // bucket(max_tokens) (largest first, so scratch and rotary tables are
+    // reserved once), then time one replay of each — host packing, upload,
+    // device work and readback, i.e. what a forward_items() of that size
+    // costs on this device. Without graphs (CPU, disabled) it only times a
+    // few sizes. Returns (bucket rows, ms) points for a cost model.
+    struct WarmPoint {
+        int tokens = 0;
+        double ms = 0;
+    };
+    std::vector<WarmPoint> prewarm_graphs(int max_tokens);
 
     LayaResult predict(const std::string& state_json_or_text,
                        const std::vector<LayaQuestion>& questions,
@@ -245,6 +264,7 @@ private:
     std::unique_ptr<Batch> batch_;
     Batch& batch();
     void reset_batch_();
+    void reserve_batch_(int T, int N, int K);
     // Y = epilogue(act(X · Wᵀ + b)) on the encoder's split-K workspace.
     void linear_(const brotensor::Tensor& W, const brotensor::Tensor& b, const brotensor::Tensor& X, int act,
                  int epilogue, brotensor::Tensor& Y);

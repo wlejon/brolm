@@ -30,7 +30,7 @@ else()
     target_compile_options(brolm_bench_decode PRIVATE -Wall -Wextra)
 endif()
 
-add_executable(brolm_bench_laya bench_laya.cpp)
+add_executable(brolm_bench_laya bench_laya.cpp bench_laya_load.cpp)
 target_link_libraries(brolm_bench_laya PRIVATE brolm)
 if(MSVC)
     target_compile_options(brolm_bench_laya PRIVATE /W4)

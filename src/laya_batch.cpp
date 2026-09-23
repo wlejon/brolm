@@ -89,7 +89,10 @@ bool env_graphs_enabled() {
     return !(e && e[0] == '0');
 }
 
-constexpr std::size_t kMaxGraphs = 96;
+// Pre-warm captures every token bucket up to the scheduler's budget (64 up to
+// 2048 rows, 80 up to 4096), so the cache must hold that many plus the odd
+// live shape whose item / marker counts overflow their floors.
+constexpr std::size_t kMaxGraphs = 192;
 
 }  // namespace
 
@@ -146,6 +149,87 @@ void DecisionModel::set_graphs_enabled(bool on) {
     Batch& b = batch();
     b.graphs_on = on;
     if (!on) b.clear_graphs();
+}
+
+bool DecisionModel::graphs_enabled() const {
+    return batch_ ? (batch_->graphs_on && !batch_->graphs_broken) : env_graphs_enabled();
+}
+
+std::size_t DecisionModel::cached_graphs() const {
+#if defined(BROTENSOR_HAS_CUDA)
+    return batch_ ? batch_->graphs.size() : 0;
+#else
+    return 0;
+#endif
+}
+
+int DecisionModel::token_bucket(int tokens) { return bucket_rows(std::max(1, tokens)); }
+
+std::vector<DecisionModel::WarmPoint> DecisionModel::prewarm_graphs(int max_tokens) {
+    const int top = bucket_rows(std::max(16, max_tokens));
+    const int item_len = std::max(1, std::min(cfg_.max_len, 128));
+    const bool graphs = bt::default_device().type == bt::DeviceType::CUDA && graphs_enabled() && !profiling_;
+
+    // Sizes to warm: every bucket with graphs, a handful for the cost model without.
+    std::vector<int> sizes;
+    if (graphs) {
+        for (int t = 1; t <= top;) {
+            const int b = bucket_rows(t);
+            sizes.push_back(b);
+            t = b + 1;
+        }
+    } else {
+        for (int t : {64, 256, 1024, top}) {
+            if (t <= top) sizes.push_back(bucket_rows(t));
+        }
+    }
+    std::sort(sizes.rbegin(), sizes.rend());
+    sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+
+    // Rotary tables for ModernBERT's full 8192 positions (a few MB), so a
+    // live request — even one overriding max_len upward — never regrows them,
+    // which would drop every graph.
+    if (encoder_.reserve_positions(std::max({cfg_.max_len, item_len, 8192}))) batch().clear_graphs();
+    // Scratch for the whole range with headroom on items (one per 8 rows) and
+    // markers (one per 2 rows), so no live batch within the budget regrows
+    // it — a regrow drops every pre-warmed graph. A few MB.
+    reserve_batch_(top, std::max(64, top / 8), std::max(256, top / 2));
+
+    // Synthetic items exactly filling `rows`: item_len-row items with 4
+    // markers each (inside the item floors forward_items buckets to), the
+    // remainder in a last shorter item. Token values do not matter to a graph.
+    std::vector<int32_t> ids(static_cast<std::size_t>(top), 100);
+    std::vector<int32_t> markers = {0, 1, 2, 3};
+    auto items_for = [&](int rows) {
+        std::vector<LayaItem> items;
+        for (int at = 0; at < rows; at += item_len) {
+            const int len = std::min(item_len, rows - at);
+            LayaItem it;
+            it.input_ids = ids.data() + at;
+            it.num_ids = len;
+            it.marker_pos = markers.data();
+            it.num_markers = std::min(4, len);
+            it.qtype = 0;
+            items.push_back(it);
+        }
+        return items;
+    };
+
+    std::vector<WarmPoint> pts;
+    pts.reserve(sizes.size());
+    for (int rows : sizes) {
+        const std::vector<LayaItem> items = items_for(rows);
+        forward_items(items);  // captures (graphs) or warms (eager)
+        double best = 1e30;
+        for (int rep = 0; rep < 2; ++rep) {
+            const auto t0 = Clock::now();
+            forward_items(items);
+            best = std::min(best, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
+        pts.push_back(WarmPoint{rows, best});
+    }
+    std::sort(pts.begin(), pts.end(), [](const WarmPoint& a, const WarmPoint& b) { return a.tokens < b.tokens; });
+    return pts;
 }
 
 // The device half of forward_items over the index views already set up in
@@ -222,6 +306,40 @@ void DecisionModel::run_device_(Batch& b, int T, int N, int K) {
     }
 }
 
+// Grow the scratch capacities to hold T rows, N items and K markers (powers
+// of two, never shrinking). Growing moves buffers, so it drops every graph.
+void DecisionModel::reserve_batch_(int T, int N, int K) {
+    Batch& b = batch();
+    if (T <= b.cap_T && N <= b.cap_N && K <= b.cap_K) return;
+    const bt::Device dev = bt::default_device();
+    const bt::Dtype dt = brolm::compute_dtype();
+    const int D = encoder_.config().hidden_size;
+    b.cap_T = pow2_at_least(T, std::max(512, b.cap_T));
+    b.cap_N = pow2_at_least(N, std::max(64, b.cap_N));
+    b.cap_K = pow2_at_least(K, std::max(256, b.cap_K));
+    const int cT = b.cap_T, cN = b.cap_N, cK = b.cap_K;
+    encoder_.reserve_rows(cT);
+    using brolm::detail::resize_like;
+    resize_like(b.idx, 5 * cT + cK + 2 * cN + 1, 1, bt::Dtype::INT32, dev);
+    resize_like(b.h, cT, D, dt, dev);
+    resize_like(b.h_norm, cT, D, dt, dev);
+    resize_like(b.qkv, cT, 3 * D, dt, dev);
+    resize_like(b.attn, cT, D, dt, dev);
+    resize_like(b.ffn1, cT, 4 * D, dt, dev);
+    resize_like(b.type_rows, cT, D, dt, dev);
+    resize_like(b.m, cK, D, dt, dev);
+    resize_like(b.s0, cK, D, dt, dev);
+    resize_like(b.s2, cK, D, dt, dev);
+    resize_like(b.logits, cK, 1, dt, dev);
+    resize_like(b.feats, cN, 4, dt, dev);
+    resize_like(b.h0, cN, D, dt, dev);
+    b.act_in = bt::Tensor::zeros_on(dev, cN, D + kActPad, dt);  // pad columns must read zero
+    resize_like(b.act_h2, cN, 256, dt, dev);
+    resize_like(b.wide, std::max(cK, cN), kOutPad, dt, dev);
+    resize_like(b.out, cK + 2 * cN, 1, dt, dev);
+    b.clear_graphs();
+}
+
 std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaItem>& items) {
     timings_.encoder_ms = timings_.head_ms = timings_.scorer_ms = 0;
     timings_.act_ms = timings_.download_ms = 0;
@@ -247,45 +365,24 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     Batch& b = batch();
     const bt::Device dev = bt::default_device();
     const bt::Dtype dt = brolm::compute_dtype();
-    const int D = encoder_.config().hidden_size;
 #if defined(BROTENSOR_HAS_CUDA)
     const bool use_graphs = dev.type == bt::DeviceType::CUDA && b.graphs_on && !b.graphs_broken && !profiling_;
 #else
     const bool use_graphs = false;
 #endif
 
-    // Bucketed shapes when replaying graphs; exact shapes otherwise.
+    // Bucketed shapes when replaying graphs; exact shapes otherwise. The item
+    // and marker buckets have floors that follow the token bucket (one item
+    // per 64 rows, one marker per 8), so a token bucket almost always maps to
+    // ONE graph whatever the item mix: padding items / markers cost only the
+    // tiny scorer and act-head rows, and it is what lets load-time pre-warm
+    // (prewarm_graphs) cover a live workload.
     const int Tb = use_graphs ? bucket_rows(T) : T;
-    const int Nb = use_graphs ? pow2_at_least(N, 4) : N;
-    const int Kb = use_graphs ? pow2_at_least(K, 8) : K;
+    const int Nb = use_graphs ? pow2_at_least(std::max(N, (Tb + 63) / 64), 4) : N;
+    const int Kb = use_graphs ? pow2_at_least(std::max(K, (Tb + 7) / 8), 8) : K;
 
     if (encoder_.reserve_positions(max_len)) b.clear_graphs();
-    if (Tb > b.cap_T || Nb > b.cap_N || Kb > b.cap_K) {
-        b.cap_T = pow2_at_least(Tb, std::max(512, b.cap_T));
-        b.cap_N = pow2_at_least(Nb, std::max(64, b.cap_N));
-        b.cap_K = pow2_at_least(Kb, std::max(256, b.cap_K));
-        const int cT = b.cap_T, cN = b.cap_N, cK = b.cap_K;
-        encoder_.reserve_rows(cT);
-        using brolm::detail::resize_like;
-        resize_like(b.idx, 5 * cT + cK + 2 * cN + 1, 1, bt::Dtype::INT32, dev);
-        resize_like(b.h, cT, D, dt, dev);
-        resize_like(b.h_norm, cT, D, dt, dev);
-        resize_like(b.qkv, cT, 3 * D, dt, dev);
-        resize_like(b.attn, cT, D, dt, dev);
-        resize_like(b.ffn1, cT, 4 * D, dt, dev);
-        resize_like(b.type_rows, cT, D, dt, dev);
-        resize_like(b.m, cK, D, dt, dev);
-        resize_like(b.s0, cK, D, dt, dev);
-        resize_like(b.s2, cK, D, dt, dev);
-        resize_like(b.logits, cK, 1, dt, dev);
-        resize_like(b.feats, cN, 4, dt, dev);
-        resize_like(b.h0, cN, D, dt, dev);
-        b.act_in = bt::Tensor::zeros_on(dev, cN, D + kActPad, dt);  // pad columns must read zero
-        resize_like(b.act_h2, cN, 256, dt, dev);
-        resize_like(b.wide, std::max(cK, cN), kOutPad, dt, dev);
-        resize_like(b.out, cK + 2 * cN, 1, dt, dev);
-        b.clear_graphs();
-    }
+    reserve_batch_(Tb, Nb, Kb);
 
     // Host index block. Padding rows [T, Tb) are singleton sequences of token
     // 0; padding items have empty marker segments and read row 0.
@@ -368,8 +465,12 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
 #endif
     if (!ran) run_device_(b, Tb, Nb, Kb);
 
-    // One readback: logits (Kb) then act logits (2 * Nb).
+    // One readback: logits (Kb) then act logits (2 * Nb). A replayed graph
+    // skips run_device_, so `out` still has the shape of the last EAGER run;
+    // set this bucket's shape (within capacity: the pointer the graph
+    // writes through is unchanged).
     const int n_out = Kb + 2 * Nb;
+    b.out.resize(n_out, 1, dt);
     {
         StageTimer t(profiling_, timings_.download_ms);
         b.out_f32.resize(static_cast<std::size_t>(n_out));
