@@ -195,9 +195,9 @@ bool readRequestOptions(Value opts, laya::RequestOptions& ro, std::string& err) 
         err = "maxLen / headMaxLen must be positive";
         return false;
     }
-    boolProp(o, "truncateLeft", "truncate_left", ro.predict.truncate_left);
-    if (numProp(o, "priority", nullptr, d)) ro.priority = static_cast<int>(d);
-    if (numProp(o, "deadlineMs", "deadline_ms", d)) ro.deadline_ms = d;
+    boolProp(o.get(), "truncateLeft", "truncate_left", ro.predict.truncate_left);
+    if (numProp(o.get(), "priority", nullptr, d)) ro.priority = static_cast<int>(d);
+    if (numProp(o.get(), "deadlineMs", "deadline_ms", d)) ro.deadline_ms = d;
     return true;
 }
 
@@ -407,14 +407,16 @@ void decorateLayaModel(ObjectBuilder& b) {
     // predictAsync(state, questions, options?) -> Promise<result>, settled on
     // this thread's next LM tick.
     b.def("predictAsync", 3, [](Value self, std::span<const Value> a) -> Value {
-        ev::Persistent promise(ev::createPromise());
+        // `self` is a plain copy, current only until the first allocation:
+        // unwrap it before createPromise.
         std::string err;
         laya::Scheduler* sched = liveScheduler(self, "predictAsync", err);
+        std::shared_ptr<laya::Scheduler> keep = sched ? hostLayaOf(self)->sched : nullptr;
+        ev::Persistent promise(ev::createPromise());
         if (!sched) return layaRejectWith(promise.get(), err);
         auto call = std::make_shared<Call>();
         if (!readCall(a, *call, err)) return layaRejectWith(promise.get(), "predictAsync: " + err);
 
-        std::shared_ptr<laya::Scheduler> keep = hostLayaOf(self)->sched;
         const LayaPost post = layaTrackPromise(promise.get(), keep);
         try {
             sched->submit(call->state, call->questions, call->opts,
