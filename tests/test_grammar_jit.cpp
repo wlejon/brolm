@@ -277,8 +277,8 @@ void test_logit_masking_correctness() {
                 if (!grammar.is_accepted()) ref_logits[i] = kNegInf;
                 continue;
             }
-            if (vocab[i].empty()) continue;
-            if (!grammar.can_accept(vocab[i])) {
+            // Empty text is masked (it never advances the grammar).
+            if (vocab[i].empty() || !grammar.can_accept(vocab[i])) {
                 ref_logits[i] = kNegInf;
             }
         }
@@ -310,8 +310,7 @@ void test_logit_masking_correctness() {
                 if (!grammar.is_accepted()) ref_logits[i] = kNegInf;
                 continue; // accepted -> EOS is preserved!
             }
-            if (vocab[i].empty()) continue;
-            if (!grammar.can_accept(vocab[i])) {
+            if (vocab[i].empty() || !grammar.can_accept(vocab[i])) {
                 ref_logits[i] = kNegInf;
             }
         }

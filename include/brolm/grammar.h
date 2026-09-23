@@ -81,6 +81,9 @@ public:
 
     // Set logits of all invalid next tokens to -INFINITY.
     // When `is_accepted()` is false, `eos_id` is also masked with -INFINITY.
+    // A token other than `eos_id` with empty text is always masked (it would
+    // never advance the grammar), and so is every id at or past
+    // vocab_tokens.size() except `eos_id`.
     void mask_logits(float* logits, int vocab_size,
                      const std::vector<std::string>& vocab_tokens,
                      int eos_id = -1) const;

@@ -28,10 +28,13 @@ void VocabIndexer::set_vocab(const std::vector<std::string>& vocab,
     }
     token_bytes_.reserve(total_bytes);
 
+    has_text_.assign(num_words_, 0ULL);
     token_offsets_.push_back(0);
-    for (const auto& tok : vocab) {
+    for (size_t i = 0; i < vocab.size(); ++i) {
+        const auto& tok = vocab[i];
         token_bytes_ += tok;
         token_offsets_.push_back(static_cast<uint32_t>(token_bytes_.size()));
+        if (!tok.empty()) has_text_[i / 64] |= (1ULL << (i % 64));
     }
 }
 
@@ -74,6 +77,8 @@ const std::vector<uint64_t>& VocabIndexer::get_valid_mask(int32_t state_id, cons
             }
         }
     }
+
+    for (size_t w = 0; w < num_words_; ++w) mask[w] &= has_text_[w];
 
     auto [insert_it, _] = mask_cache_.emplace(state_id, std::move(mask));
     return insert_it->second;

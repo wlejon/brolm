@@ -250,6 +250,57 @@ void test_logit_masking() {
     CHECK(std::isinf(logits[1]) && logits[1] < 0);  // all tokens masked since match is complete
 }
 
+// A token with no text (a special with no literal form) must never pass the
+// mask: it would leave the grammar where it was, so a decode could emit it
+// forever. The same holds for ids past the token-text table (a model whose
+// embedding rows outnumber its tokenizer). EOS keeps its own rule.
+static void check_empty_masked(const brolm::Grammar& g, const char* label) {
+    std::printf("  empty-text masking: %s\n", label);
+    // ids: 0 <eos> (empty text), 1 "", 2 "4", 3 "x", 4 "" ; vocab_size 6 (id 5 past the table)
+    const std::vector<std::string> vocab = {"", "", "4", "x", ""};
+    const int vocab_size = 6;
+    const int eos_id = 0;
+
+    std::vector<float> logits(vocab_size, 1.0f);
+    g.mask_logits(logits.data(), vocab_size, vocab, eos_id);
+    CHECK(std::isinf(logits[0]) && logits[0] < 0);  // eos: not accepted yet
+    CHECK(std::isinf(logits[1]) && logits[1] < 0);  // empty text
+    CHECK(!std::isinf(logits[2]));                  // "4" valid
+    CHECK(std::isinf(logits[3]) && logits[3] < 0);  // "x" invalid
+    CHECK(std::isinf(logits[4]) && logits[4] < 0);  // empty text
+    CHECK(std::isinf(logits[5]) && logits[5] < 0);  // past the table
+
+    // The callback overload obeys the same rule.
+    std::vector<float> l2(vocab_size, 1.0f);
+    g.mask_logits(l2.data(), vocab_size, [&](int id) -> std::string_view {
+        return id < static_cast<int>(vocab.size()) ? std::string_view(vocab[static_cast<size_t>(id)])
+                                                   : std::string_view();
+    }, eos_id);
+    for (int i = 0; i < vocab_size; ++i) CHECK(std::isinf(l2[i]) == std::isinf(logits[i]));
+
+    // Once accepted, EOS (empty text or not) is allowed; empties stay masked.
+    brolm::Grammar done = g.clone();
+    CHECK(done.accept("4"));
+    CHECK(done.is_accepted());
+    std::vector<float> l3(vocab_size, 1.0f);
+    done.mask_logits(l3.data(), vocab_size, vocab, eos_id);
+    CHECK(!std::isinf(l3[0]));
+    CHECK(std::isinf(l3[1]) && std::isinf(l3[4]) && std::isinf(l3[5]));
+    // EOS past the table is allowed too once accepted.
+    std::vector<float> l4(vocab_size, 1.0f);
+    done.mask_logits(l4.data(), vocab_size, vocab, 5);
+    CHECK(!std::isinf(l4[5]));
+    CHECK(std::isinf(l4[0]) && l4[0] < 0);  // id 0 is now just an empty token
+}
+
+void test_empty_text_masked() {
+    std::printf("Running test_empty_text_masked...\n");
+    check_empty_masked(brolm::Grammar::regex("[0-9]+"), "regex (DFA/JIT path)");
+    check_empty_masked(brolm::Grammar::bnf("root ::= digits\ndigits ::= [0-9] | [0-9] digits"),
+                       "bnf");
+    check_empty_masked(brolm::Grammar::json_integer(), "json_integer");
+}
+
 // ─── 5. Min-P Sampling Tests ─────────────────────────────────────────────────
 
 void test_min_p_sampling() {
@@ -481,6 +532,7 @@ int main() {
         test_grammar_bnf();
         test_grammar_json();
         test_logit_masking();
+        test_empty_text_masked();
         test_min_p_sampling();
         test_penalties();
         test_dry_penalty();

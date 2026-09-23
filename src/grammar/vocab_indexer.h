@@ -51,6 +51,11 @@ private:
     // Cache: state_id -> valid_mask (num_words words)
     std::unordered_map<int32_t, std::vector<uint64_t>> mask_cache_;
     std::vector<uint64_t> empty_mask_;
+    // Bit set for every token with text. A token with no text (a special
+    // without a literal form) leaves the DFA where it was, so a byte scan
+    // calls it valid in every state; it would pass the mask and never
+    // advance the grammar. Every state mask is ANDed with this.
+    std::vector<uint64_t> has_text_;
 };
 
 }  // namespace brolm

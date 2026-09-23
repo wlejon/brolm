@@ -230,14 +230,8 @@ static std::vector<int32_t> runDecode(HostLMModel& hm,
     while (true) {
         if (cancel && cancel->load(std::memory_order_acquire)) break;
         std::vector<float> row = lastRowFp32(logits);
-        if (grammar) {
-            grammar->mask_logits(row.data(), vocab, *pieces, eos_id);
-            // A token with no text (a special without a literal form) would
-            // pass the mask and never advance the grammar; exclude it.
-            const float neg_inf = -std::numeric_limits<float>::infinity();
-            for (int i = 0; i < vocab; ++i)
-                if (i != eos_id && (*pieces)[static_cast<size_t>(i)].empty()) row[static_cast<size_t>(i)] = neg_inf;
-        }
+        // The mask also excludes tokens with no text (Grammar::mask_logits).
+        if (grammar) grammar->mask_logits(row.data(), vocab, *pieces, eos_id);
         const int next = brolm::qwen::sample_token(row.data(), vocab, opts.sampling, rng,
                                                    context.data(), static_cast<int>(context.size()));
         if (stop && next == eos_id) break;

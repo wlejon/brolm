@@ -170,14 +170,16 @@ public:
                 }
                 continue;
             }
+            // A token with no text (a special without a literal form, or an
+            // id past the tokenizer's vocabulary) would pass any state and
+            // never advance the grammar: never allowed.
             const std::string& tok = vocab_tokens[i];
-            if (tok.empty()) continue;
-            if (!can_accept(tok)) {
+            if (tok.empty() || !can_accept(tok)) {
                 logits[i] = neg_inf;
             }
         }
         for (int i = n; i < vocab_size; ++i) {
-            if (i == eos_id && !is_accepted()) {
+            if (i != eos_id || !is_accepted()) {
                 logits[i] = neg_inf;
             }
         }
@@ -484,9 +486,9 @@ void Grammar::mask_logits(float* logits, int vocab_size,
             }
             continue;
         }
+        // No text: would never advance the grammar (see Impl::mask_logits).
         std::string_view tok = token_to_text(i);
-        if (tok.empty()) continue;
-        if (!can_accept(tok)) {
+        if (tok.empty() || !can_accept(tok)) {
             logits[i] = neg_inf;
         }
     }
