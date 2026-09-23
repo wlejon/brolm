@@ -103,8 +103,58 @@ struct Worst {
     double logit = 0, logit_bf16 = 0, prob = 0, act = 0;
 };
 
+// One answer against its reference question record `r`.
+void check_answer(const std::string& name, const brolm::laya::LayaQuestion& q, const brolm::laya::LayaAnswer& a,
+                  const j::Value& r, Worst& all, bool print = true) {
+    const std::vector<double> l32 = nums(r.at("logits_fp32"));
+    const std::vector<double> l16 = nums(r.at("logits_bf16"));
+    const std::vector<double> p32 = nums(r.at("probs_fp32"));
+    check(a.logits.size() == l32.size(), name + "/" + q.id + ": logit count");
+    double dl = 0, dl16 = 0, dp = 0;
+    for (std::size_t k = 0; k < l32.size() && k < a.logits.size(); ++k) {
+        dl = std::max(dl, std::fabs(a.logits[k] - l32[k]));
+        dl16 = std::max(dl16, std::fabs(l16[k] - l32[k]));
+        dp = std::max(dp, std::fabs(a.probabilities[k].second - p32[k]));
+    }
+    const double da = std::fabs(a.act_probability - r.at("act_probability_fp32").as_number());
+    check(std::fabs(a.temperature - r.at("temperature").as_number()) < 1e-5,
+          name + "/" + q.id + ": temperature bucket");
+    double lmax = 0;
+    for (double v : l32) lmax = std::max(lmax, std::fabs(v));
+    check(dl <= kLogitAbsTol + kLogitRelTol * lmax, name + "/" + q.id + ": logits off by " + std::to_string(dl));
+    check(dp <= kProbAbsTol, name + "/" + q.id + ": probabilities off by " + std::to_string(dp));
+    check(da <= kActProbAbsTol, name + "/" + q.id + ": act probability off by " + std::to_string(da));
+    // Argmax must agree unless the reference's own top-2 are within tolerance.
+    const auto top = [](const std::vector<double>& v) {
+        return static_cast<std::size_t>(std::max_element(v.begin(), v.end()) - v.begin());
+    };
+    std::vector<double> mine(a.logits.begin(), a.logits.end());
+    if (top(mine) != top(l32)) {
+        std::vector<double> s = l32;
+        std::sort(s.rbegin(), s.rend());
+        check(s.size() > 1 && s[0] - s[1] <= 2 * kLogitAbsTol, name + "/" + q.id + ": argmax differs");
+    }
+    if (print) {
+        std::printf("%-20s %4zu %9.4f %9.4f %9.5f %9.2e\n", (name + "/" + q.id).substr(0, 20).c_str(), l32.size(),
+                    dl, dl16, dp, da);
+    }
+    all.logit = std::max(all.logit, dl);
+    all.logit_bf16 = std::max(all.logit_bf16, dl16);
+    all.prob = std::max(all.prob, dp);
+    all.act = std::max(all.act, da);
+}
+
+// A fixture call kept for the all-calls packed pass.
+struct Call {
+    std::string name, state;
+    brolm::laya::PredictOptions opts;
+    std::vector<brolm::laya::LayaQuestion> questions;
+    const j::Value* ref;  // the call's "questions" array
+};
+
 void test_model(brolm::laya::DecisionModel& model, const j::Value& calls) {
     Worst all;
+    std::vector<Call> packed;
     std::printf("%-20s %4s %9s %9s %9s %9s\n", "call", "q", "dlogit", "bf16ref", "dprob", "dact");
     for (const auto& call : calls.as_array()) {
         const std::string name = call.at("name").as_string();
@@ -144,48 +194,35 @@ void test_model(brolm::laya::DecisionModel& model, const j::Value& calls) {
         }
 
         const brolm::laya::LayaResult res = model.predict(state, questions, opts);
+        packed.push_back(Call{name, state, opts, questions, &call.at("questions")});
         for (std::size_t i = 0; i < questions.size(); ++i) {
-            const auto& q = questions[i];
-            const auto& r = ref_qs[i];
-            const auto& a = res.answers.at(q.id);
-            const std::vector<double> l32 = nums(r.at("logits_fp32"));
-            const std::vector<double> l16 = nums(r.at("logits_bf16"));
-            const std::vector<double> p32 = nums(r.at("probs_fp32"));
-            check(a.logits.size() == l32.size(), name + "/" + q.id + ": logit count");
-            double dl = 0, dl16 = 0, dp = 0;
-            for (std::size_t k = 0; k < l32.size() && k < a.logits.size(); ++k) {
-                dl = std::max(dl, std::fabs(a.logits[k] - l32[k]));
-                dl16 = std::max(dl16, std::fabs(l16[k] - l32[k]));
-                dp = std::max(dp, std::fabs(a.probabilities[k].second - p32[k]));
-            }
-            const double da = std::fabs(a.act_probability - r.at("act_probability_fp32").as_number());
-            check(std::fabs(a.temperature - r.at("temperature").as_number()) < 1e-5,
-                  name + "/" + q.id + ": temperature bucket");
-            double lmax = 0;
-            for (double v : l32) lmax = std::max(lmax, std::fabs(v));
-            check(dl <= kLogitAbsTol + kLogitRelTol * lmax, name + "/" + q.id + ": logits off by " + std::to_string(dl));
-            check(dp <= kProbAbsTol, name + "/" + q.id + ": probabilities off by " + std::to_string(dp));
-            check(da <= kActProbAbsTol, name + "/" + q.id + ": act probability off by " + std::to_string(da));
-            // Argmax must agree unless the reference's own top-2 are within tolerance.
-            const auto top = [](const std::vector<double>& v) {
-                return static_cast<std::size_t>(std::max_element(v.begin(), v.end()) - v.begin());
-            };
-            std::vector<double> mine(a.logits.begin(), a.logits.end());
-            if (top(mine) != top(l32)) {
-                std::vector<double> s = l32;
-                std::sort(s.rbegin(), s.rend());
-                check(s.size() > 1 && s[0] - s[1] <= 2 * kLogitAbsTol, name + "/" + q.id + ": argmax differs");
-            }
-            std::printf("%-20s %4zu %9.4f %9.4f %9.5f %9.2e\n", (name + "/" + q.id).substr(0, 20).c_str(),
-                        l32.size(), dl, dl16, dp, da);
-            all.logit = std::max(all.logit, dl);
-            all.logit_bf16 = std::max(all.logit_bf16, dl16);
-            all.prob = std::max(all.prob, dp);
-            all.act = std::max(all.act, da);
+            check_answer(name, questions[i], res.answers.at(questions[i].id), ref_qs[i], all);
         }
     }
     std::printf("worst: |dlogit| %.4f (reference bf16 vs fp32: %.4f), |dprob| %.5f, |dact| %.2e\n",
                 all.logit, all.logit_bf16, all.prob, all.act);
+
+    // Every call's items packed into ONE forward_items() — the multi-request
+    // batch a scheduler builds. Each item must still match its reference.
+    std::vector<std::vector<brolm::laya::SequenceResult>> seqs;
+    std::vector<brolm::laya::LayaItem> items;
+    for (const Call& c : packed) seqs.push_back(model.build_sequences(c.state, c.questions, c.opts));
+    for (std::size_t n = 0; n < packed.size(); ++n)
+        for (std::size_t i = 0; i < packed[n].questions.size(); ++i)
+            items.push_back(brolm::laya::LayaItem::of(seqs[n][i], packed[n].questions[i].qtype_index()));
+    const auto outs = model.forward_items(items);
+    check(outs.size() == items.size(), "packed: one output per item");
+    Worst pk;
+    std::size_t k = 0;
+    for (const Call& c : packed) {
+        const auto& ref_qs = c.ref->as_array();
+        for (std::size_t i = 0; i < c.questions.size() && k < outs.size(); ++i, ++k) {
+            const auto a = model.answer_from_logits(c.questions[i], outs[k]);
+            check_answer("packed/" + c.name, c.questions[i], a, ref_qs[i], pk, /*print=*/false);
+        }
+    }
+    std::printf("packed: %zu items from %zu calls in one forward_items(); worst |dlogit| %.4f, |dprob| %.5f\n",
+                items.size(), packed.size(), pk.logit, pk.prob);
 }
 
 }  // namespace

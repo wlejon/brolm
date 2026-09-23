@@ -218,6 +218,7 @@ target_sources(brolm PRIVATE
     src/laya_config.cpp
     src/laya_tokenizer.cpp
     src/laya.cpp
+    src/laya_batch.cpp
     src/laya_questions.cpp
 )
 

@@ -9,7 +9,7 @@
 //
 // Usage:
 //   brolm_bench_laya [model_dir] [--iters N] [--warmup N] [--questions 1,5,10,50]
-//                    [--states short,medium,max] [--profile-iters N]
+//                    [--states short,medium,max] [--packed 8x5,16x5,32x5] [--profile-iters N]
 //                    [--json out.json] [--compare baseline.json] [--label text]
 //
 // model_dir defaults to $LAYA_MODEL_DIR or ../laya beside the brolm checkout.
@@ -47,13 +47,16 @@ struct Args {
     int profile_iters = 5;
     std::vector<int> questions = {1, 5, 10, 50};
     std::vector<std::string> states = {"short", "medium", "max"};
+    // Packed multi-request cells "RxQ" (R requests x Q questions), run over
+    // the short and medium states that are listed in `states`.
+    std::vector<std::string> packed = {"8x5", "16x5", "32x5"};
     std::string json_out, compare, label;
 };
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
                  "usage: brolm_bench_laya [model_dir] [--iters N] [--warmup N] [--questions 1,5,10,50]\n"
-                 "                        [--states short,medium,max] [--profile-iters N]\n"
+                 "                        [--states short,medium,max] [--packed 8x5,16x5,32x5] [--profile-iters N]\n"
                  "                        [--json out.json] [--compare baseline.json] [--label text]\n");
     std::exit(2);
 }
@@ -84,6 +87,7 @@ Args parse_args(int argc, char** argv) {
             a.questions.clear();
             for (const auto& t : split(val())) a.questions.push_back(std::stoi(t));
         } else if (k == "--states") a.states = split(val());
+        else if (k == "--packed") a.packed = split(val());
         else if (k == "--json") a.json_out = val();
         else if (k == "--compare") a.compare = val();
         else if (k == "--label") a.label = val();
@@ -225,6 +229,64 @@ Cell run_cell(brolm::LayaModel& model, int nq, const std::string& state_kind, co
     return c;
 }
 
+// Packed multi-request cell: R concurrent requests, each its own state (the
+// request index is written into it, so no two tokenize alike) with Q
+// questions, served as one forward_items() call — what a request scheduler
+// does with whatever arrived together. Latency is arrival to the last
+// decision: every request's tokenize + one packed forward + calibration.
+Cell run_packed_cell(brolm::LayaModel& model, int R, int nq, const std::string& state_kind, const Args& a) {
+    Cell c;
+    c.questions = R * nq;
+    c.state = state_kind;
+    c.key = "r" + std::to_string(R) + "x" + std::to_string(nq) + "_" + state_kind;
+    std::vector<std::string> states;
+    for (int r = 0; r < R; ++r) {
+        std::string s = make_state(state_kind);
+        s.insert(1, "\"request\": \"req-" + std::to_string(r * 7919) + "\", ");
+        states.push_back(std::move(s));
+    }
+    const auto qs = make_questions(nq);
+
+    auto serve = [&]() -> int {
+        std::vector<std::vector<brolm::laya::SequenceResult>> seqs(static_cast<std::size_t>(R));
+        std::vector<brolm::laya::LayaItem> items;
+        int tokens = 0;
+        for (int r = 0; r < R; ++r) {
+            seqs[static_cast<std::size_t>(r)] = model.build_sequences(states[static_cast<std::size_t>(r)], qs);
+            for (int i = 0; i < nq; ++i) {
+                const auto& sq = seqs[static_cast<std::size_t>(r)][static_cast<std::size_t>(i)];
+                items.push_back(brolm::laya::LayaItem::of(sq, qs[static_cast<std::size_t>(i)].qtype_index()));
+                tokens += static_cast<int>(sq.input_ids.size());
+            }
+        }
+        const auto outs = model.forward_items(items);
+        std::vector<brolm::LayaAnswer> answers;
+        answers.reserve(outs.size());
+        for (std::size_t k = 0; k < outs.size(); ++k)
+            answers.push_back(model.answer_from_logits(qs[k % static_cast<std::size_t>(nq)], outs[k]));
+        return tokens;
+    };
+
+    model.set_profiling(false);
+    for (int i = 0; i < a.warmup; ++i) serve();
+    std::vector<double> lat;
+    for (int i = 0; i < a.iters; ++i) {
+        const auto t0 = Clock::now();
+        c.tokens = serve();
+        lat.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    }
+    c.uploads = model.last_timings().uploads;
+    c.downloads = model.last_timings().downloads;
+    c.p50 = pct(lat, 50);
+    c.p95 = pct(lat, 95);
+    c.p99 = pct(lat, 99);
+    c.min = *std::min_element(lat.begin(), lat.end());
+    c.mean = std::accumulate(lat.begin(), lat.end(), 0.0) / static_cast<double>(lat.size());
+    c.qps = 1000.0 * c.questions / c.mean;
+    c.tok_s = 1000.0 * c.tokens / c.mean;
+    return c;
+}
+
 // ─── Output ────────────────────────────────────────────────────────────────
 
 void print_latency(const std::vector<Cell>& cells) {
@@ -243,6 +305,7 @@ void print_stages(const std::vector<Cell>& cells) {
                 "act", "download", "calib", "total");
     for (const Cell& c : cells) {
         const auto& s = c.stages;
+        if (s.total_ms <= 0) continue;  // packed cells are not profiled
         std::printf("%-12s %8.2f %8.2f %8.2f %8.2f %8.2f %8.2f %8.2f %8.2f\n", c.key.c_str(), s.tokenize_ms,
                     s.encoder_ms, s.head_ms, s.scorer_ms, s.act_ms, s.download_ms, s.calibrate_ms, s.total_ms);
     }
@@ -251,6 +314,7 @@ void print_stages(const std::vector<Cell>& cells) {
                 "rope", "attnG", "attnL", "Wo", "Wi", "geglu", "mlpWo", "resid");
     for (const Cell& c : cells) {
         const auto& e = c.stages.encoder;
+        if (c.stages.total_ms <= 0) continue;
         std::printf("%-12s %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f\n", c.key.c_str(),
                     e.embed_ms, e.norm_ms, e.qkv_ms, e.rope_ms, e.attn_full_ms, e.attn_local_ms, e.wo_ms,
                     e.mlp_in_ms, e.geglu_ms, e.mlp_out_ms, e.residual_ms);
@@ -334,6 +398,15 @@ int main(int argc, char** argv) {
     for (const std::string& s : a.states) {
         for (int nq : a.questions) {
             cells.push_back(run_cell(model, nq, s, a));
+            std::fprintf(stderr, "  %s done\n", cells.back().key.c_str());
+        }
+    }
+    for (const std::string& s : a.states) {
+        if (s == "max") continue;
+        for (const std::string& p : a.packed) {
+            const std::size_t x = p.find('x');
+            if (x == std::string::npos) usage();
+            cells.push_back(run_packed_cell(model, std::stoi(p.substr(0, x)), std::stoi(p.substr(x + 1)), s, a));
             std::fprintf(stderr, "  %s done\n", cells.back().key.c_str());
         }
     }

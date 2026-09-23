@@ -138,13 +138,16 @@ void ModernBertModel::load_weights(const brolm::detail::weights::Source& src,
         src.upload_compute_checked(p + "mlp_norm.weight", D, 1,
                                    L.mlp_norm, "mlp_norm");
 
-        // mlp.Wi: swap the two F-row halves so brotensor's geglu_exact_forward
-        // (A * gelu(B)) computes ModernBERT's gelu(input) * gate.
+        // mlp.Wi: HF rows are [input (F) ; gate (F)], out = gelu(input) * gate.
+        // Interleave them pairwise — row 2j = gate j, row 2j+1 = input j — the
+        // layout linear_forward_batched_ex's fused GeGLU epilogue reads.
         src.download_host_fp16(p + "mlp.Wi.weight", 2 * F, D, raw, "mlp.Wi");
         fixed.resize(raw.size());
-        const std::size_t half = static_cast<std::size_t>(F) * static_cast<std::size_t>(D);
-        std::memcpy(fixed.data(), raw.data() + half, half * sizeof(std::uint16_t));
-        std::memcpy(fixed.data() + half, raw.data(), half * sizeof(std::uint16_t));
+        const std::size_t drow = static_cast<std::size_t>(D);
+        for (std::size_t j = 0; j < static_cast<std::size_t>(F); ++j) {
+            std::memcpy(fixed.data() + (2 * j) * drow, raw.data() + (F + j) * drow, row_bytes);
+            std::memcpy(fixed.data() + (2 * j + 1) * drow, raw.data() + j * drow, row_bytes);
+        }
         L.mlp_Wi = upload_fp16_bits(fixed, 2 * F, D);
 
         src.upload_compute_checked(p + "mlp.Wo.weight", D, F,
@@ -185,8 +188,8 @@ void ModernBertModel::init_synthetic() {
     final_norm_ = brolm::detail::upload_host(ones_D.data(), D, 1);
 }
 
-void ModernBertModel::ensure_rotary_tables_(int seq_len) {
-    if (seq_len <= rope_rows_) return;
+bool ModernBertModel::reserve_positions(int seq_len) {
+    if (seq_len <= rope_rows_) return false;
     // Grow in 512-row steps so a run of slightly longer inputs does not
     // rebuild every call.
     const int rows = ((seq_len + 511) / 512) * 512;
@@ -215,35 +218,72 @@ void ModernBertModel::ensure_rotary_tables_(int seq_len) {
     build(cfg_.rope_theta_full, cos_full_, sin_full_);
     build(cfg_.rope_theta_sliding, cos_slid_, sin_slid_);
     rope_rows_ = rows;
+    return true;
+}
+
+void ModernBertModel::reserve_rows(int T) {
+    if (T <= 0) return;
+    const int D = cfg_.hidden_size;
+    const int F = cfg_.intermediate_size;
+    const bt::Device dev = bt::default_device();
+    const bt::Dtype dt = brolm::compute_dtype();
+    brolm::detail::resize_like(embeds_, T, D, dt, dev);
+    brolm::detail::resize_like(h_, T, D, dt, dev);
+    brolm::detail::resize_like(attn_in_, T, D, dt, dev);
+    brolm::detail::resize_like(qkv_, T, 3 * D, dt, dev);
+    brolm::detail::resize_like(attn_out_, T, D, dt, dev);
+    brolm::detail::resize_like(mlp_in_, T, D, dt, dev);
+    brolm::detail::resize_like(geglu_out_, T, F, dt, dev);
+    // Split-K only engages while a product's output tiles underfill the GPU,
+    // which caps its partials near 2 * SMs * 64 * 64 * splits-per-tile; 2M
+    // floats (8 MB) covers a 128-SM part, and the op grows it if ever short.
+    if (ws_.rows * ws_.cols < kWorkspaceFloats) {
+        ws_ = bt::Tensor::zeros_on(dev, 1, kWorkspaceFloats, bt::Dtype::FP32);
+    }
+}
+
+void ModernBertModel::linear(const bt::Tensor& W, const bt::Tensor& X, int epilogue, bt::Tensor& Y) {
+    bt::linear_forward_batched_ex(W, nullptr, X, bt::kLinearActNone, epilogue | (fast_accum_ ? bt::kLinearEpiFastAccum : 0),
+                                  &ws_, Y);
 }
 
 void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor& h_out) {
     if (seq_len <= 0) fail("forward: seq_len must be positive");
-    if (tok_embeddings_.size() == 0) fail("forward: weights not loaded");
+    std::vector<int32_t> idx(static_cast<std::size_t>(seq_len) * 4);
+    for (int r = 0; r < seq_len; ++r) {
+        idx[static_cast<std::size_t>(r)] = input_ids[r];
+        idx[static_cast<std::size_t>(seq_len + r)] = r;
+        idx[static_cast<std::size_t>(2 * seq_len + 2 * r)] = 0;
+        idx[static_cast<std::size_t>(2 * seq_len + 2 * r + 1)] = seq_len;
+    }
+    const bt::Device dev = bt::default_device();
+    single_idx_ = bt::Tensor::from_raw_bytes_on(dev, idx.data(), seq_len * 4, 1, bt::Dtype::INT32,
+                                                idx.size() * sizeof(int32_t));
+    int32_t* base = static_cast<int32_t*>(single_idx_.data);
+    const bt::Tensor ids = bt::Tensor::view(dev, base, seq_len, 1, bt::Dtype::INT32);
+    const bt::Tensor pos = bt::Tensor::view(dev, base + seq_len, seq_len, 1, bt::Dtype::INT32);
+    const bt::Tensor bounds = bt::Tensor::view(dev, base + 2 * seq_len, seq_len, 2, bt::Dtype::INT32);
+    reserve_positions(seq_len);
+    forward_packed(PackedInputs{&ids, &pos, &bounds}, h_out);
+}
 
-    const int D = cfg_.hidden_size;
+void ModernBertModel::forward_packed(const PackedInputs& in, bt::Tensor& h_out) {
+    if (!in.ids || !in.pos || !in.bounds) fail("forward_packed: missing input buffer");
+    const int seq_len = in.ids->rows;
+    if (seq_len <= 0) fail("forward_packed: no rows");
+    if (tok_embeddings_.size() == 0) fail("forward_packed: weights not loaded");
+    if (rope_rows_ <= 0) fail("forward_packed: reserve_positions() first");
+
     const int H = cfg_.num_attention_heads;
     const int head_dim = cfg_.head_dim();
     const float eps = cfg_.norm_eps;
-    const bt::Device dev = bt::default_device();
-    const bt::Dtype dt = brolm::compute_dtype();
     const bool prof = profiling_;
     EncoderTimings& T = timings_;
     if (prof) ++T.forwards;
 
-    ensure_rotary_tables_(seq_len);
-    const int half = head_dim / 2;
-    const bt::Tensor cos_full = bt::Tensor::view(dev, cos_full_.data, seq_len, half);
-    const bt::Tensor sin_full = bt::Tensor::view(dev, sin_full_.data, seq_len, half);
-    const bt::Tensor cos_slid = bt::Tensor::view(dev, cos_slid_.data, seq_len, half);
-    const bt::Tensor sin_slid = bt::Tensor::view(dev, sin_slid_.data, seq_len, half);
-
     {
         FamilyTimer t(prof, T.embed_ms);
-        ids_dev_ =bt::Tensor::from_raw_bytes_on(dev, input_ids, seq_len, 1, bt::Dtype::INT32,
-                                                 static_cast<std::size_t>(seq_len) * sizeof(int32_t));
-        bt::embedding_lookup_forward(tok_embeddings_,
-                                     static_cast<const int32_t*>(ids_dev_.data),
+        bt::embedding_lookup_forward(tok_embeddings_, static_cast<const int32_t*>(in.ids->data),
                                      seq_len, embeds_);
         layernorm_bias_free(embeds_, embed_norm_, h_, eps);
     }
@@ -261,43 +301,29 @@ void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor&
 
         {
             FamilyTimer t(prof, T.qkv_ms);
-            brolm::detail::linear_batched(L.Wqkv, nullptr, *attn_in, qkv_);
-            brolm::detail::resize_like(q_, seq_len, D, dt, dev);
-            brolm::detail::resize_like(k_, seq_len, D, dt, dev);
-            brolm::detail::resize_like(v_, seq_len, D, dt, dev);
-            bt::copy_d2d_strided(qkv_, 0,     3 * D, q_, 0, D, D, seq_len);
-            bt::copy_d2d_strided(qkv_, D,     3 * D, k_, 0, D, D, seq_len);
-            bt::copy_d2d_strided(qkv_, 2 * D, 3 * D, v_, 0, D, D, seq_len);
+            linear(L.Wqkv, *attn_in, bt::kLinearEpiStore, qkv_);
         }
 
+        // RoPE in place on the Q/K sections, each row at its own position.
         const bool is_slid = cfg_.is_sliding(i);
         {
             FamilyTimer t(prof, T.rope_ms);
-            const bt::Tensor& cos_tbl = is_slid ? cos_slid : cos_full;
-            const bt::Tensor& sin_tbl = is_slid ? sin_slid : sin_full;
-            bt::rope_apply(q_, cos_tbl, sin_tbl, head_dim, H, q_rope_);
-            bt::rope_apply(k_, cos_tbl, sin_tbl, head_dim, H, k_rope_);
+            bt::rope_qkv_packed_inplace(qkv_, is_slid ? cos_slid_ : cos_full_,
+                                        is_slid ? sin_slid_ : sin_full_, *in.pos, H, head_dim);
         }
 
-        if (is_slid) {
-            // HF: |q - k| <= local_attention / 2, which is exactly the
-            // bidirectional window brotensor takes as `window`.
-            FamilyTimer t(prof, T.attn_local_ms);
-            bt::flash_attention_windowed_forward(q_rope_, k_rope_, v_, nullptr,
-                                                 H, cfg_.local_attention, attn_out_,
-                                                 /*causal=*/false);
-        } else {
-            FamilyTimer t(prof, T.attn_full_ms);
-            full_attention(q_rope_, k_rope_, v_, H, attn_out_);
+        // Attention straight off the fused QKV. HF sliding layers attend
+        // |q - k| <= local_attention / 2 — brotensor's bidirectional `window`.
+        {
+            FamilyTimer t(prof, is_slid ? T.attn_local_ms : T.attn_full_ms);
+            bt::flash_attention_packed_qkv_forward(qkv_, *in.bounds, H,
+                                                   is_slid ? cfg_.local_attention : 0, attn_out_);
         }
 
         {
+            // Output projection with the residual add fused into its store.
             FamilyTimer t(prof, T.wo_ms);
-            brolm::detail::linear_batched(L.Wo, nullptr, attn_out_, proj_out_);
-        }
-        {
-            FamilyTimer t(prof, T.residual_ms);
-            bt::add_inplace(h_, proj_out_);
+            linear(L.Wo, attn_out_, bt::kLinearEpiAccumulate, h_);
         }
 
         // ── MLP block ──
@@ -306,20 +332,13 @@ void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor&
             layernorm_bias_free(h_, L.mlp_norm, mlp_in_, eps);
         }
         {
+            // Wi with GeGLU fused into its store (rows interleaved at load).
             FamilyTimer t(prof, T.mlp_in_ms);
-            brolm::detail::linear_batched(L.mlp_Wi, nullptr, mlp_in_, geglu_in_);
-        }
-        {
-            FamilyTimer t(prof, T.geglu_ms);
-            bt::geglu_exact_forward(geglu_in_, geglu_out_);
+            linear(L.mlp_Wi, mlp_in_, bt::kLinearEpiGeglu, geglu_out_);
         }
         {
             FamilyTimer t(prof, T.mlp_out_ms);
-            brolm::detail::linear_batched(L.mlp_Wo, nullptr, geglu_out_, mlp_out_);
-        }
-        {
-            FamilyTimer t(prof, T.residual_ms);
-            bt::add_inplace(h_, mlp_out_);
+            linear(L.mlp_Wo, geglu_out_, bt::kLinearEpiAccumulate, h_);
         }
     }
 

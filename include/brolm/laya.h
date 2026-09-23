@@ -6,6 +6,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -62,6 +63,29 @@ struct LayaAnswer {
     float temperature = 1.0f;
 };
 
+// One item of a batched forward: a tokenized (state, question) sequence as
+// build_sequence(s) produces it, plus the question-type index (qtype_index()).
+// The pointed-to ids / markers must outlive the forward_items() call.
+struct LayaItem {
+    const int32_t* input_ids = nullptr;
+    int num_ids = 0;
+    const int32_t* marker_pos = nullptr;  // positions inside this item's sequence
+    int num_markers = 0;
+    int qtype = 0;
+
+    static LayaItem of(const SequenceResult& seq, int qtype) {
+        return LayaItem{seq.input_ids.data(), static_cast<int>(seq.input_ids.size()),
+                        seq.marker_pos.data(), static_cast<int>(seq.marker_pos.size()), qtype};
+    }
+};
+
+// Raw outputs of one item: pre-temperature scorer logits (one per marker, in
+// marker order) and the two act-head logits [act, escalate].
+struct LayaItemLogits {
+    std::vector<float> logits;
+    float act_logits[2] = {0.0f, 0.0f};
+};
+
 struct LayaResult {
     std::string model = "rl-agent";
     std::unordered_map<std::string, LayaAnswer> answers;
@@ -116,8 +140,8 @@ public:
 
     DecisionModel(const DecisionModel&) = delete;
     DecisionModel& operator=(const DecisionModel&) = delete;
-    DecisionModel(DecisionModel&&) noexcept = default;
-    DecisionModel& operator=(DecisionModel&&) noexcept = default;
+    DecisionModel(DecisionModel&&) noexcept;
+    DecisionModel& operator=(DecisionModel&&) noexcept;
 
     void load_model(const std::string& model_dir);
     void load_safetensors(const std::string& safetensors_path);
@@ -133,9 +157,35 @@ public:
                                   const LayaQuestion& q,
                                   const PredictOptions& opts = {}) const;
 
+    // Tokenize the state once and build every question's sequence (throws
+    // before any device work if a question's options do not fit).
+    std::vector<SequenceResult> build_sequences(const std::string& state_json_or_text,
+                                                const std::vector<LayaQuestion>& questions,
+                                                const PredictOptions& opts = {}) const;
+
+    // ── Batched forward ────────────────────────────────────────────────
+    // One packed forward over any number of items — each a tokenized
+    // (state, question) sequence, from one request or many. The sequences
+    // are packed back to back without padding and run through the encoder,
+    // head, scorer and act head together; the result per item equals running
+    // it alone. One host->device upload and one device->host readback per
+    // call. On CUDA, the device work replays a CUDA graph cached per
+    // (token-count, item-count, marker-count) bucket.
+    // Not thread-safe: one call at a time per model.
+    std::vector<LayaItemLogits> forward_items(const std::vector<LayaItem>& items);
+
+    // Calibrate one item's raw outputs into the reference answer shape
+    // (host only: temperature softmax, confidence, option labels).
+    LayaAnswer answer_from_logits(const LayaQuestion& q, const LayaItemLogits& out) const;
+
+    // Single-question convenience over forward_items.
     LayaAnswer forward_question(const LayaQuestion& q,
                                 const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& marker_pos);
+
+    // Enable / disable CUDA-graph replay (default on; env BROLM_LAYA_GRAPHS=0
+    // turns it off). Graphs are never used while profiling.
+    void set_graphs_enabled(bool on);
 
     LayaResult predict(const std::string& state_json_or_text,
                        const std::vector<LayaQuestion>& questions,
@@ -173,7 +223,14 @@ private:
     brotensor::Tensor scorer_l2_W_;
     brotensor::Tensor scorer_l2_b_;
 
-    // Act Head
+    // Act Head. act_l1_W_ is (256, D + kActPad): the checkpoint's D + 4
+    // input columns then zeros, so its K is a multiple of 8. scorer_l2 and
+    // act_l2 (1 and 2 outputs) are zero-padded to kOutPad output rows, so
+    // every head linear takes the tensor-core path; the extra outputs are
+    // dropped on the device.
+    static constexpr int kActPad = 8;
+    static constexpr int kOutPad = 8;
+    void pad_small_heads_();
     brotensor::Tensor act_l1_W_;
     brotensor::Tensor act_l1_b_;
     brotensor::Tensor act_l2_W_;
@@ -182,28 +239,16 @@ private:
     bool profiling_ = false;
     LayaTimings timings_;
 
-    // Scratch tensors
-    brotensor::Tensor h_;
-    brotensor::Tensor h_norm_;
-    brotensor::Tensor qkv_;
-    brotensor::Tensor q_;
-    brotensor::Tensor k_;
-    brotensor::Tensor v_;
-    brotensor::Tensor attn_out_;
-    brotensor::Tensor proj_out_;
-    brotensor::Tensor ffn1_;
-    brotensor::Tensor ffn2_;
-    brotensor::Tensor m_;
-    brotensor::Tensor idx_dev_;
-    brotensor::Tensor type_row_;
-    brotensor::Tensor scorer_out0_;
-    brotensor::Tensor scorer_out1_;
-    brotensor::Tensor scorer_out2_;
-    brotensor::Tensor scorer_out3_;
-    brotensor::Tensor act_in_;
-    brotensor::Tensor act_h1_;
-    brotensor::Tensor act_h2_;
-    brotensor::Tensor act_logits_;
+    // Packed-batch scratch, index buffers and the CUDA-graph cache
+    // (laya_batch.cpp).
+    struct Batch;
+    std::unique_ptr<Batch> batch_;
+    Batch& batch();
+    void reset_batch_();
+    // Y = epilogue(act(X · Wᵀ + b)) on the encoder's split-K workspace.
+    void linear_(const brotensor::Tensor& W, const brotensor::Tensor& b, const brotensor::Tensor& X, int act,
+                 int epilogue, brotensor::Tensor& Y);
+    void run_device_(Batch& b, int T, int N, int K);
 };
 
 }  // namespace brolm::laya

@@ -27,34 +27,27 @@ namespace {
     throw std::runtime_error("laya::DecisionModel: " + msg);
 }
 
+// Zero-pad W's columns up to `cols` (the input dim a fast GEMM path needs a
+// multiple of 8 of); the matching activation columns are kept zero too.
+void pad_cols(bt::Tensor& W, int cols) {
+    if (W.cols >= cols) return;
+    bt::Tensor P = bt::Tensor::zeros_on(W.device, W.rows, cols, W.dtype);
+    bt::copy_d2d_strided(W, 0, W.cols, P, 0, cols, W.cols, W.rows);
+    W = std::move(P);
+}
+
+// Zero-pad W's rows (a linear's outputs) up to `rows`, so an N=1 or N=2
+// projection runs on the tensor-core path instead of a naive kernel.
+void pad_rows(bt::Tensor& W, int rows) {
+    if (W.rows >= rows) return;
+    bt::Tensor P = bt::Tensor::zeros_on(W.device, rows, W.cols, W.dtype);
+    bt::copy_d2d(W, 0, P, 0, W.rows * W.cols);
+    W = std::move(P);
+}
+
 double ms_since(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
-
-// Times one stage into `acc` when profiling; syncs so GPU work lands in the
-// stage that issued it.
-class StageTimer {
-public:
-    StageTimer(bool on, double& acc) : on_(on), acc_(acc) {
-        if (on_) {
-            bt::sync_all();
-            t0_ = Clock::now();
-        }
-    }
-    ~StageTimer() {
-        if (on_) {
-            bt::sync_all();
-            acc_ += ms_since(t0_);
-        }
-    }
-    StageTimer(const StageTimer&) = delete;
-    StageTimer& operator=(const StageTimer&) = delete;
-
-private:
-    bool on_;
-    double& acc_;
-    Clock::time_point t0_;
-};
 
 // Numerically-stable softmax of logits / T.
 std::vector<float> softmax_scaled(const std::vector<float>& logits, float T) {
@@ -71,12 +64,6 @@ std::vector<float> softmax_scaled(const std::vector<float>& logits, float T) {
 }
 
 }  // namespace
-
-DecisionModel::DecisionModel() {
-    head_layers_.resize(static_cast<std::size_t>(cfg_.head_layers));
-}
-
-DecisionModel::~DecisionModel() = default;
 
 void DecisionModel::set_profiling(bool on) {
     profiling_ = on;
@@ -97,6 +84,7 @@ void DecisionModel::load_safetensors(const std::string& safetensors_path) {
     bt::safetensors::File st = bt::safetensors::File::open(safetensors_path);
     brolm::detail::weights::SafetensorsSource src({&st});
 
+    reset_batch_();  // cached graphs reference the old weights
     encoder_.load_weights(src, "encoder.");
 
     const int D = encoder_.config().hidden_size;
@@ -140,6 +128,7 @@ void DecisionModel::load_safetensors(const std::string& safetensors_path) {
     src.upload_compute_checked("act_head.0.bias",   256, 1,     act_l1_b_, "act_head.0.bias");
     src.upload_compute_checked("act_head.2.weight", 2,   256,   act_l2_W_, "act_head.2.weight");
     src.upload_compute_checked("act_head.2.bias",   2,   1,     act_l2_b_, "act_head.2.bias");
+    pad_small_heads_();
 
     // The checkpoint's `temperature` buffer is deliberately ignored: the
     // reference (RLAgent) calibrates from rl_agent_config.json's
@@ -150,6 +139,7 @@ void DecisionModel::load_safetensors(const std::string& safetensors_path) {
 void DecisionModel::init_synthetic(const modernbert::Config& enc_cfg,
                                    const Config& laya_cfg) {
     cfg_ = laya_cfg;
+    reset_batch_();
     encoder_ = modernbert::ModernBertModel(enc_cfg);
     encoder_.init_synthetic();
     encoder_.set_profiling(profiling_);
@@ -187,12 +177,31 @@ void DecisionModel::init_synthetic(const modernbert::Config& enc_cfg,
     act_l1_b_ = up(fill(256, 0.0f), 256, 1);
     act_l2_W_ = up(fill(512, 0.01f), 2, 256);
     act_l2_b_ = up(fill(2, 0.0f), 2, 1);
+    pad_small_heads_();
+}
+
+void DecisionModel::pad_small_heads_() {
+    pad_cols(act_l1_W_, act_l1_W_.cols - 4 + kActPad);
+    pad_rows(scorer_l2_W_, kOutPad);
+    pad_rows(scorer_l2_b_, kOutPad);
+    pad_rows(act_l2_W_, kOutPad);
+    pad_rows(act_l2_b_, kOutPad);
 }
 
 SequenceResult DecisionModel::build_sequence(const std::string& state_json_or_text,
                                              const LayaQuestion& q,
                                              const PredictOptions& opts) const {
     return build_sequence_ids_(tokenizer_.encode_state(state_json_or_text), q, opts);
+}
+
+std::vector<SequenceResult> DecisionModel::build_sequences(const std::string& state_json_or_text,
+                                                           const std::vector<LayaQuestion>& questions,
+                                                           const PredictOptions& opts) const {
+    const std::vector<int32_t> state_ids = tokenizer_.encode_state(state_json_or_text);
+    std::vector<SequenceResult> seqs;
+    seqs.reserve(questions.size());
+    for (const auto& q : questions) seqs.push_back(build_sequence_ids_(state_ids, q, opts));
+    return seqs;
 }
 
 SequenceResult DecisionModel::build_sequence_ids_(const std::vector<int32_t>& state_ids,
@@ -222,118 +231,27 @@ LayaAnswer DecisionModel::forward_question(const LayaQuestion& q,
                                           const std::vector<int32_t>& marker_pos) {
     if (input_ids.empty()) fail("forward_question: input_ids is empty");
     if (marker_pos.empty()) fail("forward_question: marker_pos is empty");
+    const LayaItem item{input_ids.data(), static_cast<int>(input_ids.size()), marker_pos.data(),
+                        static_cast<int>(marker_pos.size()), q.qtype_index()};
+    const std::vector<LayaItemLogits> out = forward_items({item});
+    return answer_from_logits(q, out[0]);
+}
 
-    const int seq_len = static_cast<int>(input_ids.size());
-    const int K = static_cast<int>(marker_pos.size());
-    const int D = encoder_.config().hidden_size;
-    const int H = std::max(1, D / 64);  // nn.TransformerEncoderLayer(d, d // 64 heads)
-    const bt::Device dev = bt::default_device();
-    const bt::Dtype dt = brolm::compute_dtype();
-    const bool prof = profiling_;
-    LayaTimings& T = timings_;
-
-    // 1. ModernBERT encoder
-    {
-        StageTimer t(prof, T.encoder_ms);
-        encoder_.forward(input_ids.data(), seq_len, h_);
-        ++T.uploads;
-    }
-
-    // 2-3. Question-type embedding on every row, then the Pre-LN head layers
-    //      (MHA with biases, ReLU FFN — nn.TransformerEncoderLayer defaults).
-    const int qtype = q.qtype_index();
-    {
-        StageTimer t(prof, T.head_ms);
-        brolm::detail::resize_like(type_row_, 1, D, dt, dev);
-        bt::copy_d2d(type_emb_, qtype * D, type_row_, 0, D);
-        bt::add_row_bias_inplace(h_, type_row_);
-
-        for (TransformerHeadLayer& L : head_layers_) {
-            brolm::detail::layernorm_batched(h_, L.norm1_g, L.norm1_b, h_norm_, 1e-5f);
-            brolm::detail::linear_batched(L.in_proj_W, &L.in_proj_b, h_norm_, qkv_);
-            brolm::detail::resize_like(q_, seq_len, D, dt, dev);
-            brolm::detail::resize_like(k_, seq_len, D, dt, dev);
-            brolm::detail::resize_like(v_, seq_len, D, dt, dev);
-            bt::copy_d2d_strided(qkv_, 0,     3 * D, q_, 0, D, D, seq_len);
-            bt::copy_d2d_strided(qkv_, D,     3 * D, k_, 0, D, D, seq_len);
-            bt::copy_d2d_strided(qkv_, 2 * D, 3 * D, v_, 0, D, D, seq_len);
-            modernbert::full_attention(q_, k_, v_, H, attn_out_);
-            brolm::detail::linear_batched(L.out_proj_W, &L.out_proj_b, attn_out_, proj_out_);
-            bt::add_inplace(h_, proj_out_);
-
-            brolm::detail::layernorm_batched(h_, L.norm2_g, L.norm2_b, h_norm_, 1e-5f);
-            brolm::detail::linear_batched(L.linear1_W, &L.linear1_b, h_norm_, ffn1_);
-            bt::relu_forward(ffn1_, ffn1_);
-            brolm::detail::linear_batched(L.linear2_W, &L.linear2_b, ffn1_, ffn2_);
-            bt::add_inplace(h_, ffn2_);
-        }
-    }
-
-    // 4-5. Gather the [MASK] marker rows, score them:
-    //      LayerNorm -> Linear -> GELU -> Linear -> raw logits (K, 1).
-    {
-        StageTimer t(prof, T.scorer_ms);
-        idx_dev_ = bt::Tensor::from_raw_bytes_on(dev, marker_pos.data(), K, 1, bt::Dtype::INT32,
-                                                 static_cast<std::size_t>(K) * sizeof(int32_t));
-        ++T.uploads;
-        bt::gather_rows(h_, idx_dev_, m_);
-        brolm::detail::layernorm_batched(m_, scorer_ln_g_, scorer_ln_b_, scorer_out0_, 1e-5f);
-        brolm::detail::linear_batched(scorer_l1_W_, &scorer_l1_b_, scorer_out0_, scorer_out1_);
-        bt::gelu_exact_forward(scorer_out1_, scorer_out2_);
-        brolm::detail::linear_batched(scorer_l2_W_, &scorer_l2_b_, scorer_out2_, scorer_out3_);
-    }
-
-    std::vector<float> logits;
-    {
-        StageTimer t(prof, T.download_ms);
-        logits = brolm::detail::weights::detail_::download_fp32(scorer_out3_);
-        ++T.downloads;
-    }
-
-    // 6. Act head: [h[0] | top1, top1 - top2, normalized entropy, k / 255]
-    //    from the uncalibrated distribution. h[0] stays on the device.
-    std::vector<float> act_l;
-    {
-        StageTimer t(prof, T.act_ms);
-        const std::vector<float> p = softmax_scaled(logits, 1.0f);
-        const float k_float = std::max(2.0f, static_cast<float>(K));
-        float ent = 0.0f;
-        for (float pv : p) ent -= pv * std::log(std::max(pv, 1e-9f));
-        ent /= std::log(k_float);
-        std::vector<float> sorted_p = p;
-        std::sort(sorted_p.begin(), sorted_p.end(), std::greater<float>());
-        const float top1 = sorted_p[0];
-        const float top2 = K >= 2 ? sorted_p[1] : 0.0f;
-        const float feats[4] = {top1, top1 - top2, ent, k_float / 255.0f};
-
-        brolm::detail::resize_like(act_in_, 1, D + 4, dt, dev);
-        bt::copy_d2d(h_, 0, act_in_, 0, D);
-        bt::Tensor feats_dev = brolm::detail::upload_host(feats, 1, 4);
-        ++T.uploads;
-        bt::copy_d2d(feats_dev, 0, act_in_, D, 4);
-        brolm::detail::linear_batched(act_l1_W_, &act_l1_b_, act_in_, act_h1_);
-        bt::gelu_exact_forward(act_h1_, act_h2_);
-        brolm::detail::linear_batched(act_l2_W_, &act_l2_b_, act_h2_, act_logits_);
-    }
-    {
-        StageTimer t(prof, T.download_ms);
-        act_l = brolm::detail::weights::detail_::download_fp32(act_logits_);
-        ++T.downloads;
-    }
-
-    // 7-8. Temperature calibration + packaging (RLAgent.system_one).
-    StageTimer tc(prof, T.calibrate_ms);
-    const double mx = std::max(act_l[0], act_l[1]);
-    const double e0 = std::exp(act_l[0] - mx), e1 = std::exp(act_l[1] - mx);
+// Temperature calibration + packaging (RLAgent.system_one).
+LayaAnswer DecisionModel::answer_from_logits(const LayaQuestion& q, const LayaItemLogits& out) const {
+    const int K = static_cast<int>(out.logits.size());
+    if (K == 0) fail("answer_from_logits: no logits");
+    const double mx = std::max(out.act_logits[0], out.act_logits[1]);
+    const double e0 = std::exp(out.act_logits[0] - mx), e1 = std::exp(out.act_logits[1] - mx);
 
     LayaAnswer ans;
     ans.type = q.type;
     ans.act_probability = static_cast<float>(e0 / (e0 + e1));
-    ans.temperature = cfg_.get_temperature(qtype, K);
-    ans.logits = logits;
-    ans.act_logits = act_l;
+    ans.temperature = cfg_.get_temperature(q.qtype_index(), K);
+    ans.logits = out.logits;
+    ans.act_logits = {out.act_logits[0], out.act_logits[1]};
 
-    const std::vector<float> probs = softmax_scaled(logits, ans.temperature);
+    const std::vector<float> probs = softmax_scaled(out.logits, ans.temperature);
     ans.confidence = 1.0f;
     if (K >= 2) {
         float ent_cal = 0.0f;
@@ -379,19 +297,29 @@ LayaResult DecisionModel::predict(const std::string& state_json_or_text,
     // Tokenize everything first so an option-fit error throws before any
     // device work, as the reference does.
     std::vector<SequenceResult> seqs;
-    seqs.reserve(questions.size());
     {
-        StageTimer t(profiling_, timings_.tokenize_ms);
-        const std::vector<int32_t> state_ids = tokenizer_.encode_state(state_json_or_text);
-        for (const auto& q : questions) seqs.push_back(build_sequence_ids_(state_ids, q, opts));
+        const Clock::time_point t0 = Clock::now();
+        seqs = build_sequences(state_json_or_text, questions, opts);
+        timings_.tokenize_ms = ms_since(t0);
     }
 
     LayaResult res;
+    if (questions.empty()) return res;
+    std::vector<LayaItem> items;
+    items.reserve(questions.size());
     for (std::size_t i = 0; i < questions.size(); ++i) {
+        items.push_back(LayaItem::of(seqs[i], questions[i].qtype_index()));
         res.input_tokens += static_cast<int>(seqs[i].input_ids.size());
-        res.answers[questions[i].id] =
-            forward_question(questions[i], seqs[i].input_ids, seqs[i].marker_pos);
     }
+    const LayaTimings tok = timings_;
+    const std::vector<LayaItemLogits> outs = forward_items(items);  // resets stage timings
+    timings_.tokenize_ms = tok.tokenize_ms;
+
+    const Clock::time_point t_cal = Clock::now();
+    for (std::size_t i = 0; i < questions.size(); ++i) {
+        res.answers[questions[i].id] = answer_from_logits(questions[i], outs[i]);
+    }
+    timings_.calibrate_ms = ms_since(t_cal);
 
     timings_.total_ms = ms_since(t_start);
     timings_.questions = static_cast<int>(questions.size());
