@@ -69,6 +69,12 @@ brolm_add_test(brolm_test_grammar_sampler         test_grammar_sampler.cpp)
 brolm_add_test(brolm_test_grammar_jit             test_grammar_jit.cpp)
 target_include_directories(brolm_test_grammar_jit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 brolm_add_test(brolm_test_laya test_laya.cpp)
+# Numeric parity against the PyTorch reference (tests/ref/gen_laya_parity.py
+# writes the fixture); weights from LAYA_MODEL_DIR or the ../laya sibling.
+brolm_add_test(brolm_test_laya_parity test_laya_parity.cpp)
+target_compile_definitions(brolm_test_laya_parity PRIVATE
+    BROLM_TEST_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ref"
+    BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")
 
 # Bronze JavaScript binding (brolm_api): bro.lm mount points and the
 # constructors on globalThis, every loader rejecting no args / a non-string /

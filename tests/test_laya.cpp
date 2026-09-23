@@ -4,6 +4,9 @@
 #include "brolm/modernbert.h"
 #include "brolm/modernbert_config.h"
 
+#include "brotensor/runtime.h"
+
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -115,8 +118,12 @@ void test_real_checkpoint(const std::string& model_dir) {
         return;
     }
 
+    const auto t_load = std::chrono::steady_clock::now();
     brolm::laya::DecisionModel model;
     model.load_model(model_dir);
+    std::cout << "Loaded on " << brotensor::device_name(brotensor::default_device()) << " in "
+              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load).count()
+              << " ms" << std::endl;
 
     const std::string state =
         "{\"from\": \"user@acme.com\", \"subject\": \"Duplicate charge on invoice #4411\", "
@@ -211,7 +218,13 @@ void test_real_checkpoint(const std::string& model_dir) {
 }  // namespace
 
 int main() {
+    // Synthetic weights on the CPU backend (FP32 path), before any GPU probe.
     test_synthetic();
+
+    // The real checkpoint runs on the best backend, as loadLaya does. Without
+    // init() brotensor only has CPU, and the 421M model then takes over a
+    // minute on FP32 CPU kernels.
+    brotensor::init();
 
     const char* env_dir = std::getenv("LAYA_MODEL_DIR");
     std::string model_dir = (env_dir && env_dir[0]) ? env_dir : "D:/projects/laya";

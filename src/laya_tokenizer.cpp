@@ -38,19 +38,17 @@ std::string replace_all(std::string str, const std::string& from, const std::str
     return str;
 }
 
-uint32_t fold_contraction_char(uint32_t cp) {
-    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
-    if (cp == 0x017F) return 's';
-    return cp;
-}
-
-bool is_newline(uint32_t cp) { return cp == '\r' || cp == '\n'; }
-
 bool is_other(uint32_t cp) {
     return !uni::is_white_space(cp) && !uni::is_letter(cp) && !uni::is_number(cp);
 }
 
-std::vector<std::string_view> pre_tokenize(std::string_view text, int digit_run_max) {
+// The GPT-2 ByteLevel split ModernBERT's tokenizer.json declares
+// (ByteLevel, use_regex=true, add_prefix_space=false):
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+// Contractions are case-sensitive, there is no digit-run limit, and a
+// punctuation run does not swallow trailing newlines (all three differ from
+// the Qwen2/Llama-3 pattern).
+std::vector<std::string_view> pre_tokenize(std::string_view text) {
     std::vector<uint32_t> cps;
     std::vector<std::size_t> offs;
     cps.reserve(text.size());
@@ -72,14 +70,14 @@ std::vector<std::string_view> pre_tokenize(std::string_view text, int digit_run_
         const uint32_t c = cps[i];
 
         if (c == '\'' && i + 1 < n) {
-            const uint32_t d = fold_contraction_char(cps[i + 1]);
+            const uint32_t d = cps[i + 1];
             if (d == 's' || d == 't' || d == 'm' || d == 'd') {
                 emit(i, i + 2);
                 i += 2;
                 continue;
             }
             if (i + 2 < n) {
-                const uint32_t e = fold_contraction_char(cps[i + 2]);
+                const uint32_t e = cps[i + 2];
                 if ((d == 'r' && e == 'e') || (d == 'v' && e == 'e') ||
                     (d == 'l' && e == 'l')) {
                     emit(i, i + 3);
@@ -108,57 +106,44 @@ std::vector<std::string_view> pre_tokenize(std::string_view text, int digit_run_
             if (c == ' ') ++j_idx;
             if (j_idx < n && uni::is_number(cps[j_idx])) {
                 std::size_t k = j_idx + 1;
-                while (k < n && k - j_idx < static_cast<std::size_t>(digit_run_max) &&
-                       uni::is_number(cps[k])) ++k;
+                while (k < n && uni::is_number(cps[k])) ++k;
                 emit(i, k);
                 i = k;
                 continue;
             }
         }
 
+        // ?[^\s\p{L}\p{N}]+
         {
             std::size_t j_idx = i;
             if (c == ' ') ++j_idx;
             if (j_idx < n && is_other(cps[j_idx])) {
                 std::size_t k = j_idx + 1;
                 while (k < n && is_other(cps[k])) ++k;
-                while (k < n && is_newline(cps[k])) ++k;
                 emit(i, k);
                 i = k;
                 continue;
             }
         }
 
-        if (!uni::is_white_space(c)) {
-            emit(i, i + 1);
-            ++i;
-            continue;
-        }
+        // Only whitespace reaches here (every other code point is L, N or
+        // "other", all matched above).
         std::size_t run_end = i + 1;
         while (run_end < n && uni::is_white_space(cps[run_end])) ++run_end;
 
-        {
-            std::size_t after_last_nl = 0;
-            for (std::size_t k = run_end; k > i; --k) {
-                if (is_newline(cps[k - 1])) { after_last_nl = k; break; }
-            }
-            if (after_last_nl != 0) {
-                emit(i, after_last_nl);
-                i = after_last_nl;
-                continue;
-            }
-        }
-
+        // \s+(?!\S): the whole run at end of text; otherwise the run minus its
+        // last code point, which is left for the next token (a ' ' joins it,
+        // anything else falls to \s+ as a single code point).
         if (run_end == n) {
             emit(i, run_end);
+            i = run_end;
         } else if (run_end - i > 1) {
             emit(i, run_end - 1);
             i = run_end - 1;
-            continue;
         } else {
             emit(i, run_end);
+            i = run_end;
         }
-        i = run_end;
     }
     return pieces;
 }
@@ -250,7 +235,7 @@ std::vector<int32_t> LayaTokenizer::encode(std::string_view text) const {
                 normalized = uni::nfc(span);
                 span = normalized;
             }
-            for (const auto p : pre_tokenize(span, /*digit_run_max=*/1000)) {
+            for (const auto p : pre_tokenize(span)) {
                 bpe::encode_piece(p, byte_to_unicode_, vocab_, merge_ranks_,
                                   /*append_end_of_word=*/false, out);
             }
@@ -286,10 +271,40 @@ std::vector<std::string> LayaTokenizer::render_options(const LayaQuestion& q) {
     return {"false: " + f_crit, "true: " + t_crit};
 }
 
+std::string python_json_spacing(std::string_view json) {
+    std::string out;
+    out.reserve(json.size() + json.size() / 8);
+    bool in_str = false;
+    for (std::size_t i = 0; i < json.size(); ++i) {
+        const char c = json[i];
+        out.push_back(c);
+        if (in_str) {
+            if (c == '\\' && i + 1 < json.size()) {
+                out.push_back(json[++i]);
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+        } else if (c == ',' || c == ':') {
+            out.push_back(' ');
+            // tolerate input that is already spaced
+            while (i + 1 < json.size() &&
+                   (json[i + 1] == ' ' || json[i + 1] == '\n' || json[i + 1] == '\t' || json[i + 1] == '\r')) {
+                ++i;
+            }
+        }
+    }
+    return out;
+}
+
 SequenceResult LayaTokenizer::build_sequence(const std::string& state_json_or_text,
                                             const LayaQuestion& q,
                                             int max_len,
-                                            int head_max_len) const {
+                                            int head_max_len,
+                                            bool truncate_left) const {
     const std::vector<std::string> opts = render_options(q);
     const std::string ins = replace_all(q.instructions, "[MASK]", " ");
     const std::string head_text = q.type + " question: " + ins;
@@ -345,8 +360,15 @@ SequenceResult LayaTokenizer::build_sequence(const std::string& state_json_or_te
     const int room = std::max(0, max_len - static_cast<int>(ids.size()) - 1);
     const std::string st_text = replace_all(state_json_or_text, "[MASK]", " ");
     std::vector<int32_t> st = encode(st_text);
+    // Reference: `st[-room:] if truncate_left else st[:room]`. Python's
+    // st[-0:] is the whole list, so a left-truncated state with no room left
+    // is kept whole and cut by the final ids[:max_len] below; mirrored as is.
     if (static_cast<int>(st.size()) > room) {
-        st.resize(static_cast<std::size_t>(room));
+        if (!truncate_left) {
+            st.resize(static_cast<std::size_t>(room));
+        } else if (room > 0) {
+            st.erase(st.begin(), st.end() - room);
+        }
     }
     ids.insert(ids.end(), st.begin(), st.end());
     ids.push_back(kSepTokenId);

@@ -7,6 +7,7 @@
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -31,12 +32,40 @@ inline void layernorm_bias_free(const bt::Tensor& X, const bt::Tensor& gamma,
     }
 }
 
-bt::Tensor make_idx_device(const int32_t* host, int n) {
-    bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
-    std::memcpy(cpu.host_raw_mut(), host,
-                static_cast<std::size_t>(n) * sizeof(int32_t));
-    return cpu.to(bt::default_device());
+// Upload host FP16 bits at the compute dtype (FP16 on GPU, FP32 on CPU).
+bt::Tensor upload_fp16_bits(const std::vector<std::uint16_t>& bits, int rows, int cols) {
+    if (brolm::compute_dtype() == bt::Dtype::FP16) {
+        return bt::Tensor::from_host_fp16(bits.data(), rows, cols);
+    }
+    std::vector<float> f(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i) f[i] = bt::fp16_bits_to_fp32(bits[i]);
+    return bt::Tensor::from_host(f.data(), rows, cols);
 }
+
+// Brackets one op family with device syncs while profiling is on.
+class FamilyTimer {
+public:
+    FamilyTimer(bool on, double& acc) : on_(on), acc_(acc) {
+        if (on_) {
+            bt::sync_all();
+            t0_ = std::chrono::steady_clock::now();
+        }
+    }
+    ~FamilyTimer() {
+        if (on_) {
+            bt::sync_all();
+            acc_ += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0_).count();
+        }
+    }
+    FamilyTimer(const FamilyTimer&) = delete;
+    FamilyTimer& operator=(const FamilyTimer&) = delete;
+
+private:
+    bool on_;
+    double& acc_;
+    std::chrono::steady_clock::time_point t0_;
+};
 
 }  // namespace
 
@@ -59,6 +88,7 @@ void ModernBertModel::load_weights(const brolm::detail::weights::Source& src,
     src.upload_compute_checked(prefix + "embeddings.norm.weight",
                                D, 1, embed_norm_, "embed_norm");
 
+    std::vector<std::uint16_t> raw, fixed;
     layers_.resize(static_cast<std::size_t>(cfg_.num_hidden_layers));
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         const std::string p = prefix + "layers." + std::to_string(i) + ".";
@@ -69,38 +99,34 @@ void ModernBertModel::load_weights(const brolm::detail::weights::Source& src,
                                        L.attn_norm, "attn_norm");
         }
 
-        src.upload_compute_checked(p + "attn.Wqkv.weight", 3 * D, D,
-                                   L.Wqkv, "attn.Wqkv");
-
-        // Permute Q and K rows from HF rotate_half layout into brotensor interleaved layout
-        std::vector<float> host = brolm::detail::weights::detail_::download_fp32(L.Wqkv);
+        // Wqkv: permute the Q and K row blocks from HF rotate_half order into
+        // brotensor's interleaved-pair RoPE order; V rows pass through. Done
+        // on the host FP16 bits straight from the mapped file, one upload.
+        src.download_host_fp16(p + "attn.Wqkv.weight", 3 * D, D, raw, "attn.Wqkv");
+        fixed = raw;
+        const std::size_t row_bytes = static_cast<std::size_t>(D) * sizeof(std::uint16_t);
         const std::size_t block = static_cast<std::size_t>(D) * static_cast<std::size_t>(D);
         for (int part = 0; part < 2; ++part) {
-            const auto begin = host.begin() + static_cast<std::ptrdiff_t>(part * block);
-            std::vector<float> sub(begin, begin + static_cast<std::ptrdiff_t>(block));
-            std::vector<float> perm =
-                brolm::detail::weights::detail_::permute_rope_fp32(sub, H, head_dim, D);
-            std::copy(perm.begin(), perm.end(), begin);
+            brolm::detail::weights::detail_::permute_rope_bytes(
+                reinterpret_cast<const uint8_t*>(raw.data() + part * block),
+                reinterpret_cast<uint8_t*>(fixed.data() + part * block),
+                H, head_dim, row_bytes);
         }
-        L.Wqkv = brolm::detail::upload_host(host.data(), 3 * D, D);
+        L.Wqkv = upload_fp16_bits(fixed, 3 * D, D);
 
         src.upload_compute_checked(p + "attn.Wo.weight", D, D,
                                    L.Wo, "attn.Wo");
         src.upload_compute_checked(p + "mlp_norm.weight", D, 1,
                                    L.mlp_norm, "mlp_norm");
-        src.upload_compute_checked(p + "mlp.Wi.weight", 2 * F, D,
-                                   L.mlp_Wi, "mlp.Wi");
 
-        // Swap top and bottom F rows of mlp_Wi so that brotensor geglu_exact_forward
-        // (which does A * gelu(B)) matches ModernBERT's gelu(input) * gate.
-        {
-            std::vector<float> wi_host = brolm::detail::weights::detail_::download_fp32(L.mlp_Wi);
-            std::vector<float> wi_swapped(wi_host.size());
-            const std::size_t half_elems = static_cast<std::size_t>(F) * static_cast<std::size_t>(D);
-            std::copy(wi_host.begin() + half_elems, wi_host.end(), wi_swapped.begin());
-            std::copy(wi_host.begin(), wi_host.begin() + half_elems, wi_swapped.begin() + half_elems);
-            L.mlp_Wi = brolm::detail::upload_host(wi_swapped.data(), 2 * F, D);
-        }
+        // mlp.Wi: swap the two F-row halves so brotensor's geglu_exact_forward
+        // (A * gelu(B)) computes ModernBERT's gelu(input) * gate.
+        src.download_host_fp16(p + "mlp.Wi.weight", 2 * F, D, raw, "mlp.Wi");
+        fixed.resize(raw.size());
+        const std::size_t half = static_cast<std::size_t>(F) * static_cast<std::size_t>(D);
+        std::memcpy(fixed.data(), raw.data() + half, half * sizeof(std::uint16_t));
+        std::memcpy(fixed.data() + half, raw.data(), half * sizeof(std::uint16_t));
+        L.mlp_Wi = upload_fp16_bits(fixed, 2 * F, D);
 
         src.upload_compute_checked(p + "mlp.Wo.weight", D, F,
                                    L.mlp_Wo, "mlp.Wo");
@@ -140,28 +166,36 @@ void ModernBertModel::init_synthetic() {
     final_norm_ = brolm::detail::upload_host(ones_D.data(), D, 1);
 }
 
-void ModernBertModel::build_rotary_tables_(int seq_len, float theta,
-                                          bt::Tensor& cos_out,
-                                          bt::Tensor& sin_out) {
+void ModernBertModel::ensure_rotary_tables_(int seq_len) {
+    if (seq_len <= rope_rows_) return;
+    // Grow in 512-row steps so a run of slightly longer inputs does not
+    // rebuild every call.
+    const int rows = ((seq_len + 511) / 512) * 512;
     const int head_dim = cfg_.head_dim();
     const int half = head_dim / 2;
-    std::vector<float> inv_freq(static_cast<std::size_t>(half));
-    for (int i = 0; i < half; ++i) {
-        const float p = static_cast<float>(2 * i) / static_cast<float>(head_dim);
-        inv_freq[static_cast<std::size_t>(i)] = 1.0f / std::pow(theta, p);
-    }
-    std::vector<float> cos_h(static_cast<std::size_t>(seq_len) * half);
-    std::vector<float> sin_h(static_cast<std::size_t>(seq_len) * half);
-    for (int pos = 0; pos < seq_len; ++pos) {
-        for (int i = 0; i < half; ++i) {
-            const float ang = static_cast<float>(pos) * inv_freq[static_cast<std::size_t>(i)];
-            cos_h[static_cast<std::size_t>(pos) * half + i] = std::cos(ang);
-            sin_h[static_cast<std::size_t>(pos) * half + i] = std::sin(ang);
-        }
-    }
     const bt::Device dev = bt::default_device();
-    cos_out = bt::Tensor::from_host(cos_h.data(), seq_len, half).to(dev);
-    sin_out = bt::Tensor::from_host(sin_h.data(), seq_len, half).to(dev);
+    auto build = [&](float theta, bt::Tensor& cos_out, bt::Tensor& sin_out) {
+        // HF: inv_freq = 1 / theta ** (arange(0, dim, 2) / dim), angles in FP32.
+        std::vector<float> inv_freq(static_cast<std::size_t>(half));
+        for (int i = 0; i < half; ++i) {
+            const float p = static_cast<float>(2 * i) / static_cast<float>(head_dim);
+            inv_freq[static_cast<std::size_t>(i)] = 1.0f / std::pow(theta, p);
+        }
+        std::vector<float> cos_h(static_cast<std::size_t>(rows) * half);
+        std::vector<float> sin_h(static_cast<std::size_t>(rows) * half);
+        for (int pos = 0; pos < rows; ++pos) {
+            for (int i = 0; i < half; ++i) {
+                const float ang = static_cast<float>(pos) * inv_freq[static_cast<std::size_t>(i)];
+                cos_h[static_cast<std::size_t>(pos) * half + i] = std::cos(ang);
+                sin_h[static_cast<std::size_t>(pos) * half + i] = std::sin(ang);
+            }
+        }
+        cos_out = bt::Tensor::from_host_on(dev, cos_h.data(), rows, half);
+        sin_out = bt::Tensor::from_host_on(dev, sin_h.data(), rows, half);
+    };
+    build(cfg_.rope_theta_full, cos_full_, sin_full_);
+    build(cfg_.rope_theta_sliding, cos_slid_, sin_slid_);
+    rope_rows_ = rows;
 }
 
 void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor& h_out) {
@@ -174,64 +208,104 @@ void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor&
     const float eps = cfg_.norm_eps;
     const bt::Device dev = bt::default_device();
     const bt::Dtype dt = brolm::compute_dtype();
+    const bool prof = profiling_;
+    EncoderTimings& T = timings_;
+    if (prof) ++T.forwards;
 
-    ids_dev_ = make_idx_device(input_ids, seq_len);
-    bt::embedding_lookup_forward(tok_embeddings_,
-                                 static_cast<const int32_t*>(ids_dev_.data),
-                                 seq_len, embeds_);
-    layernorm_bias_free(embeds_, embed_norm_, h_, eps);
+    ensure_rotary_tables_(seq_len);
+    const int half = head_dim / 2;
+    const bt::Tensor cos_full = bt::Tensor::view(dev, cos_full_.data, seq_len, half);
+    const bt::Tensor sin_full = bt::Tensor::view(dev, sin_full_.data, seq_len, half);
+    const bt::Tensor cos_slid = bt::Tensor::view(dev, cos_slid_.data, seq_len, half);
+    const bt::Tensor sin_slid = bt::Tensor::view(dev, sin_slid_.data, seq_len, half);
 
-    bt::Tensor cos_full, sin_full;
-    bt::Tensor cos_sliding, sin_sliding;
-    build_rotary_tables_(seq_len, cfg_.rope_theta_full, cos_full, sin_full);
-    build_rotary_tables_(seq_len, cfg_.rope_theta_sliding, cos_sliding, sin_sliding);
+    {
+        FamilyTimer t(prof, T.embed_ms);
+        ids_dev_ =bt::Tensor::from_raw_bytes_on(dev, input_ids, seq_len, 1, bt::Dtype::INT32,
+                                                 static_cast<std::size_t>(seq_len) * sizeof(int32_t));
+        bt::embedding_lookup_forward(tok_embeddings_,
+                                     static_cast<const int32_t*>(ids_dev_.data),
+                                     seq_len, embeds_);
+        layernorm_bias_free(embeds_, embed_norm_, h_, eps);
+    }
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         LayerWeights& L = layers_[static_cast<std::size_t>(i)];
 
-        // ── Attention block ──
-        if (i == 0) {
-            attn_in_ = h_;
-        } else {
+        // ── Attention block ── (layer 0 has no attn_norm: attend over h_)
+        const bt::Tensor* attn_in = &h_;
+        if (i > 0) {
+            FamilyTimer t(prof, T.norm_ms);
             layernorm_bias_free(h_, L.attn_norm, attn_in_, eps);
+            attn_in = &attn_in_;
         }
 
-        brolm::detail::linear_batched(L.Wqkv, nullptr, attn_in_, qkv_);
-
-        brolm::detail::resize_like(q_, seq_len, D, dt, dev);
-        brolm::detail::resize_like(k_, seq_len, D, dt, dev);
-        brolm::detail::resize_like(v_, seq_len, D, dt, dev);
-        bt::copy_d2d_strided(qkv_, 0,     3 * D, q_, 0, D, D, seq_len);
-        bt::copy_d2d_strided(qkv_, D,     3 * D, k_, 0, D, D, seq_len);
-        bt::copy_d2d_strided(qkv_, 2 * D, 3 * D, v_, 0, D, D, seq_len);
+        {
+            FamilyTimer t(prof, T.qkv_ms);
+            brolm::detail::linear_batched(L.Wqkv, nullptr, *attn_in, qkv_);
+            brolm::detail::resize_like(q_, seq_len, D, dt, dev);
+            brolm::detail::resize_like(k_, seq_len, D, dt, dev);
+            brolm::detail::resize_like(v_, seq_len, D, dt, dev);
+            bt::copy_d2d_strided(qkv_, 0,     3 * D, q_, 0, D, D, seq_len);
+            bt::copy_d2d_strided(qkv_, D,     3 * D, k_, 0, D, D, seq_len);
+            bt::copy_d2d_strided(qkv_, 2 * D, 3 * D, v_, 0, D, D, seq_len);
+        }
 
         const bool is_slid = cfg_.is_sliding(i);
-        const bt::Tensor& cos_tbl = is_slid ? cos_sliding : cos_full;
-        const bt::Tensor& sin_tbl = is_slid ? sin_sliding : sin_full;
-
-        bt::rope_apply(q_, cos_tbl, sin_tbl, head_dim, H, q_rope_);
-        bt::rope_apply(k_, cos_tbl, sin_tbl, head_dim, H, k_rope_);
+        {
+            FamilyTimer t(prof, T.rope_ms);
+            const bt::Tensor& cos_tbl = is_slid ? cos_slid : cos_full;
+            const bt::Tensor& sin_tbl = is_slid ? sin_slid : sin_full;
+            bt::rope_apply(q_, cos_tbl, sin_tbl, head_dim, H, q_rope_);
+            bt::rope_apply(k_, cos_tbl, sin_tbl, head_dim, H, k_rope_);
+        }
 
         if (is_slid) {
+            // HF: |q - k| <= local_attention / 2, which is exactly the
+            // bidirectional window brotensor takes as `window`.
+            FamilyTimer t(prof, T.attn_local_ms);
             bt::flash_attention_windowed_forward(q_rope_, k_rope_, v_, nullptr,
                                                  H, cfg_.local_attention, attn_out_,
                                                  /*causal=*/false);
         } else {
+            FamilyTimer t(prof, T.attn_full_ms);
             bt::flash_attention_gqa_forward(q_rope_, k_rope_, v_, nullptr,
-                                             H, H, /*causal=*/false, attn_out_);
+                                            H, H, /*causal=*/false, attn_out_);
         }
 
-        brolm::detail::linear_batched(L.Wo, nullptr, attn_out_, proj_out_);
-        bt::add_inplace(h_, proj_out_);
+        {
+            FamilyTimer t(prof, T.wo_ms);
+            brolm::detail::linear_batched(L.Wo, nullptr, attn_out_, proj_out_);
+        }
+        {
+            FamilyTimer t(prof, T.residual_ms);
+            bt::add_inplace(h_, proj_out_);
+        }
 
         // ── MLP block ──
-        layernorm_bias_free(h_, L.mlp_norm, mlp_in_, eps);
-        brolm::detail::linear_batched(L.mlp_Wi, nullptr, mlp_in_, geglu_in_);
-        bt::geglu_exact_forward(geglu_in_, geglu_out_);
-        brolm::detail::linear_batched(L.mlp_Wo, nullptr, geglu_out_, mlp_out_);
-        bt::add_inplace(h_, mlp_out_);
+        {
+            FamilyTimer t(prof, T.norm_ms);
+            layernorm_bias_free(h_, L.mlp_norm, mlp_in_, eps);
+        }
+        {
+            FamilyTimer t(prof, T.mlp_in_ms);
+            brolm::detail::linear_batched(L.mlp_Wi, nullptr, mlp_in_, geglu_in_);
+        }
+        {
+            FamilyTimer t(prof, T.geglu_ms);
+            bt::geglu_exact_forward(geglu_in_, geglu_out_);
+        }
+        {
+            FamilyTimer t(prof, T.mlp_out_ms);
+            brolm::detail::linear_batched(L.mlp_Wo, nullptr, geglu_out_, mlp_out_);
+        }
+        {
+            FamilyTimer t(prof, T.residual_ms);
+            bt::add_inplace(h_, mlp_out_);
+        }
     }
 
+    FamilyTimer t(prof, T.norm_ms);
     layernorm_bias_free(h_, final_norm_, h_out, eps);
 }
 

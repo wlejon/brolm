@@ -34,31 +34,76 @@ std::vector<std::string> getObjectKeys(Value obj) {
     return keys;
 }
 
+// JSON.stringify(v) re-spaced the way Python's json.dumps separates items
+// (", " / ": ") — the reference serialises dict/list states and non-string
+// instructions with json.dumps, and the model was trained on that spacing.
+bool pythonStyleJson(Value v, std::string& out) {
+    auto g = ev::globalValue("JSON");
+    if (!g.found || !ev::isObject(g.value)) return false;
+    Value stringifyFn = ev::getProperty(g.value, "stringify");
+    if (!ev::isFunction(stringifyFn)) return false;
+    auto res = ev::call(stringifyFn, g.value, std::span<const Value>(&v, 1));
+    if (res.thrown || !ev::isString(res.value)) return false;
+    out = brolm::laya::python_json_spacing(ev::toUtf8(res.value));
+    return true;
+}
+
+// Optional integer property; `found` reports whether it was a number.
+int intProp(Value obj, const char* camel, const char* snake, bool& found) {
+    Value v = ev::getProperty(obj, camel);
+    if (!ev::isNumber(v)) v = ev::getProperty(obj, snake);
+    found = ev::isNumber(v);
+    return found ? static_cast<int>(ev::toDouble(v)) : 0;
+}
+
 static void decorateLayaModel(ObjectBuilder& b) {
-    b.def("predict", 2, [](Value self, std::span<const Value> a) -> Value {
+    // config() -> { max_len, head_max_len, temperature: [choice, score, noul],
+    //               temperature_by_options: { "choice:3-5": T, ... } }
+    b.def("config", 0, [](Value self, std::span<const Value>) -> Value {
+        auto* model = hostLayaModelOf(self);
+        if (!model) return ev::throwTypeError("config: not a LayaModel");
+        const brolm::laya::Config& c = model->config();
+        ObjectBuilder o;
+        o.set("max_len", static_cast<double>(c.max_len));
+        o.set("head_max_len", static_cast<double>(c.head_max_len));
+        o.set("temperature", makeFloat32Array(c.temperature.data(), c.temperature.size()));
+        ObjectBuilder tbo;
+        for (const auto& [k, t] : c.temperature_by_options) tbo.set(k, static_cast<double>(t));
+        o.set("temperature_by_options", tbo.build());
+        return o.build();
+    });
+
+    // predict(state, questions, options?)
+    //   options: { maxLen, headMaxLen, truncateLeft } (snake_case accepted) —
+    //   per-call overrides of the checkpoint's max_len / head_max_len, and
+    //   truncateLeft keeps the newest state tokens (multi-turn conversations).
+    b.def("predict", 3, [](Value self, std::span<const Value> a) -> Value {
         auto* model = hostLayaModelOf(self);
         if (!model) return ev::throwTypeError("predict: not a LayaModel");
         if (a.size() < 2) return ev::throwTypeError("predict(state, questions): 2 arguments required");
 
-        // 1. Read state: if string, use it; if object, serialize to JSON string.
+        brolm::laya::PredictOptions opts;
+        if (a.size() >= 3 && ev::isObject(a[2])) {
+            bool found = false;
+            opts.max_len = intProp(a[2], "maxLen", "max_len", found);
+            opts.head_max_len = intProp(a[2], "headMaxLen", "head_max_len", found);
+            Value tl = ev::getProperty(a[2], "truncateLeft");
+            if (!ev::isBool(tl)) tl = ev::getProperty(a[2], "truncate_left");
+            opts.truncate_left = ev::isBool(tl) && ev::toBool(tl);
+            if (opts.max_len < 0 || opts.head_max_len < 0) {
+                return ev::throwRangeError("predict: maxLen / headMaxLen must be positive");
+            }
+        }
+
+        // 1. Read state: a string is used as is; an object/array is
+        //    serialised like the reference's json.dumps(state).
         std::string state;
         if (ev::isString(a[0])) {
             state = ev::toUtf8(a[0]);
         } else if (ev::isObject(a[0])) {
-            auto g = ev::globalValue("JSON");
-            if (!g.found || !ev::isObject(g.value)) {
-                return ev::throwError("predict: JSON global not found");
-            }
-            Value stringifyFn = ev::getProperty(g.value, "stringify");
-            if (!ev::isFunction(stringifyFn)) {
-                return ev::throwError("predict: JSON.stringify not found");
-            }
-            Value stateArg = a[0];
-            auto res = ev::call(stringifyFn, g.value, std::span<const Value>(&stateArg, 1));
-            if (res.thrown || !ev::isString(res.value)) {
+            if (!pythonStyleJson(a[0], state)) {
                 return ev::throwTypeError("predict: failed to serialize state to JSON");
             }
-            state = ev::toUtf8(res.value);
         } else {
             return ev::throwTypeError("predict: state must be a string or object");
         }
@@ -88,6 +133,8 @@ static void decorateLayaModel(ObjectBuilder& b) {
             Value insVal = ev::getProperty(qDef, "instructions");
             if (ev::isString(insVal)) {
                 q.instructions = ev::toUtf8(insVal);
+            } else if (!ev::isUndefined(insVal)) {
+                pythonStyleJson(insVal, q.instructions);  // reference: json.dumps
             }
 
             Value critVal = ev::getProperty(qDef, "criteria");
@@ -134,11 +181,17 @@ static void decorateLayaModel(ObjectBuilder& b) {
                     std::vector<std::string> cKeys = getObjectKeys(critVal);
                     for (const std::string& kStr : cKeys) {
                         Value vVal = ev::getProperty(critVal, kStr);
-                        std::string vStr = ev::isString(vVal) ? ev::toUtf8(vVal) : "";
+                        std::string vStr;
+                        if (ev::isString(vVal)) {
+                            vStr = ev::toUtf8(vVal);
+                        } else if (!ev::isUndefined(vVal) && !ev::isNull(vVal)) {
+                            pythonStyleJson(vVal, vStr);  // structured criterion -> JSON text
+                        }
                         if (q.type == "choice" || q.type.empty()) {
                             q.criteria_choice.emplace_back(kStr, vStr);
                         } else if (q.type == "score") {
-                            q.criteria_score.push_back(vStr.empty() ? kStr : vStr);
+                            // reference: enumerate(dict) walks the keys
+                            q.criteria_score.push_back(kStr);
                         } else { // noul
                             if (kStr == "false" || kStr == "0") q.criteria_noul_false = vStr;
                             else if (kStr == "true" || kStr == "1") q.criteria_noul_true = vStr;
@@ -157,9 +210,13 @@ static void decorateLayaModel(ObjectBuilder& b) {
             questions[qId] = std::move(q);
         }
 
-        // 3. Call model->predict(state, questions).
+        // 3. Call model->predict in the caller's question order.
+        std::vector<brolm::LayaQuestion> ordered;
+        ordered.reserve(questionOrder.size());
+        for (const std::string& qId : questionOrder) ordered.push_back(questions[qId]);
+
         try {
-            brolm::LayaResult res = model->predict(state, questions);
+            brolm::LayaResult res = model->predict(state, ordered, opts);
 
             // 4. Build and return JS object using bronze::embed APIs.
             ObjectBuilder out;
@@ -178,14 +235,6 @@ static void decorateLayaModel(ObjectBuilder& b) {
                 if (ans.type == "choice") {
                     aObj.set("choice", ans.choice);
                     aObj.set("confidence", static_cast<double>(ans.confidence));
-                    ObjectBuilder probObj;
-                    for (const auto& [k, p] : ans.probabilities) {
-                        probObj.set(k, static_cast<double>(p));
-                    }
-                    aObj.set("probabilities", probObj.build());
-                    ObjectBuilder rlObj;
-                    rlObj.set("act_probability", static_cast<double>(ans.act_probability));
-                    aObj.set("rl_agent", rlObj.build());
                 } else if (ans.type == "score") {
                     aObj.set("score", static_cast<double>(ans.score));
                     aObj.set("confidence", static_cast<double>(ans.confidence));
@@ -194,20 +243,25 @@ static void decorateLayaModel(ObjectBuilder& b) {
                         legendObj.set(std::to_string(c), q.criteria_score[c]);
                     }
                     aObj.set("legend", legendObj.build());
+                } else {  // "noul"
+                    aObj.set("noul", static_cast<double>(ans.noul));
+                }
+                if (ans.type != "noul") {
                     ObjectBuilder probObj;
                     for (const auto& [k, p] : ans.probabilities) {
                         probObj.set(k, static_cast<double>(p));
                     }
                     aObj.set("probabilities", probObj.build());
-                    ObjectBuilder rlObj;
-                    rlObj.set("act_probability", static_cast<double>(ans.act_probability));
-                    aObj.set("rl_agent", rlObj.build());
-                } else { // "noul"
-                    aObj.set("noul", static_cast<double>(ans.noul));
-                    ObjectBuilder rlObj;
-                    rlObj.set("act_probability", static_cast<double>(ans.act_probability));
-                    aObj.set("rl_agent", rlObj.build());
                 }
+                // Raw, pre-temperature scorer logits (option order) and the
+                // temperature applied — enough to refit calibration downstream.
+                aObj.set("logits", makeFloat32Array(ans.logits.data(), ans.logits.size()));
+                aObj.set("temperature", static_cast<double>(ans.temperature));
+
+                ObjectBuilder rlObj;
+                rlObj.set("act_probability", static_cast<double>(ans.act_probability));
+                rlObj.set("act_logits", makeFloat32Array(ans.act_logits.data(), ans.act_logits.size()));
+                aObj.set("rl_agent", rlObj.build());
 
                 answersObj.set(qId, aObj.build());
             }
@@ -255,6 +309,15 @@ Value js_loadLaya(Value, std::span<const Value> a) {
     try {
         auto model = std::make_unique<brolm::LayaModel>();
         model->load_model(resolved);
+        // Optional load-time defaults: { maxLen, headMaxLen } replace the
+        // checkpoint's max_len / head_max_len for every later predict().
+        if (ev::isObject(a[0])) {
+            bool found = false;
+            const int ml = intProp(a[0], "maxLen", "max_len", found);
+            if (found && ml > 0) model->mutable_config().max_len = ml;
+            const int hml = intProp(a[0], "headMaxLen", "head_max_len", found);
+            if (found && hml > 0) model->mutable_config().head_max_len = hml;
+        }
         return g_layaModelClass.createInstance(std::move(model));
     } catch (const std::exception& e) {
         return ev::throwError(std::string("loadLaya: ") + e.what());

@@ -373,6 +373,61 @@ static void test_laya() {
                 throw new Error("expected churn rl_agent.act_probability");
             }
 
+            // Raw logits + temperature + act logits are exposed for refitting.
+            if (!(dept.logits instanceof Float32Array) || dept.logits.length !== 4) {
+                throw new Error("expected department.logits Float32Array(4)");
+            }
+            if (typeof dept.temperature !== "number" || !(dept.rl_agent.act_logits instanceof Float32Array)) {
+                throw new Error("expected temperature and rl_agent.act_logits");
+            }
+
+            // An object state is serialised like Python's json.dumps: the same
+            // text passed as a string must give the same logits.
+            const pyText = '{"from": "user@acme.com", "subject": "Duplicate charge on invoice #4411", ' +
+                '"body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."}';
+            const resText = laya.predict(pyText, { department: questions.department });
+            for (let k = 0; k < 4; ++k) {
+                if (Math.abs(resText.answers.department.logits[k] - dept.logits[k]) > 1e-3) {
+                    throw new Error("object state and json.dumps text disagree at logit " + k);
+                }
+            }
+
+            // Options that cannot fit raise instead of answering a truncated set.
+            const many = [];
+            for (let i = 0; i < 200; ++i) many.push("option " + i);
+            let threw = false;
+            try {
+                laya.predict("x", { huge: { type: "choice", instructions: "pick", criteria: many } });
+            } catch (e) {
+                threw = String(e.message).indexOf("options do not fit") >= 0;
+            }
+            if (!threw) throw new Error("expected options-do-not-fit error");
+
+            // Per-call limits: raising headMaxLen/maxLen makes them fit.
+            const big = laya.predict("x", { huge: { type: "choice", instructions: "pick", criteria: many } },
+                                     { maxLen: 2048, headMaxLen: 1536 });
+            if (big.answers.huge.logits.length !== 200) throw new Error("expected 200 logits with raised limits");
+
+            // truncateLeft keeps the newest tokens: a long state whose tail
+            // differs must change the answer's logits only under truncateLeft.
+            const filler = "The weather report was unremarkable today. ".repeat(80);
+            const q1 = { angry: { type: "noul", instructions: "Is the customer angry?" } };
+            const rA = laya.predict(filler + "I am furious, cancel everything now!", q1, { truncateLeft: true });
+            const rB = laya.predict(filler + "Thanks, all good.", q1, { truncateLeft: true });
+            const rC = laya.predict(filler + "I am furious, cancel everything now!", q1);
+            const rD = laya.predict(filler + "Thanks, all good.", q1);
+            if (Math.abs(rA.answers.angry.logits[1] - rB.answers.angry.logits[1]) < 1e-3) {
+                throw new Error("truncateLeft did not keep the state tail");
+            }
+            if (Math.abs(rC.answers.angry.logits[1] - rD.answers.angry.logits[1]) > 1e-3) {
+                throw new Error("default truncation should drop the state tail");
+            }
+
+            const cfg = laya.config();
+            if (cfg.max_len !== 512 || cfg.head_max_len !== 192 || cfg.temperature.length !== 3) {
+                throw new Error("config() mismatch");
+            }
+
             // Also test constructor form: new bro.lm.LayaModel(...)
             const layaCtor = new bro.lm.LayaModel(")JS" + model_dir + R"JS(");
             const res2 = layaCtor.predict(JSON.stringify(state), questions);

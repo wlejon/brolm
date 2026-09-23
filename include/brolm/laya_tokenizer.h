@@ -17,6 +17,12 @@ struct SequenceResult {
     std::vector<int32_t> marker_pos;
 };
 
+// Re-space compact JSON (JSON.stringify output) the way Python's json.dumps
+// separates items and keys (", " and ": "), which is how the reference
+// serialises a dict/list state before tokenizing. String contents are left
+// untouched. Number formatting is not reconciled (JS has no int/float split).
+std::string python_json_spacing(std::string_view json);
+
 class LayaTokenizer {
 public:
     static constexpr int32_t kClsTokenId  = 50281;
@@ -31,10 +37,17 @@ public:
 
     std::vector<int32_t> encode(std::string_view text) const;
 
+    // [CLS] <type> question: <instructions> [SEP] [MASK] opt0 [MASK] opt1 ...
+    // [SEP] state [SEP], exactly as the reference build_sequence. The state
+    // is cut from the right (keep the oldest tokens) unless truncate_left,
+    // which keeps the newest — how the reference trained multi-turn
+    // conversations. marker_pos holds only markers that landed inside
+    // max_len; fewer markers than options means the options did not fit.
     SequenceResult build_sequence(const std::string& state_json_or_text,
                                   const LayaQuestion& q,
                                   int max_len = 512,
-                                  int head_max_len = 192) const;
+                                  int head_max_len = 192,
+                                  bool truncate_left = false) const;
 
     static std::vector<std::string> render_options(const LayaQuestion& q);
 

@@ -35,6 +35,15 @@ struct LayaQuestion {
     }
 };
 
+// Parse a Jev-shaped questions object, {"id": {"type", "instructions",
+// "criteria"}, ...}, into questions in key order — the same shapes the
+// reference RLAgent._to_internal accepts: choice criteria as an object
+// (key -> description, null/"" = none) or a list of keys; score criteria as a
+// list (an object contributes its keys, as Python's enumerate(dict) does);
+// noul criteria as {"false": ..., "true": ...}. Non-string instructions are
+// serialised Python-style. Throws std::runtime_error on malformed input.
+std::vector<LayaQuestion> parse_questions_json(const std::string& json_text);
+
 struct LayaAnswer {
     std::string type;  // "choice", "score", "noul"
     std::string choice;
@@ -43,12 +52,46 @@ struct LayaAnswer {
     float confidence = 0.0f;
     std::vector<std::pair<std::string, float>> probabilities;
     float act_probability = 0.0f;
+
+    // Pre-temperature scorer logits, one per option in option order, and the
+    // two raw act-head logits ([act, escalate]) — what a downstream caller
+    // needs to refit temperatures on its own data.
+    std::vector<float> logits;
+    std::vector<float> act_logits;
+    // The temperature that was applied (per qtype / option-count bucket).
+    float temperature = 1.0f;
 };
 
 struct LayaResult {
     std::string model = "rl-agent";
     std::unordered_map<std::string, LayaAnswer> answers;
     int input_tokens = 0;
+};
+
+// Per-call overrides of the checkpoint's rl_agent_config.json values.
+struct PredictOptions {
+    int max_len = 0;             // <= 0: config max_len
+    int head_max_len = 0;        // <= 0: config head_max_len
+    bool truncate_left = false;  // keep the newest state tokens (conversations)
+};
+
+// Wall-clock stage breakdown of the last predict(), filled only while
+// profiling is on (set_profiling). Stage boundaries sync the device, so the
+// stages sum to a serialised total that is slower than an unprofiled call.
+struct LayaTimings {
+    double tokenize_ms = 0;
+    double encoder_ms = 0;
+    double head_ms = 0;       // type embedding + the 2 head transformer layers
+    double scorer_ms = 0;     // marker gather + scorer MLP
+    double act_ms = 0;        // act features + act MLP
+    double download_ms = 0;   // device->host reads (logits / act logits)
+    double calibrate_ms = 0;  // host softmax / result packaging
+    double total_ms = 0;
+    int uploads = 0;          // host->device transfers issued
+    int downloads = 0;        // device->host transfers (each one is a sync)
+    int questions = 0;
+    int tokens = 0;
+    modernbert::EncoderTimings encoder;  // encoder_ms split by op family
 };
 
 struct TransformerHeadLayer {
@@ -82,17 +125,32 @@ public:
     void init_synthetic(const modernbert::Config& enc_cfg = modernbert::Config{},
                         const Config& laya_cfg = Config{});
 
+    // Tokenize one question against the state with the effective limits.
+    // Throws std::runtime_error (reference wording) when the options do not
+    // all fit — the reference raises rather than answering over a truncated
+    // answer space.
+    SequenceResult build_sequence(const std::string& state_json_or_text,
+                                  const LayaQuestion& q,
+                                  const PredictOptions& opts = {}) const;
+
     LayaAnswer forward_question(const LayaQuestion& q,
                                 const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& marker_pos);
 
     LayaResult predict(const std::string& state_json_or_text,
-                       const std::vector<LayaQuestion>& questions);
+                       const std::vector<LayaQuestion>& questions,
+                       const PredictOptions& opts = {});
     LayaResult predict(const std::string& state_json_or_text,
-                       const std::unordered_map<std::string, LayaQuestion>& questions);
+                       const std::unordered_map<std::string, LayaQuestion>& questions,
+                       const PredictOptions& opts = {});
+
+    void set_profiling(bool on);
+    bool profiling() const { return profiling_; }
+    const LayaTimings& last_timings() const { return timings_; }
 
     const modernbert::ModernBertModel& encoder() const { return encoder_; }
     const Config& config() const { return cfg_; }
+    Config& mutable_config() { return cfg_; }
     const LayaTokenizer& tokenizer() const { return tokenizer_; }
 
 private:
@@ -117,6 +175,9 @@ private:
     brotensor::Tensor act_l2_W_;
     brotensor::Tensor act_l2_b_;
 
+    bool profiling_ = false;
+    LayaTimings timings_;
+
     // Scratch tensors
     brotensor::Tensor h_;
     brotensor::Tensor h_norm_;
@@ -129,10 +190,13 @@ private:
     brotensor::Tensor ffn1_;
     brotensor::Tensor ffn2_;
     brotensor::Tensor m_;
+    brotensor::Tensor idx_dev_;
+    brotensor::Tensor type_row_;
     brotensor::Tensor scorer_out0_;
     brotensor::Tensor scorer_out1_;
     brotensor::Tensor scorer_out2_;
     brotensor::Tensor scorer_out3_;
+    brotensor::Tensor act_in_;
     brotensor::Tensor act_h1_;
     brotensor::Tensor act_h2_;
     brotensor::Tensor act_logits_;
@@ -145,4 +209,5 @@ using LayaModel = laya::DecisionModel;
 using LayaQuestion = laya::LayaQuestion;
 using LayaAnswer = laya::LayaAnswer;
 using LayaResult = laya::LayaResult;
+using LayaPredictOptions = laya::PredictOptions;
 }  // namespace brolm
