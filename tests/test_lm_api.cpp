@@ -346,6 +346,69 @@ static void test_grammar() {
     TEST_CHECK(ev::toUtf8(res.value) == "SUCCESS");
 }
 
+// GemmaTokenizer's control-token surface from JS, over a synthetic
+// tokenizer.json (no weights): isSpecial(id) and decode(ids, skipSpecial).
+static void test_gemma_tokenizer_binding() {
+    std::cout << "[gemma] GemmaTokenizer isSpecial / decode(ids, skipSpecial)..." << std::endl;
+
+    // vocab: 0:<pad> 1:<eos> 2:<bos> 3:<unk> 4:▁ 5:a 6:c 7:t 8:ca 9:cat
+    //        10:▁cat 11:<start_of_turn>(special) 12:<unused0>(not special)
+    const auto path = std::filesystem::temp_directory_path() / "brolm_api_gemma_tokenizer.json";
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        const std::string M = "\xE2\x96\x81";  // U+2581 metaspace
+        f << "{\"added_tokens\":["
+          << "{\"id\":0,\"content\":\"<pad>\",\"special\":true},"
+          << "{\"id\":1,\"content\":\"<eos>\",\"special\":true},"
+          << "{\"id\":2,\"content\":\"<bos>\",\"special\":true},"
+          << "{\"id\":3,\"content\":\"<unk>\",\"special\":true},"
+          << "{\"id\":11,\"content\":\"<start_of_turn>\",\"special\":true},"
+          << "{\"id\":12,\"content\":\"<unused0>\",\"special\":false}],"
+          << "\"model\":{\"type\":\"BPE\",\"unk_token\":\"<unk>\",\"byte_fallback\":true,"
+          << "\"fuse_unk\":false,\"vocab\":{"
+          << "\"<pad>\":0,\"<eos>\":1,\"<bos>\":2,\"<unk>\":3,"
+          << "\"" << M << "\":4,\"a\":5,\"c\":6,\"t\":7,\"ca\":8,\"cat\":9,"
+          << "\"" << M << "cat\":10,\"<start_of_turn>\":11,\"<unused0>\":12},"
+          << "\"merges\":[\"c a\",\"ca t\",\"" << M << " cat\"]}}";
+    }
+    auto tok = std::make_shared<brolm::gemma::Tokenizer>(brolm::gemma::Tokenizer::load(path.string()));
+    std::filesystem::remove(path);
+    ev::Persistent tokVal(brolm::api::makeGemmaTokenizerValue(tok));
+    ev::registerGlobal("__gemmaTok", tokVal.get());
+
+    const char* script = R"JS(
+        (function() {
+            const t = globalThis.__gemmaTok;
+            if (!(t instanceof bro.lm.GemmaTokenizer)) throw new Error("not a GemmaTokenizer");
+            if (!t.isSpecial(t.bosId) || !t.isSpecial(t.eosId) || !t.isSpecial(11))
+                throw new Error("control tokens must be special");
+            if (t.isSpecial(5) || t.isSpecial(10)) throw new Error("text pieces are not special");
+            if (t.isSpecial(12)) throw new Error("an added token marked special:false is not special");
+            if (t.isSpecial(9999) || t.isSpecial(-1) || t.isSpecial(1.5) || t.isSpecial(NaN))
+                throw new Error("ids outside the vocabulary are not special");
+            let caught = null;
+            try { t.isSpecial("1"); } catch (e) { caught = e; }
+            if (!(caught instanceof TypeError)) throw new Error("isSpecial(string) must throw TypeError");
+
+            const ids = new Int32Array([2, 11, 5, 10, 12, 1]);
+            const full = t.decode(ids);
+            if (full.indexOf("<bos>") < 0 || full.indexOf("<start_of_turn>") < 0 || full.indexOf("<eos>") < 0)
+                throw new Error("decode(ids) keeps control tokens, got " + JSON.stringify(full));
+            if (t.decode(ids, false) !== full) throw new Error("decode(ids, false) is decode(ids)");
+            const skipped = t.decode(ids, true);
+            if (skipped !== "a cat<unused0>")
+                throw new Error("decode(ids, true) drops only control tokens, got " + JSON.stringify(skipped));
+            return "SUCCESS";
+        })()
+    )JS";
+    ev::CallResult res = bronze::eval::evalScript(script);
+    if (res.thrown) {
+        std::cerr << "gemma tokenizer eval threw: " << errorMessage(res.value) << std::endl;
+        std::exit(1);
+    }
+    TEST_CHECK(ev::toUtf8(res.value) == "SUCCESS");
+}
+
 // Weights-gated: the generation surface against Qwen3-0.6B (and NLLB /
 // Qwen3.5 when present). $BROLM_QWEN3_GGUF, else <repo>/weights/Qwen3-0.6B-GGUF.
 static std::string findWeights(const char* env, const std::string& rel) {
@@ -866,6 +929,7 @@ int main() {
         test_script();
         test_async_handle();
         test_grammar();
+        test_gemma_tokenizer_binding();
         test_generation_weights();
         test_modernbert();
         test_laya();

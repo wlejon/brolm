@@ -228,16 +228,33 @@ static void decorateGemmaTokenizer(ObjectBuilder& b) {
         }
     });
 
+    // decode(ids, skipSpecial = false): skipSpecial drops the control tokens
+    // (<bos>, <eos>, <end_of_turn>, ...), as HF's skip_special_tokens does;
+    // without it they render as their literal piece.
     b.def("decode", 1, [](Value self, std::span<const Value> a) -> Value {
         auto* w = hostGemmaTokenizerOf(self);
         if (!w || !w->tok) return ev::throwTypeError("decode: not a GemmaTokenizer");
-        if (a.empty()) return ev::throwTypeError("decode(ids): ids required");
+        if (a.empty()) return ev::throwTypeError("decode(ids, skipSpecial?): ids required");
+        const bool skipSpecial = a.size() >= 2 && ev::toBool(a[1]);
         std::vector<int32_t> ids = readInt32Array(a[0]);
         try {
-            return ev::fromUtf8(w->tok->decode(ids));
+            return ev::fromUtf8(w->tok->decode(ids, skipSpecial));
         } catch (const std::exception& e) {
             return ev::throwError(std::string("decode: ") + e.what());
         }
+    });
+
+    // isSpecial(id): true for a control token (an added token the
+    // tokenizer.json marks "special": true); false for ordinary text pieces,
+    // added tokens marked "special": false, and ids outside the vocabulary.
+    b.def("isSpecial", 1, [](Value self, std::span<const Value> a) -> Value {
+        auto* w = hostGemmaTokenizerOf(self);
+        if (!w || !w->tok) return ev::throwTypeError("isSpecial: not a GemmaTokenizer");
+        if (a.empty() || !ev::isNumber(a[0])) return ev::throwTypeError("isSpecial(id): id must be a number");
+        const double d = ev::toDouble(a[0]);
+        if (!(d >= INT32_MIN && d <= INT32_MAX) || d != static_cast<double>(static_cast<int32_t>(d)))
+            return ev::fromBool(false);
+        return ev::fromBool(w->tok->is_special(static_cast<int32_t>(d)));
     });
 }
 
