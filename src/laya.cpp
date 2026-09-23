@@ -71,12 +71,24 @@ void DecisionModel::set_profiling(bool on) {
 }
 
 void DecisionModel::load_model(const std::string& model_dir) {
+    // Everything checkpoint-specific comes from the directory: lengths and
+    // temperatures (rl_agent_config.json), the encoder's shape, rotary bases,
+    // window and global-layer pattern (encoder/config.json), the tokenizer
+    // pipeline and special-token roles (tokenizer/).
     cfg_ = Config::load(model_dir + "/rl_agent_config.json");
+    cfg_.variant = checkpoint_variant(cfg_, model_dir);
     modernbert::Config enc_cfg =
         modernbert::Config::load(model_dir + "/encoder/config.json");
+    tokenizer_ = LayaTokenizer::load(model_dir + "/tokenizer/tokenizer.json");
+    for (const int32_t id : {tokenizer_.cls_token_id(), tokenizer_.sep_token_id(), tokenizer_.pad_token_id(),
+                             tokenizer_.mask_token_id()}) {
+        if (id < 0 || id >= enc_cfg.vocab_size) {
+            fail("tokenizer special id " + std::to_string(id) + " is outside the encoder vocabulary (" +
+                 std::to_string(enc_cfg.vocab_size) + ")");
+        }
+    }
     encoder_ = modernbert::ModernBertModel(std::move(enc_cfg));
     encoder_.set_profiling(profiling_);
-    tokenizer_ = LayaTokenizer::load(model_dir + "/tokenizer/tokenizer.json");
     load_safetensors(model_dir + "/model.safetensors");
 }
 

@@ -9,9 +9,15 @@
 // handful of graphs covers a live workload. Padding rows are singleton
 // sequences, padding items empty segments; neither touches a real item.
 //
-// Graph replay needs every device pointer the graph captured to stay put, so
-// scratch is sized to a capacity that only grows (powers of two); growing it,
-// or the rotary tables, drops every cached graph.
+// Graph replay needs every device pointer the graph captured to stay put.
+// Scratch lives in ARENAS: one set of activation buffers (the encoder's
+// included) and index / readback buffers at fixed capacities. A forward that
+// fits the current arena runs there; one that does not (a per-call max_len
+// above what pre-warm sized) opens a new, larger arena and becomes current,
+// while the older arena stays alive, owned by the graphs captured on it — so
+// a single oversized call costs one capture of its own bucket, not a
+// recapture of every pre-warmed one. Growing the rotary tables (positions
+// past 8192) still drops every graph.
 
 #include "brolm/laya.h"
 
@@ -30,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -96,30 +103,63 @@ constexpr std::size_t kMaxGraphs = 192;
 
 }  // namespace
 
-struct DecisionModel::Batch {
-    // Capacities every scratch buffer is reserved to (0 = not yet).
+// One scratch set at fixed capacities (see the file comment).
+struct DecisionModel::Arena {
     int cap_T = 0, cap_N = 0, cap_K = 0;
+    std::shared_ptr<modernbert::ModernBertModel::Scratch> enc;
+    const void* ws_data = nullptr;  // the encoder split-K workspace graphs on this arena captured
+
+    bt::Tensor idx;  // INT32 index block: ids | pos | bounds | type | markers | starts | segs
+    bt::Tensor v_ids, v_pos, v_bounds, v_type, v_markers, v_starts, v_segs;
+    bt::Tensor h, h_norm, qkv, attn, ffn1, type_rows;
+    bt::Tensor m, s0, s2, wide, logits, feats, h0, act_in, act_h2, out;
+
+    bool fits(int T, int N, int K) const { return T <= cap_T && N <= cap_N && K <= cap_K; }
+};
+
+struct DecisionModel::Batch {
     bool graphs_on = env_graphs_enabled();
     bool graphs_broken = false;
 
-    std::vector<int32_t> host_idx;
-    bt::Tensor idx;  // INT32 index block: ids | pos | bounds | type | markers | starts | segs
-    bt::Tensor v_ids, v_pos, v_bounds, v_type, v_markers, v_starts, v_segs;
+    std::shared_ptr<Arena> cur;  // where new work and new captures go
 
-    bt::Tensor h, h_norm, qkv, attn, ffn1, type_rows;
-    bt::Tensor m, s0, s2, wide, logits, feats, h0, act_in, act_h2, out;
-    const void* ws_data = nullptr;  // split-K workspace the cached graphs captured
+    std::vector<int32_t> host_idx;
     std::vector<uint16_t> out_bits;
     std::vector<float> out_f32;
 
 #if defined(BROTENSOR_HAS_CUDA)
-    std::map<std::tuple<int, int, int>, bt::CudaGraph> graphs;
+    struct Cached {
+        bt::CudaGraph graph;
+        std::shared_ptr<Arena> arena;  // keeps the buffers it captured alive
+    };
+    std::map<std::tuple<int, int, int>, Cached> graphs;
 #endif
 
     void clear_graphs() {
 #if defined(BROTENSOR_HAS_CUDA)
         graphs.clear();
 #endif
+    }
+    // Drop the graphs captured on `a` (its buffers moved under them).
+    void clear_graphs_on(const Arena* a) {
+#if defined(BROTENSOR_HAS_CUDA)
+        for (auto it = graphs.begin(); it != graphs.end();) {
+            if (it->second.arena.get() == a) it = graphs.erase(it);
+            else ++it;
+        }
+#else
+        (void)a;
+#endif
+    }
+    std::size_t arenas() const {
+        std::vector<const Arena*> seen;
+        if (cur) seen.push_back(cur.get());
+#if defined(BROTENSOR_HAS_CUDA)
+        for (const auto& [k, c] : graphs) {
+            if (std::find(seen.begin(), seen.end(), c.arena.get()) == seen.end()) seen.push_back(c.arena.get());
+        }
+#endif
+        return seen.size();
     }
 };
 
@@ -163,6 +203,10 @@ std::size_t DecisionModel::cached_graphs() const {
 #endif
 }
 
+std::size_t DecisionModel::scratch_arenas() const { return batch_ ? batch_->arenas() : 0; }
+
+int DecisionModel::scratch_rows() const { return batch_ && batch_->cur ? batch_->cur->cap_T : 0; }
+
 int DecisionModel::token_bucket(int tokens) { return bucket_rows(std::max(1, tokens)); }
 
 std::vector<DecisionModel::WarmPoint> DecisionModel::prewarm_graphs(int max_tokens) {
@@ -190,10 +234,12 @@ std::vector<DecisionModel::WarmPoint> DecisionModel::prewarm_graphs(int max_toke
     // live request — even one overriding max_len upward — never regrows them,
     // which would drop every graph.
     if (encoder_.reserve_positions(std::max({cfg_.max_len, item_len, 8192}))) batch().clear_graphs();
-    // Scratch for the whole range with headroom on items (one per 8 rows) and
-    // markers (one per 2 rows), so no live batch within the budget regrows
-    // it — a regrow drops every pre-warmed graph. A few MB.
-    reserve_batch_(top, std::max(64, top / 8), std::max(256, top / 2));
+    // One arena for the whole range, with headroom on items (one per 8 rows)
+    // and markers (one per 2 rows), and rows for at least two full-length
+    // items (the checkpoint's max_len: 1024 on the multilingual and
+    // typed-decisions checkpoints), so no live batch within the budget opens
+    // another. A few MB.
+    reserve_batch_(std::max(top, 2 * bucket_rows(cfg_.max_len)), std::max(64, top / 8), std::max(256, top / 2));
 
     // Synthetic items exactly filling `rows`: item_len-row items with 4
     // markers each (inside the item floors forward_items buckets to), the
@@ -232,16 +278,17 @@ std::vector<DecisionModel::WarmPoint> DecisionModel::prewarm_graphs(int max_toke
     return pts;
 }
 
-// The device half of forward_items over the index views already set up in
-// `b`: T packed rows, N items, K markers. Issues device work only (no host
-// transfer, no allocation within capacity) so it can be graph-captured.
 void DecisionModel::linear_(const bt::Tensor& W, const bt::Tensor& bias, const bt::Tensor& X, int act,
                             int epilogue, bt::Tensor& Y) {
     const int flags = encoder_.fast_accum() ? bt::kLinearEpiFastAccum : 0;
     bt::linear_forward_batched_ex(W, &bias, X, act, epilogue | flags, &encoder_.gemm_workspace(), Y);
 }
 
-void DecisionModel::run_device_(Batch& b, int T, int N, int K) {
+// The device half of forward_items over the index views already set up in
+// arena `a` (whose scratch the encoder is pointed at): T packed rows, N items,
+// K markers. Issues device work only (no host transfer, no allocation within
+// capacity) so it can be graph-captured.
+void DecisionModel::run_device_(Arena& b, int T, int N, int K) {
     const int D = encoder_.config().hidden_size;
     const int H = std::max(1, D / 64);  // nn.TransformerEncoderLayer(d, d // 64 heads)
     const bt::Dtype dt = brolm::compute_dtype();
@@ -273,7 +320,7 @@ void DecisionModel::run_device_(Batch& b, int T, int N, int K) {
         }
     }
 
-    // 4-5. Gather every item's [MASK] marker rows and score them:
+    // 4-5. Gather every item's mask-marker rows and score them:
     //      LayerNorm -> Linear -> GELU -> Linear -> raw logits (K, 1).
     {
         StageTimer t(prof, Tm.scorer_ms);
@@ -306,38 +353,46 @@ void DecisionModel::run_device_(Batch& b, int T, int N, int K) {
     }
 }
 
-// Grow the scratch capacities to hold T rows, N items and K markers (powers
-// of two, never shrinking). Growing moves buffers, so it drops every graph.
-void DecisionModel::reserve_batch_(int T, int N, int K) {
+// The arena for T rows, N items and K markers: the current one when it fits;
+// otherwise a new one with every capacity grown to a power of two covering
+// both the request and the old arena, which becomes current. The old arena is
+// freed when no cached graph holds it.
+DecisionModel::Arena& DecisionModel::reserve_batch_(int T, int N, int K) {
     Batch& b = batch();
-    if (T <= b.cap_T && N <= b.cap_N && K <= b.cap_K) return;
+    if (b.cur && b.cur->fits(T, N, K)) return *b.cur;
     const bt::Device dev = bt::default_device();
     const bt::Dtype dt = brolm::compute_dtype();
     const int D = encoder_.config().hidden_size;
-    b.cap_T = pow2_at_least(T, std::max(512, b.cap_T));
-    b.cap_N = pow2_at_least(N, std::max(64, b.cap_N));
-    b.cap_K = pow2_at_least(K, std::max(256, b.cap_K));
-    const int cT = b.cap_T, cN = b.cap_N, cK = b.cap_K;
+    auto a = std::make_shared<Arena>();
+    const Arena* old = b.cur.get();
+    a->cap_T = pow2_at_least(T, std::max(512, old ? old->cap_T : 0));
+    a->cap_N = pow2_at_least(N, std::max(64, old ? old->cap_N : 0));
+    a->cap_K = pow2_at_least(K, std::max(256, old ? old->cap_K : 0));
+    const int cT = a->cap_T, cN = a->cap_N, cK = a->cap_K;
+    a->enc = std::make_shared<modernbert::ModernBertModel::Scratch>();
+    encoder_.set_scratch(a->enc);
     encoder_.reserve_rows(cT);
+    a->ws_data = encoder_.workspace_data();
     using brolm::detail::resize_like;
-    resize_like(b.idx, 5 * cT + cK + 2 * cN + 1, 1, bt::Dtype::INT32, dev);
-    resize_like(b.h, cT, D, dt, dev);
-    resize_like(b.h_norm, cT, D, dt, dev);
-    resize_like(b.qkv, cT, 3 * D, dt, dev);
-    resize_like(b.attn, cT, D, dt, dev);
-    resize_like(b.ffn1, cT, 4 * D, dt, dev);
-    resize_like(b.type_rows, cT, D, dt, dev);
-    resize_like(b.m, cK, D, dt, dev);
-    resize_like(b.s0, cK, D, dt, dev);
-    resize_like(b.s2, cK, D, dt, dev);
-    resize_like(b.logits, cK, 1, dt, dev);
-    resize_like(b.feats, cN, 4, dt, dev);
-    resize_like(b.h0, cN, D, dt, dev);
-    b.act_in = bt::Tensor::zeros_on(dev, cN, D + kActPad, dt);  // pad columns must read zero
-    resize_like(b.act_h2, cN, 256, dt, dev);
-    resize_like(b.wide, std::max(cK, cN), kOutPad, dt, dev);
-    resize_like(b.out, cK + 2 * cN, 1, dt, dev);
-    b.clear_graphs();
+    resize_like(a->idx, 5 * cT + cK + 2 * cN + 1, 1, bt::Dtype::INT32, dev);
+    resize_like(a->h, cT, D, dt, dev);
+    resize_like(a->h_norm, cT, D, dt, dev);
+    resize_like(a->qkv, cT, 3 * D, dt, dev);
+    resize_like(a->attn, cT, D, dt, dev);
+    resize_like(a->ffn1, cT, 4 * D, dt, dev);
+    resize_like(a->type_rows, cT, D, dt, dev);
+    resize_like(a->m, cK, D, dt, dev);
+    resize_like(a->s0, cK, D, dt, dev);
+    resize_like(a->s2, cK, D, dt, dev);
+    resize_like(a->logits, cK, 1, dt, dev);
+    resize_like(a->feats, cN, 4, dt, dev);
+    resize_like(a->h0, cN, D, dt, dev);
+    a->act_in = bt::Tensor::zeros_on(dev, cN, D + kActPad, dt);  // pad columns must read zero
+    resize_like(a->act_h2, cN, 256, dt, dev);
+    resize_like(a->wide, std::max(cK, cN), kOutPad, dt, dev);
+    resize_like(a->out, cK + 2 * cN, 1, dt, dev);
+    b.cur = std::move(a);
+    return *b.cur;
 }
 
 std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaItem>& items) {
@@ -347,8 +402,14 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     if (items.empty()) return {};
 
     int T = 0, K = 0, max_len = 0;
+    const int32_t vocab = encoder_.config().vocab_size;
     for (const LayaItem& it : items) {
         if (it.num_ids <= 0 || !it.input_ids) fail("forward_items: an item has no input ids");
+        for (int i = 0; i < it.num_ids; ++i) {
+            if (static_cast<uint32_t>(it.input_ids[i]) >= static_cast<uint32_t>(vocab)) {
+                fail("forward_items: token id " + std::to_string(it.input_ids[i]) + " outside the vocabulary");
+            }
+        }
         if (it.num_markers <= 0 || !it.marker_pos) fail("forward_items: an item has no markers");
         if (it.qtype < 0 || it.qtype > 2) fail("forward_items: qtype must be 0, 1 or 2");
         for (int k = 0; k < it.num_markers; ++k) {
@@ -382,7 +443,24 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     const int Kb = use_graphs ? pow2_at_least(std::max(K, (Tb + 7) / 8), 8) : K;
 
     if (encoder_.reserve_positions(max_len)) b.clear_graphs();
-    reserve_batch_(Tb, Nb, Kb);
+
+    // The arena: a cached graph's own when this bucket was captured (it may
+    // be an older, smaller arena), else the current one (grown if short).
+    std::shared_ptr<Arena> arena;
+#if defined(BROTENSOR_HAS_CUDA)
+    const auto key = std::make_tuple(Tb, Nb, Kb);
+    auto cached = use_graphs ? b.graphs.find(key) : b.graphs.end();
+    const bool replay = cached != b.graphs.end();
+    if (replay) arena = cached->second.arena;
+#else
+    const bool replay = false;
+#endif
+    if (!arena) {
+        reserve_batch_(Tb, Nb, Kb);
+        arena = b.cur;
+    }
+    Arena& A = *arena;
+    encoder_.set_scratch(A.enc);
 
     // Host index block. Padding rows [T, Tb) are singleton sequences of token
     // 0; padding items have empty marker segments and read row 0.
@@ -415,71 +493,67 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
         }
         for (int n = N; n <= Nb; ++n) hi[static_cast<std::size_t>(o_segs + n)] = K;
     }
-    b.idx.resize(total, 1, bt::Dtype::INT32);  // within capacity: pointer unchanged
+    A.idx.resize(total, 1, bt::Dtype::INT32);  // within capacity: pointer unchanged
     {
         StageTimer t(profiling_, timings_.encoder_ms);  // upload counts toward the encoder stage
-        b.idx.copy_from_host_raw(hi.data(), hi.size() * sizeof(int32_t));
+        A.idx.copy_from_host_raw(hi.data(), hi.size() * sizeof(int32_t));
         ++timings_.uploads;
     }
-    int32_t* base = static_cast<int32_t*>(b.idx.data);
-    b.v_ids = bt::Tensor::view(dev, base, Tb, 1, bt::Dtype::INT32);
-    b.v_pos = bt::Tensor::view(dev, base + o_pos, Tb, 1, bt::Dtype::INT32);
-    b.v_bounds = bt::Tensor::view(dev, base + o_bounds, Tb, 2, bt::Dtype::INT32);
-    b.v_type = bt::Tensor::view(dev, base + o_type, Tb, 1, bt::Dtype::INT32);
-    b.v_markers = bt::Tensor::view(dev, base + o_markers, Kb, 1, bt::Dtype::INT32);
-    b.v_starts = bt::Tensor::view(dev, base + o_starts, Nb, 1, bt::Dtype::INT32);
-    b.v_segs = bt::Tensor::view(dev, base + o_segs, Nb + 1, 1, bt::Dtype::INT32);
+    int32_t* base = static_cast<int32_t*>(A.idx.data);
+    A.v_ids = bt::Tensor::view(dev, base, Tb, 1, bt::Dtype::INT32);
+    A.v_pos = bt::Tensor::view(dev, base + o_pos, Tb, 1, bt::Dtype::INT32);
+    A.v_bounds = bt::Tensor::view(dev, base + o_bounds, Tb, 2, bt::Dtype::INT32);
+    A.v_type = bt::Tensor::view(dev, base + o_type, Tb, 1, bt::Dtype::INT32);
+    A.v_markers = bt::Tensor::view(dev, base + o_markers, Kb, 1, bt::Dtype::INT32);
+    A.v_starts = bt::Tensor::view(dev, base + o_starts, Nb, 1, bt::Dtype::INT32);
+    A.v_segs = bt::Tensor::view(dev, base + o_segs, Nb + 1, 1, bt::Dtype::INT32);
 
     bool ran = false;
 #if defined(BROTENSOR_HAS_CUDA)
-    if (use_graphs) {
-        const auto key = std::make_tuple(Tb, Nb, Kb);
-        auto it = b.graphs.find(key);
-        if (it != b.graphs.end()) {
-            it->second.launch();
-            ran = true;
-        } else {
-            run_device_(b, Tb, Nb, Kb);  // eager: sizes every output, gives this call's result
-            ran = true;
-            // A grown split-K workspace moved; graphs captured on the old one are stale.
-            if (encoder_.workspace_data() != b.ws_data) {
-                b.clear_graphs();
-                b.ws_data = encoder_.workspace_data();
+    if (replay) {
+        cached->second.graph.launch();
+        ran = true;
+    } else if (use_graphs) {
+        run_device_(A, Tb, Nb, Kb);  // eager: sizes every output, gives this call's result
+        ran = true;
+        // A grown split-K workspace moved; graphs captured on the old one are stale.
+        if (encoder_.workspace_data() != A.ws_data) {
+            b.clear_graphs_on(&A);
+            A.ws_data = encoder_.workspace_data();
+        }
+        try {
+            bt::CudaGraph g;
+            {
+                bt::CudaGraphCapture cap;
+                run_device_(A, Tb, Nb, Kb);
+                g = cap.finish();
             }
-            try {
-                bt::CudaGraph g;
-                {
-                    bt::CudaGraphCapture cap;
-                    run_device_(b, Tb, Nb, Kb);
-                    g = cap.finish();
-                }
-                if (b.graphs.size() >= kMaxGraphs) b.graphs.clear();
-                b.graphs.emplace(key, std::move(g));
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "laya: CUDA graph capture failed, running eagerly: %s\n", e.what());
-                b.graphs_broken = true;
-                b.clear_graphs();
-            }
+            if (b.graphs.size() >= kMaxGraphs) b.graphs.clear();
+            b.graphs.emplace(key, Batch::Cached{std::move(g), arena});
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "laya: CUDA graph capture failed, running eagerly: %s\n", e.what());
+            b.graphs_broken = true;
+            b.clear_graphs();
         }
     }
 #endif
-    if (!ran) run_device_(b, Tb, Nb, Kb);
+    if (!ran) run_device_(A, Tb, Nb, Kb);
 
     // One readback: logits (Kb) then act logits (2 * Nb). A replayed graph
     // skips run_device_, so `out` still has the shape of the last EAGER run;
     // set this bucket's shape (within capacity: the pointer the graph
     // writes through is unchanged).
     const int n_out = Kb + 2 * Nb;
-    b.out.resize(n_out, 1, dt);
+    A.out.resize(n_out, 1, dt);
     {
         StageTimer t(profiling_, timings_.download_ms);
         b.out_f32.resize(static_cast<std::size_t>(n_out));
-        if (b.out.dtype == bt::Dtype::FP32) {
-            b.out.copy_to_host_raw(b.out_f32.data(), b.out_f32.size() * sizeof(float));
+        if (A.out.dtype == bt::Dtype::FP32) {
+            A.out.copy_to_host_raw(b.out_f32.data(), b.out_f32.size() * sizeof(float));
         } else {
             b.out_bits.resize(static_cast<std::size_t>(n_out));
-            b.out.copy_to_host_raw(b.out_bits.data(), b.out_bits.size() * sizeof(uint16_t));
-            const bool bf = b.out.dtype == bt::Dtype::BF16;
+            A.out.copy_to_host_raw(b.out_bits.data(), b.out_bits.size() * sizeof(uint16_t));
+            const bool bf = A.out.dtype == bt::Dtype::BF16;
             for (int i = 0; i < n_out; ++i) {
                 const uint16_t v = b.out_bits[static_cast<std::size_t>(i)];
                 b.out_f32[static_cast<std::size_t>(i)] = bf ? bt::bf16_bits_to_fp32(v) : bt::fp16_bits_to_fp32(v);

@@ -2,6 +2,8 @@
 
 #include "brolm/detail/json.h"
 
+#include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -60,6 +62,10 @@ Config Config::from_json_text(const std::string& json_text) {
     cfg.head_layers  = root.get_int("head_layers",  cfg.head_layers);
     cfg.max_len      = root.get_int("max_len",      cfg.max_len);
     cfg.head_max_len = root.get_int("head_max_len", cfg.head_max_len);
+    cfg.max_prefixes = root.get_int("max_prefixes", cfg.max_prefixes);
+    cfg.encoder = root.get_string("encoder", cfg.encoder);
+    cfg.model_name = root.get_string("model_name", cfg.model_name);
+    if (cfg.max_len <= 0 || cfg.head_max_len <= 0) fail_cfg("max_len and head_max_len must be positive");
 
     if (const j::Value* t = root.find("temperature"); t && t->is_array()) {
         cfg.temperature.clear();
@@ -80,6 +86,21 @@ Config Config::from_json_text(const std::string& json_text) {
     }
 
     return cfg;
+}
+
+std::string checkpoint_variant(const Config& cfg, const std::string& model_dir) {
+    auto lower = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::string name = lower(cfg.model_name), enc = lower(cfg.encoder);
+    std::string dir = std::filesystem::path(model_dir).lexically_normal().filename().string();
+    if (dir.empty()) dir = std::filesystem::path(model_dir).lexically_normal().parent_path().filename().string();
+    dir = lower(dir);
+    if (name.find("typed-decisions") != std::string::npos || dir == "typed-decisions") return "typed-decisions";
+    if (enc.find("mmbert") != std::string::npos || dir == "multilingual") return "multilingual";
+    if (enc.find("modernbert") != std::string::npos) return "english";
+    return dir.empty() ? "unknown" : dir;
 }
 
 }  // namespace brolm::laya

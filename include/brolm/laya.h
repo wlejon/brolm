@@ -188,6 +188,14 @@ public:
     void set_graphs_enabled(bool on);
     bool graphs_enabled() const;
     std::size_t cached_graphs() const;
+    // Scratch arenas alive: the current one plus any older, smaller ones
+    // still holding captured graphs. A forward larger than every arena (a
+    // per-call max_len above what pre-warm sized) opens a new arena instead
+    // of reallocating the one the pre-warmed graphs point into, so those
+    // graphs keep replaying.
+    std::size_t scratch_arenas() const;
+    // Rows the current arena holds (0 before the first forward / pre-warm).
+    int scratch_rows() const;
 
     // The padded row count forward_items runs `tokens` packed rows at when
     // replaying graphs (16 steps per power of two, 16-row floor): the graph
@@ -258,17 +266,21 @@ private:
     bool profiling_ = false;
     LayaTimings timings_;
 
-    // Packed-batch scratch, index buffers and the CUDA-graph cache
+    // Packed-batch scratch arenas, index buffers and the CUDA-graph cache
     // (laya_batch.cpp).
+    struct Arena;
     struct Batch;
     std::unique_ptr<Batch> batch_;
     Batch& batch();
     void reset_batch_();
-    void reserve_batch_(int T, int N, int K);
+    // The arena a forward of T rows / N items / K markers runs on: the
+    // current one when it fits, else a new, larger one (the old one lives on
+    // for the graphs captured on it).
+    Arena& reserve_batch_(int T, int N, int K);
     // Y = epilogue(act(X · Wᵀ + b)) on the encoder's split-K workspace.
     void linear_(const brotensor::Tensor& W, const brotensor::Tensor& b, const brotensor::Tensor& X, int act,
                  int epilogue, brotensor::Tensor& Y);
-    void run_device_(Batch& b, int T, int N, int K);
+    void run_device_(Arena& a, int T, int N, int K);
 };
 
 }  // namespace brolm::laya

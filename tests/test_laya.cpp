@@ -215,6 +215,58 @@ void test_real_checkpoint(const std::string& model_dir) {
     std::cout << "Test 2 passed successfully!" << std::endl;
 }
 
+// A forward larger than the pre-warmed scratch (a per-call max_len far above
+// the checkpoint's) must not throw away the pre-warmed CUDA graphs: it opens
+// a second scratch arena, captures its own bucket there, and the small
+// buckets keep replaying their graphs on the first arena, with the same
+// results.
+void test_oversize_keeps_graphs() {
+    std::cout << "--- Running Test 3: oversized forward keeps pre-warmed graphs ---" << std::endl;
+    if (brotensor::default_device().type != brotensor::DeviceType::CUDA) {
+        std::cout << "SKIP: no CUDA device" << std::endl;
+        return;
+    }
+    brolm::modernbert::Config enc_cfg;
+    enc_cfg.hidden_size = 128;
+    enc_cfg.intermediate_size = 256;
+    enc_cfg.num_hidden_layers = 2;
+    enc_cfg.num_attention_heads = 2;
+    enc_cfg.local_attention = 16;
+    enc_cfg.layer_types = {"full_attention", "sliding_attention"};
+    brolm::laya::Config laya_cfg;
+    laya_cfg.max_len = 256;
+    laya_cfg.head_max_len = 64;
+
+    brolm::laya::DecisionModel model;
+    model.init_synthetic(enc_cfg, laya_cfg);
+    model.prewarm_graphs(512);
+    const std::size_t g0 = model.cached_graphs();
+    const int rows0 = model.scratch_rows();
+    check(g0 > 0 && model.scratch_arenas() == 1, "pre-warm: graphs on one arena");
+
+    std::vector<int32_t> small(100), big(3000);
+    for (std::size_t i = 0; i < small.size(); ++i) small[i] = static_cast<int32_t>(100 + (i * 37) % 5000);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<int32_t>(100 + (i * 53) % 5000);
+    const std::vector<int32_t> markers = {3, 9, 20};
+    const brolm::laya::LayaItem small_item{small.data(), 100, markers.data(), 3, 0};
+    const brolm::laya::LayaItem big_item{big.data(), 3000, markers.data(), 3, 1};
+
+    const auto before = model.forward_items({small_item});
+    check(model.cached_graphs() == g0, "a pre-warmed bucket replays without a capture");
+    model.forward_items({big_item});
+    check(model.scratch_rows() >= 3000 && model.scratch_rows() > rows0, "the oversized forward got its own arena");
+    check(model.scratch_arenas() == 2, "the pre-warmed arena stays alive beside the new one");
+    check(model.cached_graphs() == g0 + 1, "the oversized forward captured one graph and dropped none");
+    const auto after = model.forward_items({small_item});
+    check(model.cached_graphs() == g0 + 1, "the small bucket still replays its pre-warmed graph");
+    for (std::size_t k = 0; k < before[0].logits.size(); ++k) {
+        check(before[0].logits[k] == after[0].logits[k], "the replayed graph gives the same logits");
+    }
+    std::cout << "graphs " << g0 << " -> " << model.cached_graphs() << ", arenas " << model.scratch_arenas()
+              << ", rows " << rows0 << " -> " << model.scratch_rows() << std::endl;
+    std::cout << "Test 3 passed successfully!" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -225,6 +277,7 @@ int main() {
     // init() brotensor only has CPU, and the 421M model then takes over a
     // minute on FP32 CPU kernels.
     brotensor::init();
+    test_oversize_keeps_graphs();
 
     const char* env_dir = std::getenv("LAYA_MODEL_DIR");
     std::string model_dir = (env_dir && env_dir[0]) ? env_dir : "D:/projects/laya";

@@ -227,24 +227,25 @@ void ModernBertModel::reserve_rows(int T) {
     const int F = cfg_.intermediate_size;
     const bt::Device dev = bt::default_device();
     const bt::Dtype dt = brolm::compute_dtype();
-    brolm::detail::resize_like(embeds_, T, D, dt, dev);
-    brolm::detail::resize_like(h_, T, D, dt, dev);
-    brolm::detail::resize_like(attn_in_, T, D, dt, dev);
-    brolm::detail::resize_like(qkv_, T, 3 * D, dt, dev);
-    brolm::detail::resize_like(attn_out_, T, D, dt, dev);
-    brolm::detail::resize_like(mlp_in_, T, D, dt, dev);
-    brolm::detail::resize_like(geglu_out_, T, F, dt, dev);
+    Scratch& S = *s_;
+    brolm::detail::resize_like(S.embeds, T, D, dt, dev);
+    brolm::detail::resize_like(S.h, T, D, dt, dev);
+    brolm::detail::resize_like(S.attn_in, T, D, dt, dev);
+    brolm::detail::resize_like(S.qkv, T, 3 * D, dt, dev);
+    brolm::detail::resize_like(S.attn_out, T, D, dt, dev);
+    brolm::detail::resize_like(S.mlp_in, T, D, dt, dev);
+    brolm::detail::resize_like(S.geglu_out, T, F, dt, dev);
     // Split-K only engages while a product's output tiles underfill the GPU,
     // which caps its partials near 2 * SMs * 64 * 64 * splits-per-tile; 2M
     // floats (8 MB) covers a 128-SM part, and the op grows it if ever short.
-    if (ws_.rows * ws_.cols < kWorkspaceFloats) {
-        ws_ = bt::Tensor::zeros_on(dev, 1, kWorkspaceFloats, bt::Dtype::FP32);
+    if (S.ws.rows * S.ws.cols < kWorkspaceFloats) {
+        S.ws = bt::Tensor::zeros_on(dev, 1, kWorkspaceFloats, bt::Dtype::FP32);
     }
 }
 
 void ModernBertModel::linear(const bt::Tensor& W, const bt::Tensor& X, int epilogue, bt::Tensor& Y) {
     bt::linear_forward_batched_ex(W, nullptr, X, bt::kLinearActNone, epilogue | (fast_accum_ ? bt::kLinearEpiFastAccum : 0),
-                                  &ws_, Y);
+                                  &s_->ws, Y);
 }
 
 void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor& h_out) {
@@ -257,9 +258,9 @@ void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor&
         idx[static_cast<std::size_t>(2 * seq_len + 2 * r + 1)] = seq_len;
     }
     const bt::Device dev = bt::default_device();
-    single_idx_ = bt::Tensor::from_raw_bytes_on(dev, idx.data(), seq_len * 4, 1, bt::Dtype::INT32,
-                                                idx.size() * sizeof(int32_t));
-    int32_t* base = static_cast<int32_t*>(single_idx_.data);
+    s_->single_idx = bt::Tensor::from_raw_bytes_on(dev, idx.data(), seq_len * 4, 1, bt::Dtype::INT32,
+                                                   idx.size() * sizeof(int32_t));
+    int32_t* base = static_cast<int32_t*>(s_->single_idx.data);
     const bt::Tensor ids = bt::Tensor::view(dev, base, seq_len, 1, bt::Dtype::INT32);
     const bt::Tensor pos = bt::Tensor::view(dev, base + seq_len, seq_len, 1, bt::Dtype::INT32);
     const bt::Tensor bounds = bt::Tensor::view(dev, base + 2 * seq_len, seq_len, 2, bt::Dtype::INT32);
@@ -281,34 +282,35 @@ void ModernBertModel::forward_packed(const PackedInputs& in, bt::Tensor& h_out) 
     EncoderTimings& T = timings_;
     if (prof) ++T.forwards;
 
+    Scratch& S = *s_;
     {
         FamilyTimer t(prof, T.embed_ms);
         bt::embedding_lookup_forward(tok_embeddings_, static_cast<const int32_t*>(in.ids->data),
-                                     seq_len, embeds_);
-        layernorm_bias_free(embeds_, embed_norm_, h_, eps);
+                                     seq_len, S.embeds);
+        layernorm_bias_free(S.embeds, embed_norm_, S.h, eps);
     }
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         LayerWeights& L = layers_[static_cast<std::size_t>(i)];
 
-        // ── Attention block ── (layer 0 has no attn_norm: attend over h_)
-        const bt::Tensor* attn_in = &h_;
+        // ── Attention block ── (layer 0 has no attn_norm: attend over h)
+        const bt::Tensor* attn_in = &S.h;
         if (i > 0) {
             FamilyTimer t(prof, T.norm_ms);
-            layernorm_bias_free(h_, L.attn_norm, attn_in_, eps);
-            attn_in = &attn_in_;
+            layernorm_bias_free(S.h, L.attn_norm, S.attn_in, eps);
+            attn_in = &S.attn_in;
         }
 
         {
             FamilyTimer t(prof, T.qkv_ms);
-            linear(L.Wqkv, *attn_in, bt::kLinearEpiStore, qkv_);
+            linear(L.Wqkv, *attn_in, bt::kLinearEpiStore, S.qkv);
         }
 
         // RoPE in place on the Q/K sections, each row at its own position.
         const bool is_slid = cfg_.is_sliding(i);
         {
             FamilyTimer t(prof, T.rope_ms);
-            bt::rope_qkv_packed_inplace(qkv_, is_slid ? cos_slid_ : cos_full_,
+            bt::rope_qkv_packed_inplace(S.qkv, is_slid ? cos_slid_ : cos_full_,
                                         is_slid ? sin_slid_ : sin_full_, *in.pos, H, head_dim);
         }
 
@@ -316,34 +318,34 @@ void ModernBertModel::forward_packed(const PackedInputs& in, bt::Tensor& h_out) 
         // |q - k| <= local_attention / 2 — brotensor's bidirectional `window`.
         {
             FamilyTimer t(prof, is_slid ? T.attn_local_ms : T.attn_full_ms);
-            bt::flash_attention_packed_qkv_forward(qkv_, *in.bounds, H,
-                                                   is_slid ? cfg_.local_attention : 0, attn_out_);
+            bt::flash_attention_packed_qkv_forward(S.qkv, *in.bounds, H,
+                                                   is_slid ? cfg_.local_attention : 0, S.attn_out);
         }
 
         {
             // Output projection with the residual add fused into its store.
             FamilyTimer t(prof, T.wo_ms);
-            linear(L.Wo, attn_out_, bt::kLinearEpiAccumulate, h_);
+            linear(L.Wo, S.attn_out, bt::kLinearEpiAccumulate, S.h);
         }
 
         // ── MLP block ──
         {
             FamilyTimer t(prof, T.norm_ms);
-            layernorm_bias_free(h_, L.mlp_norm, mlp_in_, eps);
+            layernorm_bias_free(S.h, L.mlp_norm, S.mlp_in, eps);
         }
         {
             // Wi with GeGLU fused into its store (rows interleaved at load).
             FamilyTimer t(prof, T.mlp_in_ms);
-            linear(L.mlp_Wi, mlp_in_, bt::kLinearEpiGeglu, geglu_out_);
+            linear(L.mlp_Wi, S.mlp_in, bt::kLinearEpiGeglu, S.geglu_out);
         }
         {
             FamilyTimer t(prof, T.mlp_out_ms);
-            linear(L.mlp_Wo, geglu_out_, bt::kLinearEpiAccumulate, h_);
+            linear(L.mlp_Wo, S.geglu_out, bt::kLinearEpiAccumulate, S.h);
         }
     }
 
     FamilyTimer t(prof, T.norm_ms);
-    layernorm_bias_free(h_, final_norm_, h_out, eps);
+    layernorm_bias_free(S.h, final_norm_, h_out, eps);
 }
 
 }  // namespace brolm::modernbert

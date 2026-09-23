@@ -5,6 +5,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -91,18 +92,31 @@ public:
     // neither allocate nor move a buffer.
     void reserve_rows(int T);
 
+    // Every activation buffer a forward writes, plus the split-K workspace.
+    // A captured CUDA graph holds these pointers, so a caller that keeps
+    // graphs across a regrow gives the encoder a FRESH scratch set to grow
+    // (set_scratch) and keeps the old one alive for the old graphs, instead
+    // of reallocating the one they captured.
+    struct Scratch {
+        brotensor::Tensor single_idx;  // forward(): ids | pos | bounds of one sequence
+        brotensor::Tensor embeds, h, attn_in, qkv, attn_out, mlp_in, geglu_out;
+        brotensor::Tensor ws;  // split-K partials (FP32)
+    };
+    const std::shared_ptr<Scratch>& scratch() const { return s_; }
+    void set_scratch(std::shared_ptr<Scratch> s) { s_ = s ? std::move(s) : std::make_shared<Scratch>(); }
+
     // FP32 split-K scratch every linear here passes to
     // linear_forward_batched_ex; callers running their own linears in the same
     // graph may share it. Its device pointer is part of a captured graph:
     // reserve_rows() pre-sizes it so it does not move in practice, and a
     // caller holding graphs re-checks workspace_data() after an eager run.
-    brotensor::Tensor& gemm_workspace() { return ws_; }
+    brotensor::Tensor& gemm_workspace() { return s_->ws; }
 
     // Let FP16 linears accumulate each k16 step in FP16 before folding into
     // FP32 (brotensor kLinearEpiFastAccum): ~2x tensor rate on consumer GPUs.
     void set_fast_accum(bool on) { fast_accum_ = on; }
     bool fast_accum() const { return fast_accum_; }
-    const void* workspace_data() const { return ws_.data; }
+    const void* workspace_data() const { return s_->ws.data; }
 
     // Per-op-family timing (syncs between families; slows the forward).
     void set_profiling(bool on) { profiling_ = on; }
@@ -121,16 +135,7 @@ private:
     std::vector<LayerWeights> layers_;
     brotensor::Tensor final_norm_;      // (hidden_size, 1)
 
-    // Intermediate scratch buffers
-    brotensor::Tensor single_idx_;  // forward(): ids | pos | bounds of one sequence
-    brotensor::Tensor embeds_;
-    brotensor::Tensor h_;
-    brotensor::Tensor attn_in_;
-    brotensor::Tensor qkv_;
-    brotensor::Tensor attn_out_;
-    brotensor::Tensor mlp_in_;
-    brotensor::Tensor geglu_out_;
-    brotensor::Tensor ws_;  // split-K partials (FP32)
+    std::shared_ptr<Scratch> s_ = std::make_shared<Scratch>();
     bool fast_accum_ = false;
     static constexpr int kWorkspaceFloats = 2 << 20;
 
