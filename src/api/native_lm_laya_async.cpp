@@ -172,6 +172,9 @@ void shutdownLaya() {
     for (auto& s : live) s->shutdown();
 }
 
-void shutdownLM() { shutdownLaya(); }
+void shutdownLM() {
+    shutdownLMJobs();  // this thread's bro.lm.generate / async-load workers
+    shutdownLaya();
+}
 
 }  // namespace brolm::api

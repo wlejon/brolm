@@ -200,6 +200,7 @@ static void decorateNllbModel(ObjectBuilder& b) {
     });
 
     b.def("translate", 3, [](Value self, std::span<const Value> a) -> Value {
+        ev::Persistent selfRoot(self);  // an async job keeps the model alive
         auto* w = hostNllbModelOf(self);
         if (!w || !w->tr) return ev::throwTypeError("translate: not an NllbModel");
         if (a.size() < 3 || !ev::isString(a[0]) || !ev::isString(a[1]) || !ev::isString(a[2]))
@@ -215,13 +216,44 @@ static void decorateNllbModel(ObjectBuilder& b) {
             return ev::throwTypeError("translate: unknown target language: " + tgt);
 
         brolm::nllb::BeamOptions bopts;
+        ev::Persistent onDone, onError;
         if (a.size() >= 4 && ev::isObject(a[3])) {
-            Value nb = ev::getProperty(a[3], "numBeams");
-            if (ev::isNumber(nb)) bopts.num_beams = static_cast<int>(ev::toDouble(nb));
-            Value mnt = ev::getProperty(a[3], "maxNewTokens");
-            if (ev::isNumber(mnt)) bopts.max_new_tokens = static_cast<int>(ev::toDouble(mnt));
-            Value lp = ev::getProperty(a[3], "lengthPenalty");
-            if (ev::isNumber(lp)) bopts.length_penalty = static_cast<float>(ev::toDouble(lp));
+            double d = 0;
+            if (propNumber(a[3], "numBeams", d)) bopts.num_beams = static_cast<int>(d);
+            if (propNumber(a[3], "maxNewTokens", d)) bopts.max_new_tokens = static_cast<int>(d);
+            if (propNumber(a[3], "lengthPenalty", d)) bopts.length_penalty = static_cast<float>(d);
+            onDone.set(ev::getProperty(a[3], "onDone"));
+            onError.set(ev::getProperty(a[3], "onError"));
+        }
+        if (bopts.num_beams <= 0) return ev::throwRangeError("translate: opts.numBeams must be > 0");
+        if (bopts.max_new_tokens <= 0) return ev::throwRangeError("translate: opts.maxNewTokens must be > 0");
+
+        BusyClaim claim(w->translating);
+        if (!claim.ok()) return ev::throwError("translate: a translation is already in flight on this model");
+
+        // opts.onDone(text): the beam search runs on a worker thread and the
+        // call returns an AsyncHandle; onDone fires on this thread's tick
+        // (nothing after cancel(); a failure goes to onError).
+        if (ev::isFunction(onDone.get())) {
+            auto job = newAsyncJob();
+            job->keep.set(selfRoot.get());
+            job->onDone.set(onDone.get());
+            if (ev::isFunction(onError.get())) job->onError.set(onError.get());
+            job->busy = claim.detach();
+            auto out = std::make_shared<std::string>();
+            job->finish = [out](AsyncJob& j) {
+                if (j.core->cancelled()) return;
+                if (!j.core->error.empty()) {
+                    reportJobError(j, "translate: " + j.core->error);
+                    return;
+                }
+                ev::Persistent s(ev::fromUtf8(*out));
+                callRooted(j.onDone, {&s});
+            };
+            return launchAsyncJob(job, [w, out, text, src, tgt, bopts](AsyncCore&) {
+                brotensor::DeviceScope scope(w->device);
+                *out = w->tr->translate(text, src, tgt, bopts);
+            });
         }
 
         try {
@@ -390,70 +422,51 @@ static void parseClipConfigJson(const json::Value& root,
     else parseVisionConfigJson(root, visionCfg);
 }
 
+// The first of `keys` present as a number on `obj`.
+static bool numAny(Value obj, std::initializer_list<std::string_view> keys, double& out) {
+    if (!ev::isObject(obj)) return false;
+    ev::Persistent o(obj);
+    for (std::string_view k : keys)
+        if (propNumber(o.get(), k, out)) return true;
+    return false;
+}
+
 static void parseTextConfigJs(Value tc, brolm::clip::TextEncoderConfig& cfg) {
     if (!ev::isObject(tc)) return;
-    Value v;
-    v = ev::getProperty(tc, "vocabSize"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "vocab_size");
-    if (ev::isNumber(v)) cfg.vocab_size = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "maxPosition"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "max_position");
-    if (!ev::isNumber(v)) v = ev::getProperty(tc, "max_position_embeddings");
-    if (ev::isNumber(v)) cfg.max_position = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "hiddenDim"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "hidden_dim");
-    if (!ev::isNumber(v)) v = ev::getProperty(tc, "hidden_size");
-    if (ev::isNumber(v)) cfg.hidden_dim = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "numHeads"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_heads");
-    if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_attention_heads");
-    if (ev::isNumber(v)) cfg.num_heads = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "numLayers"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_layers");
-    if (!ev::isNumber(v)) v = ev::getProperty(tc, "num_hidden_layers");
-    if (ev::isNumber(v)) cfg.num_layers = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "intermediateDim"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "intermediate_dim");
-    if (!ev::isNumber(v)) v = ev::getProperty(tc, "intermediate_size");
-    if (ev::isNumber(v)) cfg.intermediate_dim = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "layerNormEps"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "layer_norm_eps");
-    if (ev::isNumber(v)) cfg.layer_norm_eps = static_cast<float>(ev::toDouble(v));
-
-    v = ev::getProperty(tc, "eosTokenId"); if (!ev::isNumber(v)) v = ev::getProperty(tc, "eos_token_id");
-    if (ev::isNumber(v)) cfg.eos_token_id = static_cast<int>(ev::toDouble(v));
+    ev::Persistent o(tc);
+    double d = 0;
+    if (numAny(o.get(), {"vocabSize", "vocab_size"}, d)) cfg.vocab_size = static_cast<int>(d);
+    if (numAny(o.get(), {"maxPosition", "max_position", "max_position_embeddings"}, d)) cfg.max_position = static_cast<int>(d);
+    if (numAny(o.get(), {"hiddenDim", "hidden_dim", "hidden_size"}, d)) cfg.hidden_dim = static_cast<int>(d);
+    if (numAny(o.get(), {"numHeads", "num_heads", "num_attention_heads"}, d)) cfg.num_heads = static_cast<int>(d);
+    if (numAny(o.get(), {"numLayers", "num_layers", "num_hidden_layers"}, d)) cfg.num_layers = static_cast<int>(d);
+    if (numAny(o.get(), {"intermediateDim", "intermediate_dim", "intermediate_size"}, d)) cfg.intermediate_dim = static_cast<int>(d);
+    if (numAny(o.get(), {"layerNormEps", "layer_norm_eps"}, d)) cfg.layer_norm_eps = static_cast<float>(d);
+    if (numAny(o.get(), {"eosTokenId", "eos_token_id"}, d)) cfg.eos_token_id = static_cast<int>(d);
 }
 
 static void parseVisionConfigJs(Value vc, brolm::clip_image::ImageEncoderConfig& cfg) {
     if (!ev::isObject(vc)) return;
-    Value v;
-    v = ev::getProperty(vc, "imageSize"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "image_size");
-    if (ev::isNumber(v)) cfg.image_size = static_cast<int>(ev::toDouble(v));
+    ev::Persistent o(vc);
+    double d = 0;
+    if (numAny(o.get(), {"imageSize", "image_size"}, d)) cfg.image_size = static_cast<int>(d);
+    if (numAny(o.get(), {"patchSize", "patch_size"}, d)) cfg.patch_size = static_cast<int>(d);
+    if (numAny(o.get(), {"inChannels", "in_channels", "num_channels"}, d)) cfg.in_channels = static_cast<int>(d);
+    if (numAny(o.get(), {"hiddenDim", "hidden_dim", "hidden_size"}, d)) cfg.hidden_dim = static_cast<int>(d);
+    if (numAny(o.get(), {"numHeads", "num_heads", "num_attention_heads"}, d)) cfg.num_heads = static_cast<int>(d);
+    if (numAny(o.get(), {"numLayers", "num_layers", "num_hidden_layers"}, d)) cfg.num_layers = static_cast<int>(d);
+    if (numAny(o.get(), {"intermediateDim", "intermediate_dim", "intermediate_size"}, d)) cfg.intermediate_dim = static_cast<int>(d);
+    if (numAny(o.get(), {"layerNormEps", "layer_norm_eps"}, d)) cfg.layer_norm_eps = static_cast<float>(d);
+}
 
-    v = ev::getProperty(vc, "patchSize"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "patch_size");
-    if (ev::isNumber(v)) cfg.patch_size = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(vc, "inChannels"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "in_channels");
-    if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_channels");
-    if (ev::isNumber(v)) cfg.in_channels = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(vc, "hiddenDim"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "hidden_dim");
-    if (!ev::isNumber(v)) v = ev::getProperty(vc, "hidden_size");
-    if (ev::isNumber(v)) cfg.hidden_dim = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(vc, "numHeads"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_heads");
-    if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_attention_heads");
-    if (ev::isNumber(v)) cfg.num_heads = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(vc, "numLayers"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_layers");
-    if (!ev::isNumber(v)) v = ev::getProperty(vc, "num_hidden_layers");
-    if (ev::isNumber(v)) cfg.num_layers = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(vc, "intermediateDim"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "intermediate_dim");
-    if (!ev::isNumber(v)) v = ev::getProperty(vc, "intermediate_size");
-    if (ev::isNumber(v)) cfg.intermediate_dim = static_cast<int>(ev::toDouble(v));
-
-    v = ev::getProperty(vc, "layerNormEps"); if (!ev::isNumber(v)) v = ev::getProperty(vc, "layer_norm_eps");
-    if (ev::isNumber(v)) cfg.layer_norm_eps = static_cast<float>(ev::toDouble(v));
+// The first of `keys` present as an object on `root`, or undefined.
+static Value objAny(Value root, std::initializer_list<std::string_view> keys) {
+    ev::Persistent o(root);
+    for (std::string_view k : keys) {
+        Value v = ev::getProperty(o.get(), k);
+        if (ev::isObject(v)) return v;
+    }
+    return ev::undefined();
 }
 
 static void parseClipConfigJs(Value root,
@@ -461,58 +474,45 @@ static void parseClipConfigJs(Value root,
                               brolm::clip_image::ImageEncoderConfig& visionCfg,
                               brolm::clip_score::Config& scoreCfg) {
     if (!ev::isObject(root)) return;
-    Value v = ev::getProperty(root, "projectionDim");
-    if (!ev::isNumber(v)) v = ev::getProperty(root, "projection_dim");
-    if (ev::isNumber(v)) scoreCfg.projection_dim = static_cast<int>(ev::toDouble(v));
+    ev::Persistent r(root);
+    double d = 0;
+    if (numAny(r.get(), {"projectionDim", "projection_dim"}, d)) scoreCfg.projection_dim = static_cast<int>(d);
 
-    Value tc = ev::getProperty(root, "textConfig");
-    if (!ev::isObject(tc)) tc = ev::getProperty(root, "text_config");
-    if (!ev::isObject(tc)) tc = ev::getProperty(root, "text");
-    if (ev::isObject(tc)) parseTextConfigJs(tc, textCfg);
-    else parseTextConfigJs(root, textCfg);
+    ev::Persistent tc(objAny(r.get(), {"textConfig", "text_config", "text"}));
+    parseTextConfigJs(ev::isObject(tc.get()) ? tc.get() : r.get(), textCfg);
 
-    Value vc = ev::getProperty(root, "visionConfig");
-    if (!ev::isObject(vc)) vc = ev::getProperty(root, "vision_config");
-    if (!ev::isObject(vc)) vc = ev::getProperty(root, "vision");
-    if (ev::isObject(vc)) parseVisionConfigJs(vc, visionCfg);
-    else parseVisionConfigJs(root, visionCfg);
+    ev::Persistent vc(objAny(r.get(), {"visionConfig", "vision_config", "vision"}));
+    parseVisionConfigJs(ev::isObject(vc.get()) ? vc.get() : r.get(), visionCfg);
 }
 
 Value js_loadClip(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isObject(a[0]))
         return ev::throwTypeError("loadClip(opts): opts object required");
 
-    Value opts = a[0];
-    Value vp = ev::getProperty(opts, "vocabPath");
-    Value mp = ev::getProperty(opts, "mergesPath");
-    if (!ev::isString(vp) || !ev::isString(mp))
+    // a[0] is a rooted argument slot: current across every read below.
+    const Value& opts = a[0];
+    std::string vocab, merges;
+    if (!propString(opts, "vocabPath", vocab) || !propString(opts, "mergesPath", merges))
         return ev::throwTypeError("loadClip: opts.vocabPath and opts.mergesPath required");
-
-    std::string vocab = ev::toUtf8(vp);
-    std::string merges = ev::toUtf8(mp);
+    vocab = resolvePath(vocab);
+    merges = resolvePath(merges);
 
     std::string weights;
-    Value wp = ev::getProperty(opts, "weightsPath");
-    if (ev::isString(wp)) weights = ev::toUtf8(wp);
+    if (propString(opts, "weightsPath", weights)) weights = resolvePath(weights);
 
     std::string textPath = weights, imagePath = weights, projPath = weights;
-    Value tp = ev::getProperty(opts, "textPath");
-    if (ev::isString(tp)) textPath = ev::toUtf8(tp);
-    Value ip = ev::getProperty(opts, "imagePath");
-    if (ev::isString(ip)) imagePath = ev::toUtf8(ip);
-    Value pp = ev::getProperty(opts, "projectionPath");
-    if (ev::isString(pp)) projPath = ev::toUtf8(pp);
+    std::string s;
+    if (propString(opts, "textPath", s)) textPath = resolvePath(s);
+    if (propString(opts, "imagePath", s)) imagePath = resolvePath(s);
+    if (propString(opts, "projectionPath", s)) projPath = resolvePath(s);
 
     if (textPath.empty() || imagePath.empty() || projPath.empty())
         return ev::throwTypeError("loadClip: opts.weightsPath or opts.textPath+imagePath+projectionPath required");
 
     std::string textPrefix = "text_model.", visionPrefix = "vision_model.", projPrefix = "";
-    Value vtp = ev::getProperty(opts, "textPrefix");
-    if (ev::isString(vtp)) textPrefix = ev::toUtf8(vtp);
-    Value vip = ev::getProperty(opts, "visionPrefix");
-    if (ev::isString(vip)) visionPrefix = ev::toUtf8(vip);
-    Value vpp = ev::getProperty(opts, "projectionPrefix");
-    if (ev::isString(vpp)) projPrefix = ev::toUtf8(vpp);
+    propString(opts, "textPrefix", textPrefix);
+    propString(opts, "visionPrefix", visionPrefix);
+    propString(opts, "projectionPrefix", projPrefix);
 
     brotensor::init();
     brotensor::Device dev = autoDevice();
@@ -525,15 +525,8 @@ Value js_loadClip(Value, std::span<const Value> a) {
     brolm::clip_score::Config scoreCfg;
 
     std::string configPath;
-    Value cpVal = ev::getProperty(opts, "configPath");
-    if (ev::isString(cpVal)) {
-        configPath = ev::toUtf8(cpVal);
-    } else {
-        Value cVal = ev::getProperty(opts, "config");
-        if (ev::isString(cVal)) {
-            configPath = ev::toUtf8(cVal);
-        }
-    }
+    if (propString(opts, "configPath", configPath) || propString(opts, "config", configPath))
+        configPath = resolvePath(configPath);
 
     if (configPath.empty()) {
         std::vector<std::string> probeCandidates = { weights, textPath, vocab };
@@ -603,7 +596,7 @@ Value js_loadClip(Value, std::span<const Value> a) {
 Value js_loadNllb(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isString(a[0]))
         return ev::throwTypeError("loadNllb(checkpointDir, opts?): dir string required");
-    std::string dir = ev::toUtf8(a[0]);
+    const std::string dir = resolvePath(ev::toUtf8(a[0]));
 
     brotensor::init();
     brotensor::Device dev = autoDevice();
@@ -613,56 +606,61 @@ Value js_loadNllb(Value, std::span<const Value> a) {
             return ev::throwTypeError(err);
     }
 
-    try {
-        brotensor::DeviceScope scope(dev);
-        auto tr = std::make_unique<brolm::nllb::Translator>(
-            brolm::nllb::Translator::load(dir));
-        return makeNllbModelValue(std::move(tr), dev);
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("loadNllb: ") + e.what());
-    }
+    struct Built { std::unique_ptr<brolm::nllb::Translator> tr; };
+    return runLoad<Built>(a, 1, "loadNllb",
+        [dir, dev](Built& b) {
+            brotensor::DeviceScope scope(dev);
+            b.tr = std::make_unique<brolm::nllb::Translator>(brolm::nllb::Translator::load(dir));
+        },
+        [dev](Built& b) { return makeNllbModelValue(std::move(b.tr), dev); });
 }
 
 Value js_loadT5(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isObject(a[0]))
         return ev::throwTypeError("loadT5(opts): opts object required");
 
-    Value opts = a[0];
-    Value tp = ev::getProperty(opts, "tokenizerPath");
-    if (!ev::isString(tp))
+    // a[0] is a rooted argument slot: current across every read below.
+    const Value& opts = a[0];
+    std::string tokPath;
+    if (!propString(opts, "tokenizerPath", tokPath))
         return ev::throwTypeError("loadT5: opts.tokenizerPath (tokenizer.json) required");
-    std::string tokPath = ev::toUtf8(tp);
+    tokPath = resolvePath(tokPath);
 
     std::string gguf, weights;
-    Value gp = ev::getProperty(opts, "ggufPath");
-    if (ev::isString(gp)) gguf = ev::toUtf8(gp);
-    Value wp = ev::getProperty(opts, "weightsPath");
-    if (ev::isString(wp)) weights = ev::toUtf8(wp);
+    if (propString(opts, "ggufPath", gguf)) gguf = resolvePath(gguf);
+    if (propString(opts, "weightsPath", weights)) weights = resolvePath(weights);
 
-    std::vector<std::string> shards;
-    Value sv = ev::getProperty(opts, "shards");
-    if (ev::isObject(sv)) {
-        Value lenVal = ev::getProperty(sv, "length");
-        if (ev::isNumber(lenVal)) {
-            uint32_t n = static_cast<uint32_t>(ev::toDouble(lenVal));
-            for (uint32_t i = 0; i < n; ++i) {
-                Value e = ev::getElement(sv, i);
-                if (ev::isString(e)) shards.push_back(ev::toUtf8(e));
-            }
-        }
-    }
+    std::vector<std::string> shards = readStringArray(ev::getProperty(opts, "shards"));
+    for (auto& s : shards) s = resolvePath(s);
 
     if (gguf.empty() && weights.empty() && shards.empty())
         return ev::throwTypeError("loadT5: opts.ggufPath, opts.weightsPath, or opts.shards required");
 
     std::string prefix = "";
-    Value prefVal = ev::getProperty(opts, "prefix");
-    if (ev::isString(prefVal)) prefix = ev::toUtf8(prefVal);
+    propString(opts, "prefix", prefix);
 
     int maxLength = 512;
-    Value mlVal = ev::getProperty(opts, "maxLength");
-    if (ev::isNumber(mlVal)) maxLength = static_cast<int>(ev::toDouble(mlVal));
-    if (maxLength <= 0) maxLength = 512;
+    double d = 0;
+    if (propNumber(opts, "maxLength", d)) maxLength = static_cast<int>(d);
+    if (maxLength <= 0)
+        return ev::throwTypeError("loadT5: opts.maxLength must be > 0");
+    // INT8 (W8A16) attention/FFN weights; honoured on a GPU backend.
+    bool quantize = false;
+    propBool(opts, "quantizeWeights", quantize);
+
+    // Architecture overrides for safetensors/shard loads (a GGUF carries its own).
+    brolm::t5::T5Config cfgOverride;
+    {
+        ev::Persistent cv(ev::getProperty(opts, "config"));
+        if (ev::isObject(cv.get())) {
+            if (propNumber(cv.get(), "vocabSize", d)) cfgOverride.vocab_size = static_cast<int>(d);
+            if (propNumber(cv.get(), "dModel", d))    cfgOverride.d_model = static_cast<int>(d);
+            if (propNumber(cv.get(), "dFf", d))       cfgOverride.d_ff = static_cast<int>(d);
+            if (propNumber(cv.get(), "dKv", d))       cfgOverride.d_kv = static_cast<int>(d);
+            if (propNumber(cv.get(), "numHeads", d))  cfgOverride.num_heads = static_cast<int>(d);
+            if (propNumber(cv.get(), "numLayers", d)) cfgOverride.num_layers = static_cast<int>(d);
+        }
+    }
 
     brotensor::init();
     brotensor::Device dev = autoDevice();
@@ -682,21 +680,13 @@ Value js_loadT5(Value, std::span<const Value> a) {
         if (!gguf.empty()) {
             brotensor::gguf::File f = brotensor::gguf::File::open(gguf);
             brolm::t5::T5Config cfg = brolm::t5::T5Config::from_gguf(f);
+            cfg.quantize_weights = quantize;
             w->enc = std::make_unique<brolm::t5::TextEncoder>(cfg);
             w->enc->load_weights(f);
             w->dModel = cfg.d_model;
         } else {
-            brolm::t5::T5Config cfg;
-            Value cv = ev::getProperty(opts, "config");
-            if (ev::isObject(cv)) {
-                Value v;
-                v = ev::getProperty(cv, "vocabSize"); if (ev::isNumber(v)) cfg.vocab_size = static_cast<int>(ev::toDouble(v));
-                v = ev::getProperty(cv, "dModel");    if (ev::isNumber(v)) cfg.d_model = static_cast<int>(ev::toDouble(v));
-                v = ev::getProperty(cv, "dFf");       if (ev::isNumber(v)) cfg.d_ff = static_cast<int>(ev::toDouble(v));
-                v = ev::getProperty(cv, "dKv");       if (ev::isNumber(v)) cfg.d_kv = static_cast<int>(ev::toDouble(v));
-                v = ev::getProperty(cv, "numHeads");  if (ev::isNumber(v)) cfg.num_heads = static_cast<int>(ev::toDouble(v));
-                v = ev::getProperty(cv, "numLayers"); if (ev::isNumber(v)) cfg.num_layers = static_cast<int>(ev::toDouble(v));
-            }
+            brolm::t5::T5Config cfg = cfgOverride;
+            cfg.quantize_weights = quantize;
             w->enc = std::make_unique<brolm::t5::TextEncoder>(cfg);
 
             if (!shards.empty()) {

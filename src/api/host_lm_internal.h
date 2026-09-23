@@ -78,20 +78,49 @@ struct HostAsyncHandle {
     }
 };
 
+// Single-owner claim on a model's `generating`/`translating` flag: a decode
+// drives the model's KV-cache in place, so a second overlapping call (a sync
+// call while a bro.lm.generate job runs on a worker, or two jobs) would
+// interleave writes into it. The claim is taken on the JS thread; an async
+// job carries the flag and releases it on the JS thread before its onDone.
+class BusyClaim {
+public:
+    explicit BusyClaim(std::atomic<bool>& f) {
+        bool expected = false;
+        if (f.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) flag_ = &f;
+    }
+    BusyClaim(const BusyClaim&) = delete;
+    BusyClaim& operator=(const BusyClaim&) = delete;
+    ~BusyClaim() { release(); }
+    bool ok() const { return flag_ != nullptr; }
+    // Hand the claim to someone else (an async job) without releasing it.
+    std::atomic<bool>* detach() { auto* f = flag_; flag_ = nullptr; return f; }
+    void release() {
+        if (flag_) flag_->store(false, std::memory_order_release);
+        flag_ = nullptr;
+    }
+private:
+    std::atomic<bool>* flag_ = nullptr;
+};
+
+inline const char* kBusyMessage = "a generation is already in flight on this model";
+
+// Tokenizers are shared with the model they were loaded beside (the model's
+// grammar mask needs each token's text), so the handle holds a shared_ptr.
 struct HostQwenTokenizer {
-    std::unique_ptr<brolm::qwen::Tokenizer> tok;
+    std::shared_ptr<brolm::qwen::Tokenizer> tok;
 };
 
 struct HostMistralTokenizer {
-    std::unique_ptr<brolm::mistral::Tokenizer> tok;
+    std::shared_ptr<brolm::mistral::Tokenizer> tok;
 };
 
 struct HostGemmaTokenizer {
-    std::unique_ptr<brolm::gemma::Tokenizer> tok;
+    std::shared_ptr<brolm::gemma::Tokenizer> tok;
 };
 
 struct HostLlama3Tokenizer {
-    std::unique_ptr<brolm::llama3::Tokenizer> tok;
+    std::shared_ptr<brolm::llama3::Tokenizer> tok;
 };
 
 struct LMDecoder {
@@ -105,6 +134,8 @@ struct LMDecoder {
     virtual void allocateCache(int n) = 0;
     virtual void resetCache() = 0;
     virtual void forward(const int32_t* ids, int L, brotensor::Tensor& out) = 0;
+    // Logits of the LAST position only: what the decode loop samples from.
+    virtual void forwardLast(const int32_t* ids, int L, brotensor::Tensor& out) = 0;
 };
 
 struct QwenDecoder final : LMDecoder {
@@ -120,6 +151,9 @@ struct QwenDecoder final : LMDecoder {
     void resetCache() override { m.reset_cache(); }
     void forward(const int32_t* ids, int L, brotensor::Tensor& out) override {
         m.forward(ids, L, out);
+    }
+    void forwardLast(const int32_t* ids, int L, brotensor::Tensor& out) override {
+        m.forward_last(ids, L, out);
     }
 };
 
@@ -137,6 +171,9 @@ struct MistralDecoder final : LMDecoder {
     void forward(const int32_t* ids, int L, brotensor::Tensor& out) override {
         m.forward(ids, L, out);
     }
+    void forwardLast(const int32_t* ids, int L, brotensor::Tensor& out) override {
+        m.forward_last(ids, L, out);
+    }
 };
 
 struct GemmaDecoder final : LMDecoder {
@@ -153,6 +190,9 @@ struct GemmaDecoder final : LMDecoder {
     void forward(const int32_t* ids, int L, brotensor::Tensor& out) override {
         m.forward(ids, L, out);
     }
+    void forwardLast(const int32_t* ids, int L, brotensor::Tensor& out) override {
+        m.forward_last(ids, L, out);
+    }
 };
 
 struct HostLMModel {
@@ -160,6 +200,25 @@ struct HostLMModel {
     bool weights_loaded = false;
     brotensor::Device device = brotensor::Device::CPU;
     std::atomic<bool> generating{false};
+
+    // The paired tokenizer's end-of-turn id: the eosId generate() stops on
+    // when opts.eosId is absent (-1 when the model came without one).
+    int defaultEos = -1;
+    // id -> token text, from the paired tokenizer; null when there is none.
+    // Used to build `vocabPieces` for grammar-constrained decoding.
+    std::function<std::string(int32_t)> tokenText;
+    std::once_flag vocabOnce;
+    std::vector<std::string> vocabPieces;  // built on first grammar use
+
+    const std::vector<std::string>& pieces() {
+        std::call_once(vocabOnce, [this] {
+            if (!tokenText || !model) return;
+            const int n = model->vocabSize();
+            vocabPieces.resize(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) vocabPieces[static_cast<size_t>(i)] = tokenText(i);
+        });
+        return vocabPieces;
+    }
 };
 
 struct HostQwen35Model {
@@ -214,6 +273,7 @@ extern HostClass g_clipModelClass;
 extern HostClass g_nllbModelClass;
 extern HostClass g_t5ModelClass;
 extern HostClass g_layaModelClass;
+extern HostClass g_grammarClass;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Conversions and Helpers
@@ -250,50 +310,108 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err)
     return false;
 }
 
+// ── Rooted property reads ────────────────────────────────────────────────
+// getProperty allocates (it interns the key) and may run a getter, so under
+// the embed.h GC contract every Value the caller holds is stale after it.
+// These read ONE property of `obj` (which must be current at the call) and
+// consume it before returning; a caller reading several properties of an
+// object that is not an args[] slot holds it in an ev::Persistent and passes
+// .get() each time.
+inline bool propNumber(Value obj, std::string_view key, double& out) {
+    if (!ev::isObject(obj)) return false;
+    Value v = ev::getProperty(obj, key);
+    if (!ev::isNumber(v)) return false;
+    out = ev::toDouble(v);
+    return true;
+}
+
+inline bool propString(Value obj, std::string_view key, std::string& out) {
+    if (!ev::isObject(obj)) return false;
+    Value v = ev::getProperty(obj, key);
+    if (!ev::isString(v)) return false;
+    out = ev::toUtf8(v);
+    return true;
+}
+
+// A present (non-undefined, non-null) property's truthiness.
+inline bool propBool(Value obj, std::string_view key, bool& out) {
+    if (!ev::isObject(obj)) return false;
+    Value v = ev::getProperty(obj, key);
+    if (ev::isUndefined(v) || ev::isNull(v)) return false;
+    out = ev::toBool(v);
+    return true;
+}
+
+inline bool propFloat(Value obj, std::string_view camel, std::string_view snake, float& out) {
+    double d = 0;
+    if (propNumber(obj, camel, d) || propNumber(obj, snake, d)) {
+        out = static_cast<float>(d);
+        return true;
+    }
+    return false;
+}
+
+// Strings of an array-like (a plain array of strings), non-strings skipped.
+inline std::vector<std::string> readStringArray(Value arr) {
+    std::vector<std::string> out;
+    if (!ev::isObject(arr)) return out;
+    ev::Persistent a(arr);
+    double len = 0;
+    if (!propNumber(a.get(), "length", len)) return out;
+    const uint32_t n = static_cast<uint32_t>(len);
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        Value e = ev::getElement(a.get(), i);
+        if (ev::isString(e)) out.push_back(ev::toUtf8(e));
+    }
+    return out;
+}
+
+const brolm::Grammar* hostGrammarOf(Value v);  // native_lm_grammar.cpp
+
 inline brolm::qwen::GenerateOptions parseGenerateOptions(Value v) {
     brolm::qwen::GenerateOptions o;
     if (!ev::isObject(v)) return o;
-    Value maxTokens = ev::getProperty(v, "maxNewTokens");
-    if (ev::isNumber(maxTokens)) {
-        o.max_new_tokens = static_cast<int>(ev::toDouble(maxTokens));
-    }
-    Value stopOnEos = ev::getProperty(v, "stopOnEos");
-    if (!ev::isUndefined(stopOnEos) && !ev::isNull(stopOnEos)) {
-        o.stop_on_eos = ev::toBool(stopOnEos);
-    }
-    Value s = ev::getProperty(v, "sampling");
-    if (ev::isObject(s)) {
-        Value temp = ev::getProperty(s, "temperature");
-        if (ev::isNumber(temp)) o.sampling.temperature = static_cast<float>(ev::toDouble(temp));
-        Value topK = ev::getProperty(s, "topK");
-        if (ev::isNumber(topK)) o.sampling.top_k = static_cast<int>(ev::toDouble(topK));
-        Value topP = ev::getProperty(s, "topP");
-        if (ev::isNumber(topP)) o.sampling.top_p = static_cast<float>(ev::toDouble(topP));
-        Value seed = ev::getProperty(s, "seed");
+    ev::Persistent opts(v);
+    double d = 0;
+    if (propNumber(opts.get(), "maxNewTokens", d)) o.max_new_tokens = static_cast<int>(d);
+    bool b = false;
+    if (propBool(opts.get(), "stopOnEos", b)) o.stop_on_eos = b;
+
+    ev::Persistent s(ev::getProperty(opts.get(), "sampling"));
+    if (ev::isObject(s.get())) {
+        if (propNumber(s.get(), "temperature", d)) o.sampling.temperature = static_cast<float>(d);
+        if (propNumber(s.get(), "topK", d)) o.sampling.top_k = static_cast<int>(d);
+        if (propNumber(s.get(), "topP", d)) o.sampling.top_p = static_cast<float>(d);
+        Value seed = ev::getProperty(s.get(), "seed");
         if (ev::isNumber(seed)) o.sampling.seed = static_cast<uint64_t>(ev::toDouble(seed));
         else if (ev::isBigInt(seed)) o.sampling.seed = ev::toUint64(seed);
     }
 
-    auto parseSamplingFloat = [&](const char* k1, const char* k2, float& target) {
-        if (ev::isObject(s)) {
-            Value val = ev::getProperty(s, k1);
-            if (ev::isUndefined(val) || ev::isNull(val)) val = ev::getProperty(s, k2);
-            if (ev::isNumber(val)) {
-                target = static_cast<float>(ev::toDouble(val));
-                return;
-            }
-        }
-        Value val = ev::getProperty(v, k1);
-        if (ev::isUndefined(val) || ev::isNull(val)) val = ev::getProperty(v, k2);
-        if (ev::isNumber(val)) {
-            target = static_cast<float>(ev::toDouble(val));
-        }
+    // The penalty knobs are read from opts.sampling first, then from opts.
+    auto samplingFloat = [&](const char* camel, const char* snake, float& target) {
+        if (propFloat(s.get(), camel, snake, target)) return;
+        propFloat(opts.get(), camel, snake, target);
     };
+    samplingFloat("minP", "min_p", o.sampling.min_p);
+    samplingFloat("repetitionPenalty", "repetition_penalty", o.sampling.repetition_penalty);
+    samplingFloat("frequencyPenalty", "frequency_penalty", o.sampling.frequency_penalty);
+    samplingFloat("presencePenalty", "presence_penalty", o.sampling.presence_penalty);
+    samplingFloat("dryMultiplier", "dry_multiplier", o.sampling.dry_multiplier);
+    samplingFloat("dryBase", "dry_base", o.sampling.dry_base);
+    float f = 0;
+    if (propFloat(s.get(), "penaltyLastN", "penalty_last_n", f) ||
+        propFloat(opts.get(), "penaltyLastN", "penalty_last_n", f))
+        o.sampling.penalty_last_n = static_cast<int>(f);
+    if (propFloat(s.get(), "dryAllowedLength", "dry_allowed_length", f) ||
+        propFloat(opts.get(), "dryAllowedLength", "dry_allowed_length", f))
+        o.sampling.dry_allowed_length = static_cast<int>(f);
 
-    parseSamplingFloat("min_p", "minP", o.sampling.min_p);
-    parseSamplingFloat("repetition_penalty", "repetitionPenalty", o.sampling.repetition_penalty);
-    parseSamplingFloat("frequency_penalty", "frequencyPenalty", o.sampling.frequency_penalty);
-    parseSamplingFloat("presence_penalty", "presencePenalty", o.sampling.presence_penalty);
+    // opts.grammar: a bro.lm.Grammar. The caller keeps the grammar object
+    // alive for the call (a sync call holds it in args; bro.lm.generate roots
+    // it in the job), and generation clones its state, so the template is
+    // never advanced.
+    o.grammar = hostGrammarOf(ev::getProperty(opts.get(), "grammar"));
 
     return o;
 }
@@ -307,13 +425,23 @@ inline std::vector<int32_t> readInt32Array(Value v) {
         out.assign(src, src + tinfo.elementCount);
         return out;
     }
-    Value lenVal = ev::getProperty(v, "length");
-    if (ev::isNumber(lenVal)) {
-        uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
-        out.reserve(len);
-        for (uint32_t i = 0; i < len; ++i) {
-            Value elem = ev::getElement(v, i);
-            out.push_back(static_cast<int32_t>(ev::toDouble(elem)));
+    if (tinfo.data) {  // another typed array: convert element by element
+        ev::Persistent arr(v);
+        out.reserve(tinfo.elementCount);
+        for (uint32_t i = 0; i < tinfo.elementCount; ++i) {
+            Value elem = ev::getElement(arr.get(), i);
+            out.push_back(ev::isNumber(elem) ? static_cast<int32_t>(ev::toDouble(elem)) : 0);
+        }
+        return out;
+    }
+    ev::Persistent arr(v);
+    double len = 0;
+    if (propNumber(arr.get(), "length", len)) {
+        const uint32_t n = static_cast<uint32_t>(len);
+        out.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            Value elem = ev::getElement(arr.get(), i);
+            out.push_back(ev::isNumber(elem) ? static_cast<int32_t>(ev::toDouble(elem)) : 0);
         }
     }
     return out;
@@ -357,19 +485,16 @@ inline std::vector<float> lastRowFp32(const brotensor::Tensor& logits) {
 inline std::vector<std::pair<std::string, std::string>> readChatMessages(Value v) {
     std::vector<std::pair<std::string, std::string>> out;
     if (!ev::isObject(v)) return out;
-    Value lenVal = ev::getProperty(v, "length");
-    if (!ev::isNumber(lenVal)) return out;
-    uint32_t n = static_cast<uint32_t>(ev::toDouble(lenVal));
+    ev::Persistent arr(v);
+    double len = 0;
+    if (!propNumber(arr.get(), "length", len)) return out;
+    const uint32_t n = static_cast<uint32_t>(len);
     out.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
-        Value elem = ev::getElement(v, i);
+        ev::Persistent elem(ev::getElement(arr.get(), i));
         std::string role, content;
-        if (ev::isObject(elem)) {
-            Value r = ev::getProperty(elem, "role");
-            if (ev::isString(r)) role = ev::toUtf8(r);
-            Value c = ev::getProperty(elem, "content");
-            if (ev::isString(c)) content = ev::toUtf8(c);
-        }
+        propString(elem.get(), "role", role);
+        propString(elem.get(), "content", content);
         out.emplace_back(std::move(role), std::move(content));
     }
     return out;
@@ -380,19 +505,20 @@ inline bool readImageArg(Value val, std::vector<uint8_t>& rgba, int& w, int& h, 
         err = "image must be an object with { data, width, height }";
         return false;
     }
-    Value wVal = ev::getProperty(val, "width");
-    Value hVal = ev::getProperty(val, "height");
-    if (!ev::isNumber(wVal) || !ev::isNumber(hVal)) {
+    ev::Persistent img(val);
+    double wd = 0, hd = 0;
+    if (!propNumber(img.get(), "width", wd) || !propNumber(img.get(), "height", hd)) {
         err = "image { width, height } must be numbers";
         return false;
     }
-    w = static_cast<int>(ev::toDouble(wVal));
-    h = static_cast<int>(ev::toDouble(hVal));
+    w = static_cast<int>(wd);
+    h = static_cast<int>(hd);
     if (w <= 0 || h <= 0) {
         err = "image { width, height } must be positive";
         return false;
     }
-    Value dataVal = ev::getProperty(val, "data");
+    // The data pointer is consumed (copied) before any further allocation.
+    Value dataVal = ev::getProperty(img.get(), "data");
     auto tinfo = ev::typedArrayInfo(dataVal);
     const size_t need = static_cast<size_t>(w) * h * 4;
     if (tinfo.data && tinfo.byteLength >= need) {
@@ -436,8 +562,8 @@ struct VlmImage {
 
 inline bool readVlmImages(Value opts, std::vector<VlmImage>& images, std::string& err) {
     if (!ev::isObject(opts)) return true;
-    Value imgs = ev::getProperty(opts, "images");
-    if (ev::isUndefined(imgs) || ev::isNull(imgs)) return true;
+    ev::Persistent imgs(ev::getProperty(opts, "images"));
+    if (ev::isUndefined(imgs.get()) || ev::isNull(imgs.get())) return true;
 
     auto parseOne = [&](Value v) -> bool {
         std::vector<uint8_t> rgba;
@@ -447,16 +573,15 @@ inline bool readVlmImages(Value opts, std::vector<VlmImage>& images, std::string
         return true;
     };
 
-    Value lenVal = ev::getProperty(imgs, "length");
-    if (ev::isNumber(lenVal)) {
-        uint32_t count = static_cast<uint32_t>(ev::toDouble(lenVal));
-        for (uint32_t i = 0; i < count; ++i) {
-            Value item = ev::getElement(imgs, i);
-            if (!parseOne(item)) return false;
+    // An array of images (an image itself has no numeric `length`).
+    double count = 0;
+    if (propNumber(imgs.get(), "length", count)) {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(count); ++i) {
+            if (!parseOne(ev::getElement(imgs.get(), i))) return false;
         }
         return true;
     }
-    return parseOne(imgs);
+    return parseOne(imgs.get());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -466,20 +591,106 @@ inline bool readVlmImages(Value opts, std::vector<VlmImage>& images, std::string
 HostAsyncHandle* hostAsyncHandleOf(Value v);
 Value makeAsyncHandleValue(std::shared_ptr<HostAsyncHandle> h);
 
+// ── Background jobs (native_lm_model.cpp) ───────────────────────────────────
+// A job's work runs on its own thread and touches no JS value; everything it
+// shares with the JS thread lives in AsyncCore. The AsyncJob itself (the JS
+// callbacks, the roots that keep a model alive, the finish step) is owned by
+// the launching JS thread and ticked there by tickLMAsync / AsyncHandle.wait.
+struct AsyncCore {
+    std::shared_ptr<HostAsyncHandle> handle;
+    std::mutex mu;
+    std::vector<int32_t> pendingTokens;  // produced, not yet delivered to onToken
+    std::string error;                   // set by the worker on a throw
+    std::atomic<bool> done{false};
+
+    bool cancelled() const { return handle->cancelled.load(std::memory_order_acquire); }
+    void pushToken(int32_t id) {
+        { std::lock_guard<std::mutex> lk(mu); pendingTokens.push_back(id); }
+        handle->notify();
+    }
+};
+
+struct AsyncJob {
+    std::shared_ptr<AsyncCore> core;
+    std::thread worker;
+    ev::Persistent onToken, onDone, onError;
+    ev::Persistent keep;                // the model (or other object) the work borrows
+    std::atomic<bool>* busy = nullptr;  // a BusyClaim handed over, released before finish
+    // JS thread, once, after the worker joined: deliver the outcome.
+    std::function<void(AsyncJob&)> finish;
+    bool ticking = false;  // being delivered by an outer tick (a callback re-entered)
+
+    ~AsyncJob() {
+        if (core) core->handle->cancelled.store(true, std::memory_order_release);
+        if (worker.joinable()) worker.join();
+        if (busy) busy->store(false, std::memory_order_release);
+    }
+};
+
+std::shared_ptr<AsyncJob> newAsyncJob();
+// Start `work` on the job's thread and return its AsyncHandle.
+Value launchAsyncJob(std::shared_ptr<AsyncJob> job, std::function<void(AsyncCore&)> work);
+// Call a JS callback held in a Persistent with already-rooted arguments.
+void callRooted(const ev::Persistent& fn, std::initializer_list<const ev::Persistent*> args);
+// Cancel and join this thread's jobs (shutdownLM).
+void shutdownLMJobs();
+
+// Report a background failure: opts.onError(message) when given, else stderr
+// (a failure is never silent).
+void reportJobError(AsyncJob& job, const std::string& message);
+
+// A loader's shared shape. Synchronous unless opts.onReady is a function:
+// then `build` runs on a worker thread, the call returns an AsyncHandle, and
+// on a later tick onReady(wrap(built)) fires on this thread, or
+// onError(message) on a failure (nothing after cancel()). `build` touches no
+// JS value; `wrap` runs on the JS thread and makes the handles.
+template <class Built>
+Value runLoad(std::span<const Value> a, size_t optsIdx, const char* what,
+              std::function<void(Built&)> build, std::function<Value(Built&)> wrap) {
+    ev::Persistent onReady, onError;
+    if (a.size() > optsIdx && ev::isObject(a[optsIdx])) {
+        onReady.set(ev::getProperty(a[optsIdx], "onReady"));
+        onError.set(ev::getProperty(a[optsIdx], "onError"));
+    }
+    if (!ev::isFunction(onReady.get())) {
+        try {
+            Built b;
+            build(b);
+            return wrap(b);
+        } catch (const std::exception& e) {
+            return ev::throwError(std::string(what) + ": " + e.what());
+        }
+    }
+    auto job = newAsyncJob();
+    job->onDone.set(onReady.get());
+    if (ev::isFunction(onError.get())) job->onError.set(onError.get());
+    auto built = std::make_shared<Built>();
+    std::string label = what;
+    job->finish = [built, wrap, label](AsyncJob& j) {
+        if (j.core->cancelled()) return;
+        if (!j.core->error.empty()) {
+            reportJobError(j, label + ": " + j.core->error);
+            return;
+        }
+        ev::Persistent result(wrap(*built));
+        callRooted(j.onDone, {&result});
+    };
+    return launchAsyncJob(job, [built, build](AsyncCore&) { build(*built); });
+}
+
 HostQwenTokenizer* hostQwenTokenizerOf(Value v);
-Value makeQwenTokenizerValue(std::unique_ptr<brolm::qwen::Tokenizer> tok);
+Value makeQwenTokenizerValue(std::shared_ptr<brolm::qwen::Tokenizer> tok);
 
 HostMistralTokenizer* hostMistralTokenizerOf(Value v);
-Value makeMistralTokenizerValue(std::unique_ptr<brolm::mistral::Tokenizer> tok);
+Value makeMistralTokenizerValue(std::shared_ptr<brolm::mistral::Tokenizer> tok);
 
 HostGemmaTokenizer* hostGemmaTokenizerOf(Value v);
-Value makeGemmaTokenizerValue(std::unique_ptr<brolm::gemma::Tokenizer> tok);
+Value makeGemmaTokenizerValue(std::shared_ptr<brolm::gemma::Tokenizer> tok);
 
 HostLlama3Tokenizer* hostLlama3TokenizerOf(Value v);
-Value makeLlama3TokenizerValue(std::unique_ptr<brolm::llama3::Tokenizer> tok);
+Value makeLlama3TokenizerValue(std::shared_ptr<brolm::llama3::Tokenizer> tok);
 
 HostLMModel* hostLMModelOf(Value v);
-Value makeLMModelValue(std::unique_ptr<LMDecoder> dec, brotensor::Device dev);
 
 HostQwen35Model* hostQwen35ModelOf(Value v);
 Value makeQwen35ModelValue(std::unique_ptr<brolm::qwen35::VLM> vlm, int maxSeqLen, brotensor::Device dev);
@@ -530,6 +741,7 @@ void registerLMModelClasses();
 void registerLMVLClasses();
 void registerLMClipClasses();
 void registerLMLayaClasses();
+void registerLMGrammarClass();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // bro.lm Namespace Bindings

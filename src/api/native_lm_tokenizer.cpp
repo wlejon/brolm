@@ -16,7 +16,7 @@ HostQwenTokenizer* hostQwenTokenizerOf(Value v) {
     return static_cast<HostQwenTokenizer*>(g_qwenTokenizerClass.unwrap(v));
 }
 
-Value makeQwenTokenizerValue(std::unique_ptr<brolm::qwen::Tokenizer> tok) {
+Value makeQwenTokenizerValue(std::shared_ptr<brolm::qwen::Tokenizer> tok) {
     auto w = std::make_unique<HostQwenTokenizer>();
     w->tok = std::move(tok);
     return g_qwenTokenizerClass.createInstance(std::move(w));
@@ -27,7 +27,7 @@ HostMistralTokenizer* hostMistralTokenizerOf(Value v) {
     return static_cast<HostMistralTokenizer*>(g_mistralTokenizerClass.unwrap(v));
 }
 
-Value makeMistralTokenizerValue(std::unique_ptr<brolm::mistral::Tokenizer> tok) {
+Value makeMistralTokenizerValue(std::shared_ptr<brolm::mistral::Tokenizer> tok) {
     auto w = std::make_unique<HostMistralTokenizer>();
     w->tok = std::move(tok);
     return g_mistralTokenizerClass.createInstance(std::move(w));
@@ -38,7 +38,7 @@ HostGemmaTokenizer* hostGemmaTokenizerOf(Value v) {
     return static_cast<HostGemmaTokenizer*>(g_gemmaTokenizerClass.unwrap(v));
 }
 
-Value makeGemmaTokenizerValue(std::unique_ptr<brolm::gemma::Tokenizer> tok) {
+Value makeGemmaTokenizerValue(std::shared_ptr<brolm::gemma::Tokenizer> tok) {
     auto w = std::make_unique<HostGemmaTokenizer>();
     w->tok = std::move(tok);
     return g_gemmaTokenizerClass.createInstance(std::move(w));
@@ -49,7 +49,7 @@ HostLlama3Tokenizer* hostLlama3TokenizerOf(Value v) {
     return static_cast<HostLlama3Tokenizer*>(g_llama3TokenizerClass.unwrap(v));
 }
 
-Value makeLlama3TokenizerValue(std::unique_ptr<brolm::llama3::Tokenizer> tok) {
+Value makeLlama3TokenizerValue(std::shared_ptr<brolm::llama3::Tokenizer> tok) {
     auto w = std::make_unique<HostLlama3Tokenizer>();
     w->tok = std::move(tok);
     return g_llama3TokenizerClass.createInstance(std::move(w));
@@ -79,6 +79,10 @@ static void decorateQwenTokenizer(ObjectBuilder& b) {
     b.accessor("vocabCount", [](Value self, std::span<const Value>) {
         auto* w = hostQwenTokenizerOf(self);
         return ev::fromDouble(w && w->tok ? static_cast<double>(w->tok->vocab_count()) : 0.0);
+    });
+    b.accessor("mergeCount", [](Value self, std::span<const Value>) {
+        auto* w = hostQwenTokenizerOf(self);
+        return ev::fromDouble(w && w->tok ? static_cast<double>(w->tok->merge_count()) : 0.0);
     });
 
     b.def("encode", 1, [](Value self, std::span<const Value> a) -> Value {
@@ -330,25 +334,23 @@ Value js_loadTokenizer(Value, std::span<const Value> a) {
 
     try {
         if (ev::isString(a[0])) {
-            std::string p = ev::toUtf8(a[0]);
+            std::string p = resolvePath(ev::toUtf8(a[0]));
             auto tok = std::make_unique<brolm::qwen::Tokenizer>(
                 brolm::qwen::Tokenizer::from_tokenizer_json(p));
             return makeQwenTokenizerValue(std::move(tok));
         }
 
-        Value opts = a[0];
-        Value vp = ev::getProperty(opts, "vocabPath");
-        Value mp = ev::getProperty(opts, "mergesPath");
-        if (ev::isString(vp) && ev::isString(mp)) {
+        // a[0] is a rooted argument slot, current across each read.
+        std::string vocab, merges, tokJson;
+        if (propString(a[0], "vocabPath", vocab) && propString(a[0], "mergesPath", merges)) {
             auto tok = std::make_unique<brolm::qwen::Tokenizer>(
-                brolm::qwen::Tokenizer::load(ev::toUtf8(vp), ev::toUtf8(mp)));
+                brolm::qwen::Tokenizer::load(resolvePath(vocab), resolvePath(merges)));
             return makeQwenTokenizerValue(std::move(tok));
         }
 
-        Value tp = ev::getProperty(opts, "tokenizerPath");
-        if (ev::isString(tp)) {
+        if (propString(a[0], "tokenizerPath", tokJson)) {
             auto tok = std::make_unique<brolm::qwen::Tokenizer>(
-                brolm::qwen::Tokenizer::from_tokenizer_json(ev::toUtf8(tp)));
+                brolm::qwen::Tokenizer::from_tokenizer_json(resolvePath(tokJson)));
             return makeQwenTokenizerValue(std::move(tok));
         }
 
@@ -366,11 +368,11 @@ Value js_loadLlama3Tokenizer(Value, std::span<const Value> a) {
     if (ev::isString(a[0])) {
         path = ev::toUtf8(a[0]);
     } else if (ev::isObject(a[0])) {
-        Value tp = ev::getProperty(a[0], "tokenizerPath");
-        if (ev::isString(tp)) path = ev::toUtf8(tp);
+        propString(a[0], "tokenizerPath", path);
     }
     if (path.empty())
         return ev::throwTypeError("loadLlama3Tokenizer: tokenizerPath required");
+    path = resolvePath(path);
 
     try {
         auto tok = std::make_unique<brolm::llama3::Tokenizer>(

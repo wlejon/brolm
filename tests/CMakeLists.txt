@@ -87,6 +87,8 @@ target_compile_definitions(brolm_test_laya_parity PRIVATE
 if(BROLM_ENABLE_API AND TARGET brolm_api)
     add_executable(brolm_test_api test_lm_api.cpp)
     target_link_libraries(brolm_test_api PRIVATE brolm_api bronze_runtime_shared)
+    # Weights-gated sections look under <repo>/weights and skip when absent.
+    target_compile_definitions(brolm_test_api PRIVATE BROLM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     if(MSVC)
         target_compile_options(brolm_test_api PRIVATE /W4)
     else()
@@ -115,9 +117,20 @@ if(BROLM_ENABLE_API AND TARGET brolm_api)
         message(STATUS "brolm: brolm_test_api not registered (brass has no code generator for this target)")
     else()
         add_test(NAME brolm_test_api COMMAND brolm_test_api)
+        # The same binding test under bronze's GC stress oracle: a collection
+        # on every allocation, from-space poisoned afterwards, so a Value held
+        # across an allocating embed call crashes or reads garbage here
+        # instead of passing by luck. `ctest -LE gcstress` skips it.
+        add_test(NAME brolm_test_api_gcstress COMMAND brolm_test_api)
+        set_tests_properties(brolm_test_api_gcstress PROPERTIES LABELS gcstress)
         if(WIN32)
             set_tests_properties(brolm_test_api PROPERTIES
                 ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brolm_test_api>;$ENV{PATH}")
+            set_tests_properties(brolm_test_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brolm_test_api>;$ENV{PATH}")
+        else()
+            set_tests_properties(brolm_test_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1")
         endif()
     endif()
 endif()

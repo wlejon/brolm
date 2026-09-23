@@ -1,6 +1,7 @@
 #include "host_class.h"
 #include "object_builder.h"
 
+#include <mutex>
 #include <unordered_map>
 
 namespace brolm::api {
@@ -43,15 +44,16 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
 
     Slots& s = slots();
     ev::Persistent ctor(ev::makeFunction(std::move(ctorBody), arity, name));
+    s.ctor = new ev::Persistent(ctor.get());
 
     {
         ObjectBuilder proto(ev::getProperty(ctor.get(), "prototype"));
+        proto.set("constructor", ctor.get());
         if (decorate) decorate(proto);
         s.proto = new ev::Persistent(proto.get());
     }
 
-    ev::setGlobalValue(name, ctor.get());
-    s.ctor = new ev::Persistent(ctor.get());
+    ev::setGlobalValue(name, s.ctor->get());
 }
 
 void HostClass::alias(const char* name) const {
@@ -73,10 +75,64 @@ void HostClass::inherit(const HostClass& base) const {
     ev::call(setProto.get(), ev::undefined(), std::span<const Value>(args, 2));
 }
 
+// ── Brands ──────────────────────────────────────────────────────────────────
+// ev::handleData answers the payload of ANY handle, so a method called with
+// a receiver of another class (bro.lm.generate(qwen35Model, ...) probing for
+// an LMModel, or `LMModel.prototype.generate.call(tokenizer)`) would cast one
+// class's payload to another's. Every payload made here is registered with
+// the class that made it; unwrap() answers only for its own class.
+namespace {
+
+struct Brand {
+    const HostClass* cls;
+    ev::HandleDestructor dtor;
+};
+
+std::mutex& brandMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<const void*, Brand>& brands() {
+    static auto* m = new std::unordered_map<const void*, Brand>();  // outlives every sweep
+    return *m;
+}
+
+// The destructor every branded handle carries: unregister, then run the
+// class's own destructor. Runs InSweep (no heap access) or Deferred.
+void brandedDestroy(void* data) {
+    ev::HandleDestructor dtor = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(brandMutex());
+        auto& m = brands();
+        auto it = m.find(data);
+        if (it != m.end()) {
+            dtor = it->second.dtor;
+            m.erase(it);
+        }
+    }
+    if (dtor) dtor(data);
+}
+
+}  // namespace
+
 Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) const {
+    if (data) {
+        std::lock_guard<std::mutex> lk(brandMutex());
+        brands()[data] = Brand{this, dtor};
+    }
     const Slots* s = slotsIfAny();
-    if (!s || !s->proto) return ev::makeHandle(data, dtor, when);
-    return ev::makeHandle(data, dtor, when, s->proto->get());
+    if (!s || !s->proto) return ev::makeHandle(data, brandedDestroy, when);
+    return ev::makeHandle(data, brandedDestroy, when, s->proto->get());
+}
+
+void* HostClass::unwrap(Value val) const {
+    void* data = ev::handleData(val);
+    if (!data) return nullptr;
+    std::lock_guard<std::mutex> lk(brandMutex());
+    auto& m = brands();
+    auto it = m.find(data);
+    return (it != m.end() && it->second.cls == this) ? data : nullptr;
 }
 
 void HostClass::setStatic(const char* name, Value v) const {
@@ -96,24 +152,12 @@ Value HostClass::constructor() const {
 }
 
 Value hostArrayOf(size_t count, const std::function<Value(size_t)>& make) {
-    ev::CallResult parsed = ev::parseJson("[]");
-    if (parsed.thrown) {
-        return ev::undefined();
-    }
-    ev::Persistent arr(parsed.value);
-    if (count == 0) return arr.get();
-
-    ev::Persistent push(ev::getProperty(arr.get(), "push"));
-    if (!ev::isFunction(push.get())) {
-        return arr.get();
-    }
+    ev::Persistent arr(ev::makeArray(static_cast<uint32_t>(count)));
+    if (!ev::isObject(arr.get())) return ev::undefined();
     for (size_t i = 0; i < count; ++i) {
+        // make() allocates; the element is read back out of arr only after.
         Value v = make(i);
-        ev::CallResult r = ev::call(push.get(), arr.get(),
-                                    std::span<const Value>(&v, 1));
-        if (r.thrown) {
-            break;
-        }
+        arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), v));
     }
     return arr.get();
 }

@@ -7,6 +7,7 @@ add_library(brolm_api STATIC
     native_lm_clip.cpp
     native_lm_laya.cpp
     native_lm_laya_async.cpp
+    native_lm_grammar.cpp
 )
 
 target_include_directories(brolm_api PUBLIC
