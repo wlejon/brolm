@@ -67,6 +67,8 @@ static thread_local std::vector<std::shared_ptr<AsyncLmJob>> s_activeJobs;
 static thread_local std::mutex s_jobsMutex;
 
 void tickLMAsync() {
+    tickLayaAsync();  // LayaModel promises (native_lm_laya_async.cpp)
+
     std::vector<std::shared_ptr<AsyncLmJob>> jobsToTick;
     {
         std::lock_guard<std::mutex> lock(s_jobsMutex);

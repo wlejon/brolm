@@ -31,6 +31,7 @@
 #include <brolm/tokenizer_t5.h>
 #include <brolm/sampler.h>
 #include <brolm/laya.h>
+#include <brolm/laya_scheduler.h>
 #include <brolm/detail/generate.h>
 
 #include <algorithm>
@@ -495,8 +496,26 @@ Value makeNllbModelValue(std::unique_ptr<brolm::nllb::Translator> tr, brotensor:
 HostT5Model* hostT5ModelOf(Value v);
 Value makeT5ModelValue(std::unique_ptr<HostT5Model> t5);
 
-brolm::LayaModel* hostLayaModelOf(Value v);
-Value makeLayaModelValue(std::unique_ptr<brolm::LayaModel> model);
+// A LayaModel handle: the request scheduler over one replica per device.
+Value makeLayaModelValue(std::shared_ptr<brolm::laya::Scheduler> sched);
+
+// Laya promise delivery (native_lm_laya_async.cpp). layaTrackPromise roots
+// `promise` on the calling JS thread and returns a post handle any thread
+// may call with a settle function; tickLayaAsync (from tickLMAsync) runs the
+// queued settles on that JS thread with their promise. `keepalive` lives
+// until the promise settles.
+struct LayaMailbox;
+struct LayaPost {
+    std::shared_ptr<LayaMailbox> box;
+    uint64_t id = 0;
+    void operator()(std::function<void(const ev::Persistent& promise)> settle) const;
+};
+LayaPost layaTrackPromise(Value promise, std::shared_ptr<void> keepalive);
+void layaTrackLoad(Value promise, std::shared_ptr<brolm::laya::Scheduler> sched);
+void layaRegisterScheduler(const std::shared_ptr<brolm::laya::Scheduler>& sched);
+Value layaRejectWith(Value promise, const std::string& message);
+bool tickLayaAsync();
+void shutdownLaya();
 
 // Path resolution for file loaders (api.h setPathResolver).
 void setPathResolver(std::function<std::string(const std::string&)> resolver);
@@ -528,6 +547,7 @@ Value js_loadLlama3Tokenizer(Value, std::span<const Value>);
 Value js_loadClip(Value, std::span<const Value>);
 Value js_loadT5(Value, std::span<const Value>);
 Value js_loadLaya(Value, std::span<const Value>);
+Value js_loadLayaAsync(Value, std::span<const Value>);
 Value js_lm_generate(Value, std::span<const Value>);
 Value js_lm_tick(Value, std::span<const Value>);
 

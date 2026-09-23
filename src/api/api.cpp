@@ -70,6 +70,7 @@ void installLM() {
     lmObj.def("loadClipModel", 1, js_loadClip);
     lmObj.def("loadT5", 1, js_loadT5);
     lmObj.def("loadLaya", 1, js_loadLaya);
+    lmObj.def("loadLayaAsync", 1, js_loadLayaAsync);
     lmObj.def("generate", 2, js_lm_generate);
     lmObj.def("tick", 0, js_lm_tick);
 

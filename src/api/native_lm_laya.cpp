@@ -1,19 +1,31 @@
+// bro.lm.loadLaya / loadLayaAsync and the LayaModel class.
+//
+// A LayaModel is a handle on a laya::Scheduler: one model replica per device,
+// requests from this realm (and any other caller) packed into shared
+// forwards. predict() is the blocking form (submit + wait); predictAsync()
+// returns a Promise settled on this JS thread's next LM tick
+// (native_lm_laya_async.cpp), so many calls in flight from one app batch
+// together. Reading the arguments and building the results happen here, on
+// the JS thread; the device threads only ever see C++ values.
+
 #include "host_lm_internal.h"
 
 namespace brolm::api {
 
 HostClass g_layaModelClass;
 
-brolm::LayaModel* hostLayaModelOf(Value v) {
-    if (!ev::isObject(v)) return nullptr;
-    return static_cast<brolm::LayaModel*>(g_layaModelClass.unwrap(v));
-}
-
-Value makeLayaModelValue(std::unique_ptr<brolm::LayaModel> model) {
-    return g_layaModelClass.createInstance(std::move(model));
-}
-
 namespace {
+
+namespace laya = brolm::laya;
+
+struct HostLaya {
+    std::shared_ptr<laya::Scheduler> sched;
+};
+
+HostLaya* hostLayaOf(Value v) {
+    if (!ev::isObject(v)) return nullptr;
+    return static_cast<HostLaya*>(g_layaModelClass.unwrap(v));
+}
 
 std::vector<std::string> getObjectKeys(Value obj) {
     std::vector<std::string> keys;
@@ -23,12 +35,13 @@ std::vector<std::string> getObjectKeys(Value obj) {
     if (!ev::isFunction(keysFn)) return keys;
     auto res = ev::call(keysFn, g.value, std::span<const Value>(&obj, 1));
     if (res.thrown || !ev::isObject(res.value)) return keys;
-    Value lenVal = ev::getProperty(res.value, "length");
+    ev::Persistent arr(res.value);
+    Value lenVal = ev::getProperty(arr.get(), "length");
     if (!ev::isNumber(lenVal)) return keys;
     uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
     keys.reserve(len);
     for (uint32_t i = 0; i < len; ++i) {
-        Value k = ev::getElement(res.value, i);
+        Value k = ev::getElement(arr.get(), i);
         if (ev::isString(k)) keys.push_back(ev::toUtf8(k));
     }
     return keys;
@@ -48,21 +61,294 @@ bool pythonStyleJson(Value v, std::string& out) {
     return true;
 }
 
-// Optional integer property; `found` reports whether it was a number.
-int intProp(Value obj, const char* camel, const char* snake, bool& found) {
+// Optional numeric property under a camelCase or snake_case name.
+bool numProp(Value obj, const char* camel, const char* snake, double& out) {
     Value v = ev::getProperty(obj, camel);
-    if (!ev::isNumber(v)) v = ev::getProperty(obj, snake);
-    found = ev::isNumber(v);
-    return found ? static_cast<int>(ev::toDouble(v)) : 0;
+    if (!ev::isNumber(v) && snake) v = ev::getProperty(obj, snake);
+    if (!ev::isNumber(v)) return false;
+    out = ev::toDouble(v);
+    return true;
 }
 
-static void decorateLayaModel(ObjectBuilder& b) {
-    // config() -> { max_len, head_max_len, temperature: [choice, score, noul],
-    //               temperature_by_options: { "choice:3-5": T, ... } }
+bool boolProp(Value obj, const char* camel, const char* snake, bool& out) {
+    Value v = ev::getProperty(obj, camel);
+    if (!ev::isBool(v) && snake) v = ev::getProperty(obj, snake);
+    if (!ev::isBool(v)) return false;
+    out = ev::toBool(v);
+    return true;
+}
+
+// state: a string is used as is; an object/array is serialised like the
+// reference's json.dumps(state).
+bool readState(Value v, std::string& out, std::string& err) {
+    if (ev::isString(v)) {
+        out = ev::toUtf8(v);
+        return true;
+    }
+    if (ev::isObject(v)) {
+        if (pythonStyleJson(v, out)) return true;
+        err = "failed to serialize state to JSON";
+        return false;
+    }
+    err = "state must be a string or object";
+    return false;
+}
+
+// questions: { id: { type, instructions, criteria } }, in key order.
+bool readQuestions(Value qsVal, std::vector<LayaQuestion>& out, std::string& err) {
+    if (!ev::isObject(qsVal)) {
+        err = "questions must be an object";
+        return false;
+    }
+    ev::Persistent qsObj(qsVal);
+    for (const std::string& qId : getObjectKeys(qsObj.get())) {
+        ev::Persistent qDef(ev::getProperty(qsObj.get(), qId));
+        if (!ev::isObject(qDef.get())) continue;
+
+        LayaQuestion q;
+        q.id = qId;
+        Value typeVal = ev::getProperty(qDef.get(), "type");
+        if (ev::isString(typeVal)) q.type = ev::toUtf8(typeVal);
+
+        Value insVal = ev::getProperty(qDef.get(), "instructions");
+        if (ev::isString(insVal)) {
+            q.instructions = ev::toUtf8(insVal);
+        } else if (!ev::isUndefined(insVal)) {
+            pythonStyleJson(insVal, q.instructions);  // reference: json.dumps
+        }
+
+        ev::Persistent crit(ev::getProperty(qDef.get(), "criteria"));
+        if (ev::isObject(crit.get())) {
+            Value critLenVal = ev::getProperty(crit.get(), "length");
+            if (ev::isNumber(critLenVal)) {
+                const uint32_t critLen = static_cast<uint32_t>(ev::toDouble(critLenVal));
+                for (uint32_t c = 0; c < critLen; ++c) {
+                    ev::Persistent item(ev::getElement(crit.get(), c));
+                    if (q.type == "choice" || q.type.empty()) {
+                        if (ev::isString(item.get())) {
+                            q.criteria_choice.emplace_back(ev::toUtf8(item.get()), "");
+                        } else if (ev::isObject(item.get())) {
+                            // [key, description] pairs
+                            Value itemLen = ev::getProperty(item.get(), "length");
+                            if (ev::isNumber(itemLen) && ev::toDouble(itemLen) >= 2) {
+                                Value k = ev::getElement(item.get(), 0);
+                                std::string ks = ev::isString(k) ? ev::toUtf8(k) : "";
+                                Value d = ev::getElement(item.get(), 1);
+                                q.criteria_choice.emplace_back(ks, ev::isString(d) ? ev::toUtf8(d) : "");
+                            }
+                        }
+                    } else if (q.type == "score") {
+                        if (ev::isString(item.get())) q.criteria_score.push_back(ev::toUtf8(item.get()));
+                    } else if (ev::isString(item.get())) {  // noul: [false, true]
+                        (c == 0 ? q.criteria_noul_false : q.criteria_noul_true) = ev::toUtf8(item.get());
+                    }
+                }
+            } else {
+                // Object criteria, e.g. { billing: "...", technical: "..." }
+                for (const std::string& kStr : getObjectKeys(crit.get())) {
+                    Value vVal = ev::getProperty(crit.get(), kStr);
+                    std::string vStr;
+                    if (ev::isString(vVal)) {
+                        vStr = ev::toUtf8(vVal);
+                    } else if (!ev::isUndefined(vVal) && !ev::isNull(vVal)) {
+                        pythonStyleJson(vVal, vStr);  // structured criterion -> JSON text
+                    }
+                    if (q.type == "choice" || q.type.empty()) {
+                        q.criteria_choice.emplace_back(kStr, vStr);
+                    } else if (q.type == "score") {
+                        q.criteria_score.push_back(kStr);  // reference: enumerate(dict) walks the keys
+                    } else if (kStr == "false" || kStr == "0") {
+                        q.criteria_noul_false = vStr;
+                    } else if (kStr == "true" || kStr == "1") {
+                        q.criteria_noul_true = vStr;
+                    }
+                }
+            }
+        }
+        if (q.type.empty()) {
+            if (!q.criteria_choice.empty()) q.type = "choice";
+            else if (!q.criteria_score.empty()) q.type = "score";
+            else q.type = "noul";
+        }
+        out.push_back(std::move(q));
+    }
+    return true;
+}
+
+// { maxLen, headMaxLen, truncateLeft, priority, deadlineMs } (snake_case accepted).
+bool readRequestOptions(Value o, laya::RequestOptions& ro, std::string& err) {
+    if (!ev::isObject(o)) return true;
+    double d = 0;
+    if (numProp(o, "maxLen", "max_len", d)) ro.predict.max_len = static_cast<int>(d);
+    if (numProp(o, "headMaxLen", "head_max_len", d)) ro.predict.head_max_len = static_cast<int>(d);
+    if (ro.predict.max_len < 0 || ro.predict.head_max_len < 0) {
+        err = "maxLen / headMaxLen must be positive";
+        return false;
+    }
+    boolProp(o, "truncateLeft", "truncate_left", ro.predict.truncate_left);
+    if (numProp(o, "priority", nullptr, d)) ro.priority = static_cast<int>(d);
+    if (numProp(o, "deadlineMs", "deadline_ms", d)) ro.deadline_ms = d;
+    return true;
+}
+
+Value buildTiming(const laya::RequestTiming& t) {
+    ObjectBuilder o;
+    o.set("tokenizeMs", t.tokenize_ms);
+    o.set("queueMs", t.queue_ms);
+    o.set("forwardMs", t.forward_ms);
+    o.set("totalMs", t.total_ms);
+    o.set("forwards", static_cast<double>(t.forwards));
+    o.set("batchItems", static_cast<double>(t.batch_items));
+    o.set("batchRequests", static_cast<double>(t.batch_requests));
+    o.set("batchTokens", static_cast<double>(t.batch_tokens));
+    o.set("device", static_cast<double>(t.device));
+    o.set("deadlineMissed", t.deadline_missed);
+    return o.build();
+}
+
+// The reference response shape, plus `timing`.
+Value buildResult(const laya::ScheduledResult& r, const std::vector<LayaQuestion>& questions) {
+    ObjectBuilder out;
+    out.set("model", r.result.model);
+    ObjectBuilder answersObj;
+    for (const LayaQuestion& q : questions) {
+        auto it = r.result.answers.find(q.id);
+        if (it == r.result.answers.end()) continue;
+        const LayaAnswer& ans = it->second;
+        ObjectBuilder a;
+        a.set("type", ans.type);
+        if (ans.type == "choice") {
+            a.set("choice", ans.choice);
+            a.set("confidence", static_cast<double>(ans.confidence));
+        } else if (ans.type == "score") {
+            a.set("score", static_cast<double>(ans.score));
+            a.set("confidence", static_cast<double>(ans.confidence));
+            ObjectBuilder legend;
+            for (size_t c = 0; c < q.criteria_score.size(); ++c) legend.set(std::to_string(c), q.criteria_score[c]);
+            a.set("legend", legend.build());
+        } else {
+            a.set("noul", static_cast<double>(ans.noul));
+            // Not in the reference's noul answer; the same entropy-based
+            // confidence, which is what escalation has to gate on.
+            a.set("confidence", static_cast<double>(ans.confidence));
+        }
+        if (ans.type != "noul") {
+            ObjectBuilder probs;
+            for (const auto& [k, p] : ans.probabilities) probs.set(k, static_cast<double>(p));
+            a.set("probabilities", probs.build());
+        }
+        // Raw pre-temperature scorer logits (option order) and the temperature
+        // applied — enough to refit calibration downstream.
+        a.set("logits", makeFloat32Array(ans.logits.data(), ans.logits.size()));
+        a.set("temperature", static_cast<double>(ans.temperature));
+        ObjectBuilder rl;
+        rl.set("act_probability", static_cast<double>(ans.act_probability));
+        rl.set("act_logits", makeFloat32Array(ans.act_logits.data(), ans.act_logits.size()));
+        a.set("rl_agent", rl.build());
+        answersObj.set(q.id, a.build());
+    }
+    out.set("answers", answersObj.build());
+    ObjectBuilder usage;
+    usage.set("input_tokens", static_cast<double>(r.result.input_tokens));
+    usage.set("output_tokens", 0.0);
+    out.set("usage", usage.build());
+    out.set("timing", buildTiming(r.timing));
+    return out.build();
+}
+
+Value buildStats(const laya::SchedulerStats& s) {
+    ObjectBuilder o;
+    o.set("submitted", static_cast<double>(s.submitted));
+    o.set("completed", static_cast<double>(s.completed));
+    o.set("failed", static_cast<double>(s.failed));
+    o.set("deadlineMissed", static_cast<double>(s.deadline_missed));
+    o.set("queuedRequests", static_cast<double>(s.queued_requests));
+    o.set("queuedItems", static_cast<double>(s.queued_items));
+    o.set("inFlightRequests", static_cast<double>(s.in_flight_requests));
+    o.set("forwards", static_cast<double>(s.forwards));
+    o.set("itemsRun", static_cast<double>(s.items_run));
+    o.set("tokensRun", static_cast<double>(s.tokens_run));
+    o.set("meanBatchItems", s.mean_batch_items);
+    o.set("meanBatchTokens", s.mean_batch_tokens);
+    o.set("meanBatchRequests", s.mean_batch_requests);
+    o.set("meanOccupancy", s.mean_occupancy);
+    o.set("tokenBudget", static_cast<double>(s.token_budget));
+    o.set("targetForwardMs", s.target_forward_ms);
+    o.set("estFixedMs", s.est_fixed_ms);
+    o.set("estMsPer1kTokens", s.est_ms_per_1k_tokens);
+    o.set("latencyP50", s.latency_p50);
+    o.set("latencyP95", s.latency_p95);
+    o.set("latencyP99", s.latency_p99);
+    o.set("latencyMax", s.latency_max);
+    o.set("queueMeanMs", s.queue_mean);
+    o.set("windowS", s.window_s);
+    o.set("throughputRps", s.throughput_rps);
+    o.set("devices", hostArrayOf(s.devices.size(), [&](size_t i) {
+              const auto& d = s.devices[i];
+              ObjectBuilder e;
+              e.set("device", static_cast<double>(d.device));
+              e.set("name", d.name);
+              e.set("forwards", static_cast<double>(d.forwards));
+              e.set("busyMs", d.busy_ms);
+              e.set("busyFraction", d.busy_fraction);
+              e.set("graphs", static_cast<double>(d.graphs));
+              return e.build();
+          }));
+    o.set("recentBatches", hostArrayOf(s.recent_batches.size(), [&](size_t i) {
+              const auto& b = s.recent_batches[i];
+              ObjectBuilder e;
+              e.set("seq", static_cast<double>(b.seq));
+              e.set("device", static_cast<double>(b.device));
+              e.set("requests", static_cast<double>(b.requests));
+              e.set("items", static_cast<double>(b.items));
+              e.set("tokens", static_cast<double>(b.tokens));
+              e.set("budget", static_cast<double>(b.budget));
+              e.set("startMs", b.start_ms);
+              e.set("ms", b.ms);
+              return e.build();
+          }));
+    return o.build();
+}
+
+// Everything a predict call reads from its arguments, read on the JS thread.
+struct Call {
+    std::string state;
+    std::vector<LayaQuestion> questions;
+    laya::RequestOptions opts;
+};
+
+bool readCall(std::span<const Value> a, Call& c, std::string& err) {
+    if (a.size() < 2) {
+        err = "(state, questions): 2 arguments required";
+        return false;
+    }
+    if (!readState(a[0], c.state, err)) return false;
+    if (!readQuestions(a[1], c.questions, err)) return false;
+    return a.size() < 3 || readRequestOptions(a[2], c.opts, err);
+}
+
+laya::Scheduler* liveScheduler(Value self, const char* what, std::string& err) {
+    HostLaya* h = hostLayaOf(self);
+    if (!h || !h->sched) {
+        err = std::string(what) + ": not a LayaModel";
+        return nullptr;
+    }
+    if (h->sched->is_shut_down()) {
+        err = std::string(what) + ": LayaModel is disposed";
+        return nullptr;
+    }
+    return h->sched.get();
+}
+
+void decorateLayaModel(ObjectBuilder& b) {
+    // config() -> { max_len, head_max_len, temperature, temperature_by_options,
+    //               devices, tokenBudget, maxBatchTokens, targetForwardMs, deadlineMs }
     b.def("config", 0, [](Value self, std::span<const Value>) -> Value {
-        auto* model = hostLayaModelOf(self);
-        if (!model) return ev::throwTypeError("config: not a LayaModel");
-        const brolm::laya::Config& c = model->config();
+        HostLaya* h = hostLayaOf(self);
+        if (!h || !h->sched) return ev::throwTypeError("config: not a LayaModel");
+        const laya::Config& c = h->sched->model().config();
+        const laya::SchedulerOptions& so = h->sched->options();
+        const std::vector<int> devs = h->sched->devices();
         ObjectBuilder o;
         o.set("max_len", static_cast<double>(c.max_len));
         o.set("head_max_len", static_cast<double>(c.head_max_len));
@@ -70,262 +356,198 @@ static void decorateLayaModel(ObjectBuilder& b) {
         ObjectBuilder tbo;
         for (const auto& [k, t] : c.temperature_by_options) tbo.set(k, static_cast<double>(t));
         o.set("temperature_by_options", tbo.build());
+        o.set("devices", hostArrayOf(devs.size(), [&](size_t i) { return ev::fromDouble(devs[i]); }));
+        o.set("tokenBudget", static_cast<double>(h->sched->token_budget()));
+        o.set("maxBatchTokens", static_cast<double>(so.max_batch_tokens));
+        o.set("targetForwardMs", so.target_forward_ms);
+        o.set("deadlineMs", so.default_deadline_ms);
         return o.build();
     });
 
-    // predict(state, questions, options?)
-    //   options: { maxLen, headMaxLen, truncateLeft } (snake_case accepted) —
-    //   per-call overrides of the checkpoint's max_len / head_max_len, and
-    //   truncateLeft keeps the newest state tokens (multi-turn conversations).
+    // predict(state, questions, options?) — blocking: queued with everything
+    // else in flight, and this thread waits for its answer.
     b.def("predict", 3, [](Value self, std::span<const Value> a) -> Value {
-        auto* model = hostLayaModelOf(self);
-        if (!model) return ev::throwTypeError("predict: not a LayaModel");
-        if (a.size() < 2) return ev::throwTypeError("predict(state, questions): 2 arguments required");
-
-        brolm::laya::PredictOptions opts;
-        if (a.size() >= 3 && ev::isObject(a[2])) {
-            bool found = false;
-            opts.max_len = intProp(a[2], "maxLen", "max_len", found);
-            opts.head_max_len = intProp(a[2], "headMaxLen", "head_max_len", found);
-            Value tl = ev::getProperty(a[2], "truncateLeft");
-            if (!ev::isBool(tl)) tl = ev::getProperty(a[2], "truncate_left");
-            opts.truncate_left = ev::isBool(tl) && ev::toBool(tl);
-            if (opts.max_len < 0 || opts.head_max_len < 0) {
-                return ev::throwRangeError("predict: maxLen / headMaxLen must be positive");
-            }
-        }
-
-        // 1. Read state: a string is used as is; an object/array is
-        //    serialised like the reference's json.dumps(state).
-        std::string state;
-        if (ev::isString(a[0])) {
-            state = ev::toUtf8(a[0]);
-        } else if (ev::isObject(a[0])) {
-            if (!pythonStyleJson(a[0], state)) {
-                return ev::throwTypeError("predict: failed to serialize state to JSON");
-            }
-        } else {
-            return ev::throwTypeError("predict: state must be a string or object");
-        }
-
-        // 2. Parse questions JS object into std::unordered_map<std::string, LayaQuestion>.
-        if (!ev::isObject(a[1])) {
-            return ev::throwTypeError("predict: questions must be an object");
-        }
-
-        std::vector<std::string> keys = getObjectKeys(a[1]);
-        std::unordered_map<std::string, brolm::LayaQuestion> questions;
-        std::vector<std::string> questionOrder;
-        questionOrder.reserve(keys.size());
-
-        for (const std::string& qId : keys) {
-            Value qDef = ev::getProperty(a[1], qId);
-            if (!ev::isObject(qDef)) continue;
-
-            brolm::LayaQuestion q;
-            q.id = qId;
-
-            Value typeVal = ev::getProperty(qDef, "type");
-            if (ev::isString(typeVal)) {
-                q.type = ev::toUtf8(typeVal);
-            }
-
-            Value insVal = ev::getProperty(qDef, "instructions");
-            if (ev::isString(insVal)) {
-                q.instructions = ev::toUtf8(insVal);
-            } else if (!ev::isUndefined(insVal)) {
-                pythonStyleJson(insVal, q.instructions);  // reference: json.dumps
-            }
-
-            Value critVal = ev::getProperty(qDef, "criteria");
-            if (ev::isObject(critVal)) {
-                Value critLenVal = ev::getProperty(critVal, "length");
-                if (ev::isNumber(critLenVal)) {
-                    // Array of criteria
-                    uint32_t critLen = static_cast<uint32_t>(ev::toDouble(critLenVal));
-                    if (q.type == "choice") {
-                        for (uint32_t c = 0; c < critLen; ++c) {
-                            Value item = ev::getElement(critVal, c);
-                            if (ev::isString(item)) {
-                                q.criteria_choice.emplace_back(ev::toUtf8(item), "");
-                            } else if (ev::isObject(item)) {
-                                Value itemLen = ev::getProperty(item, "length");
-                                if (ev::isNumber(itemLen) && ev::toDouble(itemLen) >= 2) {
-                                    Value k = ev::getElement(item, 0);
-                                    Value v = ev::getElement(item, 1);
-                                    q.criteria_choice.emplace_back(
-                                        ev::isString(k) ? ev::toUtf8(k) : "",
-                                        ev::isString(v) ? ev::toUtf8(v) : "");
-                                }
-                            }
-                        }
-                    } else if (q.type == "score") {
-                        for (uint32_t c = 0; c < critLen; ++c) {
-                            Value item = ev::getElement(critVal, c);
-                            if (ev::isString(item)) {
-                                q.criteria_score.push_back(ev::toUtf8(item));
-                            }
-                        }
-                    } else { // noul
-                        if (critLen > 0) {
-                            Value v0 = ev::getElement(critVal, 0);
-                            if (ev::isString(v0)) q.criteria_noul_false = ev::toUtf8(v0);
-                        }
-                        if (critLen > 1) {
-                            Value v1 = ev::getElement(critVal, 1);
-                            if (ev::isString(v1)) q.criteria_noul_true = ev::toUtf8(v1);
-                        }
-                    }
-                } else {
-                    // Object criteria (e.g. { billing: "...", technical: "..." })
-                    std::vector<std::string> cKeys = getObjectKeys(critVal);
-                    for (const std::string& kStr : cKeys) {
-                        Value vVal = ev::getProperty(critVal, kStr);
-                        std::string vStr;
-                        if (ev::isString(vVal)) {
-                            vStr = ev::toUtf8(vVal);
-                        } else if (!ev::isUndefined(vVal) && !ev::isNull(vVal)) {
-                            pythonStyleJson(vVal, vStr);  // structured criterion -> JSON text
-                        }
-                        if (q.type == "choice" || q.type.empty()) {
-                            q.criteria_choice.emplace_back(kStr, vStr);
-                        } else if (q.type == "score") {
-                            // reference: enumerate(dict) walks the keys
-                            q.criteria_score.push_back(kStr);
-                        } else { // noul
-                            if (kStr == "false" || kStr == "0") q.criteria_noul_false = vStr;
-                            else if (kStr == "true" || kStr == "1") q.criteria_noul_true = vStr;
-                        }
-                    }
-                }
-            }
-
-            if (q.type.empty()) {
-                if (!q.criteria_choice.empty()) q.type = "choice";
-                else if (!q.criteria_score.empty()) q.type = "score";
-                else q.type = "noul";
-            }
-
-            questionOrder.push_back(qId);
-            questions[qId] = std::move(q);
-        }
-
-        // 3. Call model->predict in the caller's question order.
-        std::vector<brolm::LayaQuestion> ordered;
-        ordered.reserve(questionOrder.size());
-        for (const std::string& qId : questionOrder) ordered.push_back(questions[qId]);
-
+        std::string err;
+        laya::Scheduler* sched = liveScheduler(self, "predict", err);
+        if (!sched) return ev::throwTypeError(err);
+        Call c;
+        if (!readCall(a, c, err)) return ev::throwTypeError("predict: " + err);
         try {
-            brolm::LayaResult res = model->predict(state, ordered, opts);
-
-            // 4. Build and return JS object using bronze::embed APIs.
-            ObjectBuilder out;
-            out.set("model", res.model);
-
-            ObjectBuilder answersObj;
-            for (const std::string& qId : questionOrder) {
-                auto it = res.answers.find(qId);
-                if (it == res.answers.end()) continue;
-                const brolm::LayaAnswer& ans = it->second;
-                const brolm::LayaQuestion& q = questions[qId];
-
-                ObjectBuilder aObj;
-                aObj.set("type", ans.type);
-
-                if (ans.type == "choice") {
-                    aObj.set("choice", ans.choice);
-                    aObj.set("confidence", static_cast<double>(ans.confidence));
-                } else if (ans.type == "score") {
-                    aObj.set("score", static_cast<double>(ans.score));
-                    aObj.set("confidence", static_cast<double>(ans.confidence));
-                    ObjectBuilder legendObj;
-                    for (size_t c = 0; c < q.criteria_score.size(); ++c) {
-                        legendObj.set(std::to_string(c), q.criteria_score[c]);
-                    }
-                    aObj.set("legend", legendObj.build());
-                } else {  // "noul"
-                    aObj.set("noul", static_cast<double>(ans.noul));
-                }
-                if (ans.type != "noul") {
-                    ObjectBuilder probObj;
-                    for (const auto& [k, p] : ans.probabilities) {
-                        probObj.set(k, static_cast<double>(p));
-                    }
-                    aObj.set("probabilities", probObj.build());
-                }
-                // Raw, pre-temperature scorer logits (option order) and the
-                // temperature applied — enough to refit calibration downstream.
-                aObj.set("logits", makeFloat32Array(ans.logits.data(), ans.logits.size()));
-                aObj.set("temperature", static_cast<double>(ans.temperature));
-
-                ObjectBuilder rlObj;
-                rlObj.set("act_probability", static_cast<double>(ans.act_probability));
-                rlObj.set("act_logits", makeFloat32Array(ans.act_logits.data(), ans.act_logits.size()));
-                aObj.set("rl_agent", rlObj.build());
-
-                answersObj.set(qId, aObj.build());
-            }
-            out.set("answers", answersObj.build());
-
-            ObjectBuilder usageObj;
-            usageObj.set("input_tokens", static_cast<double>(res.input_tokens));
-            usageObj.set("output_tokens", 0.0);
-            out.set("usage", usageObj.build());
-
-            return out.build();
+            const laya::ScheduledResult r = sched->predict(c.state, c.questions, c.opts);
+            return buildResult(r, c.questions);
         } catch (const std::exception& e) {
             return ev::throwError(std::string("predict: ") + e.what());
         }
     });
+
+    // predictAsync(state, questions, options?) -> Promise<result>, settled on
+    // this thread's next LM tick.
+    b.def("predictAsync", 3, [](Value self, std::span<const Value> a) -> Value {
+        ev::Persistent promise(ev::createPromise());
+        std::string err;
+        laya::Scheduler* sched = liveScheduler(self, "predictAsync", err);
+        if (!sched) return layaRejectWith(promise.get(), err);
+        auto call = std::make_shared<Call>();
+        if (!readCall(a, *call, err)) return layaRejectWith(promise.get(), "predictAsync: " + err);
+
+        std::shared_ptr<laya::Scheduler> keep = hostLayaOf(self)->sched;
+        const LayaPost post = layaTrackPromise(promise.get(), keep);
+        try {
+            sched->submit(call->state, call->questions, call->opts,
+                          [post, call](laya::ScheduledResult&& r, std::exception_ptr e) {
+                              std::string failure;
+                              if (e) {
+                                  try {
+                                      std::rethrow_exception(e);
+                                  } catch (const std::exception& x) {
+                                      failure = x.what();
+                                  } catch (...) {
+                                      failure = "unknown error";
+                                  }
+                              }
+                              auto res = std::make_shared<laya::ScheduledResult>(std::move(r));
+                              post([res, call, failure](const ev::Persistent& p) {
+                                  if (!failure.empty()) {
+                                      layaRejectWith(p.get(), "predictAsync: " + failure);
+                                      return;
+                                  }
+                                  ev::Persistent v(buildResult(*res, call->questions));
+                                  ev::resolvePromise(p.get(), v.get());
+                              });
+                          });
+        } catch (const std::exception& e) {
+            // Tokenize / option-fit errors: rejected on the next tick like any other failure.
+            const std::string msg = std::string("predictAsync: ") + e.what();
+            post([msg](const ev::Persistent& p) { layaRejectWith(p.get(), msg); });
+        }
+        return promise.get();
+    });
+
+    // stats() -> scheduler counters since the last resetStats().
+    b.def("stats", 0, [](Value self, std::span<const Value>) -> Value {
+        HostLaya* h = hostLayaOf(self);
+        if (!h || !h->sched) return ev::throwTypeError("stats: not a LayaModel");
+        return buildStats(h->sched->stats());
+    });
+
+    b.def("resetStats", 0, [](Value self, std::span<const Value>) -> Value {
+        HostLaya* h = hostLayaOf(self);
+        if (!h || !h->sched) return ev::throwTypeError("resetStats: not a LayaModel");
+        h->sched->reset_stats();
+        return ev::undefined();
+    });
+
+    // dispose(): stop the device threads and free every replica now. Pending
+    // predictAsync promises reject; later calls throw.
+    b.def("dispose", 0, [](Value self, std::span<const Value>) -> Value {
+        HostLaya* h = hostLayaOf(self);
+        if (!h || !h->sched) return ev::throwTypeError("dispose: not a LayaModel");
+        h->sched->shutdown();
+        return ev::undefined();
+    });
 }
 
-} // namespace
-
-Value js_loadLaya(Value, std::span<const Value> a) {
+// loadLaya(path | { path|modelPath, ... }, options?) — the options may ride
+// on the first argument or come second:
+//   devices: "all" | number[] | number   (default: the default device)
+//   maxBatchTokens, targetForwardMs, deadlineMs, prewarm, maxLen, headMaxLen
+bool readLoadArgs(std::span<const Value> a, const char* what, std::string& path, laya::SchedulerOptions& so,
+                  std::string& err) {
     if (a.empty()) {
-        return ev::throwTypeError("loadLaya: path string required");
+        err = std::string(what) + ": path string required";
+        return false;
     }
-
-    std::string path;
+    Value opts = ev::undefined();
     if (ev::isString(a[0])) {
         path = ev::toUtf8(a[0]);
+        if (a.size() > 1 && ev::isObject(a[1])) opts = a[1];
     } else if (ev::isObject(a[0])) {
         Value p = ev::getProperty(a[0], "modelPath");
         if (!ev::isString(p)) p = ev::getProperty(a[0], "path");
         if (ev::isString(p)) path = ev::toUtf8(p);
+        opts = a[0];
     }
-
     if (path.empty()) {
-        return ev::throwTypeError("loadLaya: path string required");
+        err = std::string(what) + ": path string required";
+        return false;
     }
-
-    std::string resolved = resolvePath(path);
-    if (!std::filesystem::exists(resolved)) {
-        return ev::throwError("loadLaya: model path not found: " + resolved);
-    }
-
-    brotensor::init();
-
-    try {
-        auto model = std::make_unique<brolm::LayaModel>();
-        model->load_model(resolved);
-        // Optional load-time defaults: { maxLen, headMaxLen } replace the
-        // checkpoint's max_len / head_max_len for every later predict().
-        if (ev::isObject(a[0])) {
-            bool found = false;
-            const int ml = intProp(a[0], "maxLen", "max_len", found);
-            if (found && ml > 0) model->mutable_config().max_len = ml;
-            const int hml = intProp(a[0], "headMaxLen", "head_max_len", found);
-            if (found && hml > 0) model->mutable_config().head_max_len = hml;
+    if (ev::isObject(opts)) {
+        ev::Persistent o(opts);
+        double d = 0;
+        if (numProp(o.get(), "maxBatchTokens", "max_batch_tokens", d)) so.max_batch_tokens = static_cast<int>(d);
+        if (numProp(o.get(), "targetForwardMs", "target_forward_ms", d)) so.target_forward_ms = d;
+        if (numProp(o.get(), "deadlineMs", "deadline_ms", d)) so.default_deadline_ms = d;
+        if (numProp(o.get(), "maxLen", "max_len", d)) so.max_len = static_cast<int>(d);
+        if (numProp(o.get(), "headMaxLen", "head_max_len", d)) so.head_max_len = static_cast<int>(d);
+        boolProp(o.get(), "prewarm", nullptr, so.prewarm);
+        ev::Persistent devs(ev::getProperty(o.get(), "devices"));
+        if (ev::isString(devs.get())) {
+            if (ev::toUtf8(devs.get()) != "all") {
+                err = std::string(what) + ": devices must be \"all\", an index or an array of indices";
+                return false;
+            }
+            so.devices = laya::Scheduler::all_devices();
+        } else if (ev::isNumber(devs.get())) {
+            so.devices = {static_cast<int>(ev::toDouble(devs.get()))};
+        } else if (ev::isObject(devs.get())) {
+            Value lenV = ev::getProperty(devs.get(), "length");
+            const uint32_t n = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                Value e = ev::getElement(devs.get(), i);
+                if (ev::isNumber(e)) so.devices.push_back(static_cast<int>(ev::toDouble(e)));
+            }
         }
-        return g_layaModelClass.createInstance(std::move(model));
+    }
+    const std::string resolved = resolvePath(path);
+    if (!std::filesystem::exists(resolved + "/model.safetensors")) {
+        err = std::string(what) + ": no Laya checkpoint (model.safetensors) at " + resolved;
+        return false;
+    }
+    path = resolved;
+    return true;
+}
+
+}  // namespace
+
+Value makeLayaModelValue(std::shared_ptr<laya::Scheduler> sched) {
+    layaRegisterScheduler(sched);
+    auto h = std::make_unique<HostLaya>();
+    h->sched = std::move(sched);
+    return g_layaModelClass.createInstance(std::move(h));
+}
+
+// Blocking: returns once every replica is loaded and pre-warmed.
+Value js_loadLaya(Value, std::span<const Value> a) {
+    std::string path, err;
+    laya::SchedulerOptions so;
+    if (!readLoadArgs(a, "loadLaya", path, so, err)) {
+        return err.find("path string") != std::string::npos ? ev::throwTypeError(err) : ev::throwError(err);
+    }
+    try {
+        auto sched = std::make_shared<laya::Scheduler>(path, so);
+        sched->wait_ready();
+        return makeLayaModelValue(std::move(sched));
     } catch (const std::exception& e) {
         return ev::throwError(std::string("loadLaya: ") + e.what());
     }
+}
+
+// Promise<LayaModel>: the replicas load and pre-warm on their device threads.
+Value js_loadLayaAsync(Value, std::span<const Value> a) {
+    ev::Persistent promise(ev::createPromise());
+    std::string path, err;
+    laya::SchedulerOptions so;
+    if (!readLoadArgs(a, "loadLayaAsync", path, so, err)) return layaRejectWith(promise.get(), err);
+    try {
+        layaTrackLoad(promise.get(), std::make_shared<laya::Scheduler>(path, so));
+    } catch (const std::exception& e) {
+        return layaRejectWith(promise.get(), std::string("loadLayaAsync: ") + e.what());
+    }
+    return promise.get();
 }
 
 void registerLMLayaClasses() {
     g_layaModelClass.install("LayaModel", 1, js_loadLaya, decorateLayaModel);
 }
 
-} // namespace brolm::api
+}  // namespace brolm::api

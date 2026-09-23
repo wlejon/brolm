@@ -135,9 +135,16 @@ public:
     // Same with a custom per-replica initialiser (runs on the device thread
     // under that device's DeviceScope) — tests use init_synthetic.
     Scheduler(std::function<void(DecisionModel&)> init, SchedulerOptions opts = {});
-    // Fails every request still queued ("scheduler shut down"), lets the
-    // running forwards finish, and joins the device threads.
+    // shutdown().
     ~Scheduler();
+
+    // Fail every request still queued ("shut down before the request ran"),
+    // let the running forwards finish, join the device threads and free the
+    // replicas' device memory. Idempotent; later submits throw. Must not be
+    // called from a completion callback (those run on the device threads),
+    // nor race a submit() still tokenizing on another thread.
+    void shutdown();
+    bool is_shut_down() const;
 
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;

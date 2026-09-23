@@ -84,7 +84,7 @@ struct Scheduler::Impl {
     std::vector<std::shared_ptr<Request>> queue;  // requests with untaken items
     int queued_tokens = 0, queued_items = 0;
     int idle = 0, loaded = 0;
-    bool ready = false, stop = false;
+    bool ready = false, stop = false, shut = false;
     std::string load_error;
     uint64_t next_seq = 0, batch_seq = 0;
 
@@ -421,12 +421,20 @@ void Scheduler::Impl::complete(Request& req) {
 
 // ─── Public surface ───────────────────────────────────────────────────────
 
-Scheduler::~Scheduler() {
+Scheduler::~Scheduler() { shutdown(); }
+
+void Scheduler::shutdown() {
+    for (auto& w : impl_->workers) {
+        if (w->thread.get_id() == std::this_thread::get_id()) {
+            throw std::logic_error("laya::Scheduler: shutdown from a completion callback (a device thread)");
+        }
+    }
     std::vector<std::shared_ptr<Request>> orphans;
     {
         std::unique_lock<std::mutex> lk(impl_->mu);
+        if (impl_->shut) return;
         impl_->ready_cv.wait(lk, [&] { return impl_->ready; });  // never tear down mid-load
-        impl_->stop = true;
+        impl_->stop = impl_->shut = true;
         orphans.swap(impl_->queue);
         impl_->queued_items = impl_->queued_tokens = 0;
     }
@@ -439,6 +447,19 @@ Scheduler::~Scheduler() {
         const int untaken = static_cast<int>(r->item_tokens.size()) - r->next_item;
         impl_->release(r, untaken, err);
     }
+    // Free the replicas' device memory now, not whenever the last owner of
+    // this object lets go (for a JS handle, a GC that may come after the
+    // device runtime is gone). The config stays readable through model().
+    for (auto& w : impl_->workers) {
+        const Config cfg = w->model.config();
+        w->model = DecisionModel();
+        w->model.mutable_config() = cfg;
+    }
+}
+
+bool Scheduler::is_shut_down() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->shut;
 }
 
 void Scheduler::wait_ready() {
@@ -456,6 +477,7 @@ bool Scheduler::poll_ready(std::string* error) const {
 void Scheduler::submit(const std::string& state, std::vector<LayaQuestion> questions, const RequestOptions& opts,
                        Completion done) {
     wait_ready();
+    if (is_shut_down()) throw std::runtime_error("laya::Scheduler: shut down");
     auto req = std::make_shared<Request>();
     req->submit_t = Clock::now();
     const double deadline_ms = opts.deadline_ms > 0 ? opts.deadline_ms : impl_->opts.default_deadline_ms;

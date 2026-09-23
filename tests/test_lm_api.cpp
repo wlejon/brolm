@@ -160,6 +160,15 @@ static void test_loader_validation() {
         TEST_CHECK(r.thrown);
         TEST_CHECK(errorMessage(r.value).find("loadLaya") != std::string::npos);
     }
+    // loadLayaAsync never throws: a bad path is a rejected promise.
+    {
+        Value arg = missing.get();
+        Value fn = ev::getProperty(lm, "loadLayaAsync");
+        TEST_CHECK(ev::isFunction(fn));
+        ev::CallResult r = ev::call(fn, lm, std::span<const Value>(&arg, 1));
+        TEST_CHECK(!r.thrown);
+        TEST_CHECK(ev::isPromise(r.value));
+    }
 
     // loadTokenizer({}) : an options object with none of the doc'd keys.
     {
@@ -430,6 +439,10 @@ static void test_laya() {
             if (cfg.max_len !== 512 || cfg.head_max_len !== 192 || cfg.temperature.length !== 3) {
                 throw new Error("config() mismatch");
             }
+            if (!Array.isArray(cfg.devices) || cfg.devices.length !== 1 || !(cfg.tokenBudget >= 512)) {
+                throw new Error("config() scheduler fields mismatch");
+            }
+            globalThis.__laya = laya;
 
             // Also test constructor form: new bro.lm.LayaModel(...)
             const layaCtor = new bro.lm.LayaModel(")JS" + model_dir + R"JS(");
@@ -448,6 +461,87 @@ static void test_laya() {
         std::exit(1);
     }
     TEST_CHECK(ev::toUtf8(res.value) == "SUCCESS");
+
+    // predictAsync: many requests in flight from one realm share forwards;
+    // promises settle on the LM tick (the engine's frame pump in bro).
+    std::string launch = R"JS(
+        (function() {
+            const laya = globalThis.__laya;
+            const qs = {
+                department: { type: "choice", instructions: "Which department should handle this request?",
+                              criteria: { billing: "invoices, payments, refunds", technical: "bugs, outages",
+                                          sales: "pricing, new contracts", other: "everything else" } },
+                churn_risk: { type: "noul", instructions: "Does the user threaten to cancel or leave?" }
+            };
+            const st = globalThis.__async = { done: 0, bad: null, shared: 0, rejected: false, loaded: null };
+            laya.resetStats();
+            for (let i = 0; i < 24; ++i) {
+                const state = { id: i, body: "We were billed twice for March, refund the duplicate or we cancel." };
+                laya.predictAsync(state, qs, { priority: i % 3, deadlineMs: 100 }).then((r) => {
+                    if (r.answers.department.choice !== "billing") st.bad = "wrong choice " + r.answers.department.choice;
+                    if (typeof r.timing.totalMs !== "number" || r.timing.forwards < 1) st.bad = "timing missing";
+                    if (typeof r.answers.churn_risk.confidence !== "number") st.bad = "noul confidence missing";
+                    if (r.timing.batchRequests > 1) st.shared++;
+                    st.done++;
+                }, (e) => { st.bad = String(e); });
+            }
+            const many = [];
+            for (let i = 0; i < 200; ++i) many.push("option " + i);
+            laya.predictAsync("x", { huge: { type: "choice", instructions: "pick", criteria: many } })
+                .then(() => { st.bad = "expected a rejection"; },
+                      (e) => { st.rejected = String(e.message).indexOf("options do not fit") >= 0; });
+            bro.lm.loadLayaAsync(")JS" + model_dir + R"JS(", { prewarm: false }).then((m) => {
+                st.loaded = m.predict("Please refund my duplicate charge.", qs).answers.department.choice;
+                m.dispose();
+            }, (e) => { st.bad = "loadLayaAsync: " + e; });
+            return "LAUNCHED";
+        })()
+    )JS";
+    res = bronze::eval::evalScript(launch);
+    TEST_CHECK(!res.thrown && ev::toUtf8(res.value) == "LAUNCHED");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string state;
+    for (;;) {
+        brolm::api::tickLMAsync();
+        ev::drainMicrotasks();
+        ev::CallResult s = bronze::eval::evalScript(
+            "(function(){ const s = globalThis.__async; return s.bad ? 'BAD ' + s.bad : "
+            "(s.done === 24 && s.rejected && s.loaded ? 'DONE' : 'WAIT'); })()");
+        state = ev::toUtf8(s.value);
+        if (state != "WAIT") break;
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (state != "DONE") {
+        std::cerr << "laya async: " << state << std::endl;
+        std::exit(1);
+    }
+
+    std::string check = R"JS(
+        (function() {
+            const laya = globalThis.__laya, st = globalThis.__async;
+            if (st.loaded !== "billing") throw new Error("loadLayaAsync model answered " + st.loaded);
+            if (st.shared === 0) throw new Error("no two async requests shared a forward");
+            const s = laya.stats();
+            if (s.completed < 24 || s.forwards < 1 || !(s.meanBatchRequests > 1) || s.devices.length !== 1)
+                throw new Error("stats: " + JSON.stringify(s));
+            if (!Array.isArray(s.recentBatches) || s.recentBatches.length !== s.forwards)
+                throw new Error("stats.recentBatches");
+            laya.dispose();
+            let threw = false;
+            try { laya.predict("x", { a: { type: "noul", instructions: "?" } }); }
+            catch (e) { threw = String(e.message).indexOf("disposed") >= 0; }
+            if (!threw) throw new Error("predict after dispose must throw");
+            return "SUCCESS " + st.shared + "/24 shared, mean " + s.meanBatchRequests.toFixed(1) + " requests/forward";
+        })()
+    )JS";
+    res = bronze::eval::evalScript(check);
+    if (res.thrown) {
+        std::cerr << "laya async check threw: " << errorMessage(res.value) << std::endl;
+        std::exit(1);
+    }
+    std::cout << "  async: " << ev::toUtf8(res.value) << std::endl;
 }
 
 int main() {
@@ -462,6 +556,7 @@ int main() {
         test_script();
         test_async_handle();
         test_laya();
+        brolm::api::shutdownLM();  // what bro's engine shutdown hook does
     }
     ev::destroyRealm(realm);
 
