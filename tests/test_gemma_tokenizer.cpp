@@ -48,7 +48,8 @@ static void write_fixture(const std::filesystem::path& path) {
     f << "{\"id\":1,\"content\":\"<eos>\",\"special\":true},";
     f << "{\"id\":2,\"content\":\"<bos>\",\"special\":true},";
     f << "{\"id\":3,\"content\":\"<unk>\",\"special\":true},";
-    f << "{\"id\":13,\"content\":\"<start_of_turn>\",\"special\":true}";
+    f << "{\"id\":13,\"content\":\"<start_of_turn>\",\"special\":true},";
+    f << "{\"id\":14,\"content\":\"<unused0>\",\"special\":false}";
     f << "],";
     f << "\"model\":{";
     f << "\"type\":\"BPE\",";
@@ -141,6 +142,25 @@ static void run_unit_tests() {
         CHECK(ids == exp);
     }
 
+    // Control tokens are marked: "special": true added tokens (and the framing
+    // ids) are special, give no grammar text, and drop under skip_special;
+    // a "special": false added token is ordinary text.
+    {
+        for (int id : {0, 1, 2, 3, 13}) {
+            CHECK(tok.is_special(id));
+            CHECK(tok.token_text(id).empty());
+        }
+        CHECK(!tok.is_special(14));
+        CHECK(tok.token_text(14) == "<unused0>");
+        CHECK(!tok.is_special(10));
+        CHECK(tok.token_text(10) == " cat");
+        CHECK(tok.token_text(9999).empty());
+
+        const std::vector<int32_t> ids = {2, 13, 5, 10, 14, 1};
+        CHECK(tok.decode(ids) == "<bos><start_of_turn>a cat<unused0><eos>");
+        CHECK(tok.decode(ids, /*skip_special=*/true) == "a cat<unused0>");
+    }
+
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
@@ -178,6 +198,24 @@ static void run_checkpoint_tests() {
         // Decode of the content (drop bos) round-trips the text.
         std::vector<int32_t> content(ids.begin() + 1, ids.end());
         CHECK(tok.decode(content) == "Hello this is a test");
+    }
+
+    // Turn markers are control tokens; Gemma's newline-run added tokens
+    // ("special": false in the file) stay text.
+    {
+        const auto eot = tok.tokenize("<end_of_turn>");
+        CHECK(eot.size() == 1);
+        if (eot.size() == 1) {
+            CHECK(tok.is_special(eot[0]));
+            CHECK(tok.token_text(eot[0]).empty());
+        }
+        const auto nl = tok.tokenize("\n\n");
+        CHECK(nl.size() == 1);
+        if (nl.size() == 1) {
+            CHECK(!tok.is_special(nl[0]));
+            CHECK(tok.token_text(nl[0]) == "\n\n");
+        }
+        CHECK(tok.decode({2, 4521, 1}, /*skip_special=*/true) == "Hello");
     }
 }
 

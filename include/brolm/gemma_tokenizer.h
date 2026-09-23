@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace brolm::gemma {
@@ -50,10 +51,24 @@ public:
     std::vector<int32_t> tokenize(std::string_view text) const;
 
     // Detokenize ids back to text (the inverse of tokenize): metaspace U+2581
-    // -> space and "<0xNN>" byte-fallback pieces -> their raw byte. Special /
-    // added tokens render as their literal piece string; ids outside the vocab
-    // are skipped.
-    std::string decode(const std::vector<int32_t>& ids) const;
+    // -> space and "<0xNN>" byte-fallback pieces -> their raw byte. Added
+    // tokens render as their literal piece string unless `skip_special` drops
+    // the control ones (HF skip_special_tokens); ids outside the vocab are
+    // skipped.
+    std::string decode(const std::vector<int32_t>& ids,
+                       bool skip_special = false) const;
+
+    // True for a control token: an added token the tokenizer.json marks
+    // "special": true (<pad>, <eos>, <bos>, <unk>, <start_of_turn>,
+    // <end_of_turn>, ...). Added tokens marked "special": false (Gemma's
+    // newline / whitespace runs, <unusedN>) are ordinary text, as in HF.
+    bool is_special(int32_t id) const { return special_ids_.count(id) != 0; }
+
+    // The bytes one id adds to generated text: its decoded piece, or "" for a
+    // control token and for an id outside the vocabulary. This is the table a
+    // grammar mask reads (Grammar::mask_logits masks every empty entry), so a
+    // constrained decode never emits <end_of_turn> as though it were text.
+    std::string token_text(int32_t id) const;
 
     std::size_t vocab_count() const { return model_.size(); }
     int bos_id() const { return bos_id_; }
@@ -65,7 +80,8 @@ private:
     Tokenizer() = default;
 
     brolm::detail::spm::Bpe model_;
-    brolm::detail::bpe::SpecialTokens specials_;
+    brolm::detail::bpe::SpecialTokens specials_;   // every added token, matched verbatim
+    std::unordered_set<int32_t> special_ids_;      // the "special": true ones
 
     int pad_id_ = 0;
     int eos_id_ = 1;

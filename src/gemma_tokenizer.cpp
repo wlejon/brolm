@@ -112,6 +112,10 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
             t.specials_.add(content, id);
             if (!t.model_.has(content)) t.model_.add_decode_only(content, id);
             note_special(content, id);
+            // "special": true marks a control token; "special": false added
+            // tokens (newline runs, <unusedN>) are text. A file without the
+            // flag keeps the old reading: every added token is control.
+            if (e.get_bool("special", true)) t.special_ids_.insert(id);
         }
     }
 
@@ -122,6 +126,8 @@ Tokenizer Tokenizer::load(const std::string& tokenizer_json_path) {
     t.eos_id_ = (eos >= 0) ? eos : 1;
     t.bos_id_ = (bos >= 0) ? bos : 2;
     t.unk_id_ = (unk >= 0) ? unk : 3;
+    // The framing ids are control tokens whether or not added_tokens lists them.
+    for (int id : {t.pad_id_, t.eos_id_, t.bos_id_, t.unk_id_}) t.special_ids_.insert(id);
     return t;
 }
 
@@ -149,8 +155,14 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text,
     return out;
 }
 
-std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
-    return model_.decode(ids);
+std::string Tokenizer::decode(const std::vector<int32_t>& ids,
+                              bool skip_special) const {
+    return model_.decode(ids, skip_special ? &special_ids_ : nullptr);
+}
+
+std::string Tokenizer::token_text(int32_t id) const {
+    if (is_special(id)) return {};
+    return model_.decode(std::vector<int32_t>{id});   // "" for an unknown id
 }
 
 }  // namespace brolm::gemma
