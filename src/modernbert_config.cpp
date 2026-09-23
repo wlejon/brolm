@@ -46,6 +46,7 @@ Config Config::from_json_text(const std::string& json_text) {
     cfg.num_hidden_layers   = root.get_int("num_hidden_layers",   cfg.num_hidden_layers);
     cfg.num_attention_heads = root.get_int("num_attention_heads", cfg.num_attention_heads);
     cfg.local_attention     = root.get_int("local_attention",     cfg.local_attention);
+    cfg.max_position_embeddings = root.get_int("max_position_embeddings", cfg.max_position_embeddings);
 
     if (const j::Value* eps = root.find("norm_eps"); eps && eps->is_number()) {
         cfg.norm_eps = static_cast<float>(eps->as_number());
@@ -97,6 +98,7 @@ void Config::validate() const {
     if (intermediate_size <= 0) fail_cfg("intermediate_size must be positive");
     if (num_hidden_layers <= 0) fail_cfg("num_hidden_layers must be positive");
     if (num_attention_heads <= 0) fail_cfg("num_attention_heads must be positive");
+    if (max_position_embeddings <= 0) fail_cfg("max_position_embeddings must be positive");
     if (hidden_size % num_attention_heads != 0) {
         fail_cfg("hidden_size must be divisible by num_attention_heads");
     }

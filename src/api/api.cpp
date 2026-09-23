@@ -25,6 +25,7 @@ void installLM() {
     registerLMClipClasses();
     registerLMLayaClasses();
     registerLMGrammarClass();
+    registerLMModernBertClass();
 
     // Every Value below that outlives an allocating call rides in a
     // Persistent (embed.h GC contract): getProperty, createObject and
@@ -68,6 +69,7 @@ void installLM() {
     lmObj.def("loadClip", 1, js_loadClip);
     lmObj.def("loadClipModel", 1, js_loadClip);
     lmObj.def("loadT5", 1, js_loadT5);
+    lmObj.def("loadModernBert", 1, js_loadModernBert);
     lmObj.def("loadLaya", 1, js_loadLaya);
     lmObj.def("loadLayaAsync", 1, js_loadLayaAsync);
     lmObj.def("generate", 2, js_lm_generate);
@@ -83,6 +85,7 @@ void installLM() {
     lmObj.set("ClipModel", g_clipModelClass.constructor());
     lmObj.set("NllbModel", g_nllbModelClass.constructor());
     lmObj.set("T5Model", g_t5ModelClass.constructor());
+    lmObj.set("ModernBertModel", g_modernBertModelClass.constructor());
     lmObj.set("LayaModel", g_layaModelClass.constructor());
     lmObj.set("AsyncHandle", g_asyncHandleClass.constructor());
     lmObj.set("Grammar", g_grammarClass.constructor());

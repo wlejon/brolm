@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -39,13 +40,13 @@ static std::string errorMessage(Value thrown) {
 static const char* kLoaders[] = {
     "loadQwen", "loadMistral", "loadGemma2", "loadModel", "loadQwen35",
     "loadQwen3VL", "loadNllb", "loadTokenizer", "loadLlama3Tokenizer",
-    "loadClip", "loadClipModel", "loadT5", "loadLaya",
+    "loadClip", "loadClipModel", "loadT5", "loadLaya", "loadModernBert",
 };
 
 static const char* kClasses[] = {
     "QwenTokenizer", "MistralTokenizer", "GemmaTokenizer", "Llama3Tokenizer",
     "LMModel", "Qwen35Model", "Qwen3VLModel", "ClipModel", "NllbModel",
-    "T5Model", "LayaModel", "AsyncHandle", "Grammar",
+    "T5Model", "LayaModel", "AsyncHandle", "Grammar", "ModernBertModel",
 };
 
 static Value lmNamespace() {
@@ -145,7 +146,7 @@ static void test_loader_validation() {
         const Value arg = missing.get();
         return ev::call(fn.get(), lm.get(), std::span<const Value>(&arg, 1));
     };
-    for (const char* name : {"loadQwen", "loadTokenizer", "loadLlama3Tokenizer", "loadLaya"}) {
+    for (const char* name : {"loadQwen", "loadTokenizer", "loadLlama3Tokenizer", "loadLaya", "loadModernBert"}) {
         // (loadTokenizer / loadLlama3Tokenizer: construction from a
         // nonexistent tokenizer.json.)
         ev::CallResult r = callWithMissing(name);
@@ -502,6 +503,94 @@ static void test_generation_weights() {
     }
 }
 
+// Weights-gated: bro.lm.loadModernBert over a Laya checkpoint's encoder,
+// against Hugging Face's ModernBertModel (tests/ref/gen_modernbert_encode.py
+// writes the fixture): the same [CLS] ... [SEP] ids, and hidden states that
+// match row for row. LAYA_MODEL_DIR, else D:/projects/laya.
+static void test_modernbert() {
+    std::cout << "[weights] ModernBERT encoder..." << std::endl;
+
+    const char* env_dir = std::getenv("LAYA_MODEL_DIR");
+    std::string model_dir = (env_dir && env_dir[0]) ? env_dir : "D:/projects/laya";
+    std::replace(model_dir.begin(), model_dir.end(), '\\', '/');
+    const std::filesystem::path fixture = std::filesystem::path(BROLM_SOURCE_DIR) / "tests/ref/modernbert_encode.json";
+    if (!std::filesystem::exists(model_dir + "/model.safetensors") ||
+        !std::filesystem::exists(model_dir + "/encoder/config.json")) {
+        std::cout << "  Skipping: no Laya checkpoint at " << model_dir << std::endl;
+        return;
+    }
+    std::ifstream f(fixture, std::ios::binary);
+    TEST_CHECK(f.good());
+    const std::string ref((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    // Handed over as a string for JSON.parse: thousands of numbers as one
+    // array literal overflow the compiler's stack.
+    std::string refLit;
+    for (char c : ref) {
+        if (c == '\\' || c == '\'') refLit += '\\';
+        if (c == '\n' || c == '\r') continue;
+        refLit += c;
+    }
+    std::string script = "globalThis.__mbRef = JSON.parse('" + refLit + "');\n" + R"JS(
+        (function() {
+            const m = bro.lm.loadModernBert(")JS" + model_dir + R"JS(");
+            if (!(m instanceof bro.lm.ModernBertModel)) throw new Error("not a ModernBertModel");
+            const ref = globalThis.__mbRef;
+            if (m.hiddenSize !== ref.hidden_size || m.numLayers !== 28 || m.maxLength !== 8192)
+                throw new Error("accessors " + m.hiddenSize + " " + m.numLayers + " " + m.maxLength);
+            const D = m.hiddenSize;
+            const cmp = (got, want, what) => {
+                let dot = 0, ng = 0, nw = 0, maxAbs = 0;
+                for (let i = 0; i < want.length; ++i) {
+                    dot += got[i] * want[i]; ng += got[i] * got[i]; nw += want[i] * want[i];
+                    maxAbs = Math.max(maxAbs, Math.abs(got[i] - want[i]));
+                }
+                const cos = dot / Math.sqrt(ng * nw);
+                if (!(cos > 0.999) || !(maxAbs < 0.08)) throw new Error(what + ": cos " + cos + " maxAbs " + maxAbs);
+                return maxAbs;
+            };
+            let worst = 0;
+            for (const c of ref.cases) {
+                const toks = m.tokenize(c.text);
+                if (toks.length !== c.ids.length || toks.some((v, i) => v !== c.ids[i]))
+                    throw new Error("ids differ for " + JSON.stringify(c.text.slice(0, 20)) + ": " + Array.from(toks).slice(0, 8));
+                const r = m.encode(c.text, { pooling: "mean" });
+                if (r.length !== c.ids.length || r.dim !== D || r.data.length !== r.length * D)
+                    throw new Error("shape " + r.length + "x" + r.dim);
+                const L = r.length;
+                worst = Math.max(worst, cmp(r.data.subarray(0, D), c.first, "row 0"));
+                worst = Math.max(worst, cmp(r.data.subarray((L - 1) * D, L * D), c.last, "row L-1"));
+                worst = Math.max(worst, cmp(r.pooled, c.mean, "mean"));
+                // Ids in, the same states out; cls pooling is row 0.
+                const byIds = m.encode(toks, { pooling: "cls" });
+                for (let i = 0; i < D; ++i)
+                    if (byIds.pooled[i] !== r.data[i]) throw new Error("ids path / cls pooling differ at " + i);
+            }
+            // addSpecialTokens: false drops [CLS]/[SEP]; maxLength keeps both.
+            const bare = m.tokenize("Hello, world!", { addSpecialTokens: false });
+            if (bare.length !== ref.cases[0].ids.length - 2 || bare[0] === m.clsId) throw new Error("addSpecialTokens");
+            const cut = m.tokenize(ref.cases[2].text, { maxLength: 16 });
+            if (cut.length !== 16 || cut[0] !== m.clsId || cut[15] !== m.sepId) throw new Error("maxLength cut");
+            // Bad arguments.
+            const expectThrow = (fn, re) => { try { fn(); } catch (e) { if (re.test(e.message)) return; throw e; } throw new Error("no throw: " + re); };
+            expectThrow(() => m.encode([m.clsId, 1 << 20]), /outside the vocabulary/);
+            expectThrow(() => m.encode("x", { pooling: "max" }), /pooling/);
+            expectThrow(() => m.encode("x", { maxLength: 0 }), /maxLength/);
+            // A method on the wrong receiver is refused, not reinterpreted.
+            expectThrow(() => bro.lm.ModernBertModel.prototype.encode.call(bro.lm.Grammar.exact("a"), "x"), /not a ModernBertModel/);
+            return "SUCCESS worst |d| " + worst.toFixed(4);
+        })()
+    )JS";
+    ev::CallResult res = bronze::eval::evalScript(script);
+    if (res.thrown) {
+        std::cerr << "modernbert eval threw: " << errorMessage(res.value) << std::endl;
+        std::exit(1);
+    }
+    const std::string out = ev::toUtf8(res.value);
+    TEST_CHECK(out.rfind("SUCCESS", 0) == 0);
+    std::cout << "  modernbert: " << out << std::endl;
+}
+
 static void test_laya() {
     std::cout << "[5/5] laya inference test..." << std::endl;
 
@@ -775,6 +864,7 @@ int main() {
         test_async_handle();
         test_grammar();
         test_generation_weights();
+        test_modernbert();
         test_laya();
         brolm::api::shutdownLM();  // what bro's engine shutdown hook does
     }

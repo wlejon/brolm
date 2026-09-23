@@ -12,6 +12,7 @@ struct Config {
     int num_hidden_layers = 28;
     int num_attention_heads = 16;
     int local_attention = 128;
+    int max_position_embeddings = 8192;  // longest sequence the checkpoint was trained on
     float norm_eps = 1e-5f;
     std::vector<std::string> layer_types;
     float rope_theta_full = 160000.0f;

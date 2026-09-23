@@ -274,6 +274,7 @@ extern HostClass g_nllbModelClass;
 extern HostClass g_t5ModelClass;
 extern HostClass g_layaModelClass;
 extern HostClass g_grammarClass;
+extern HostClass g_modernBertModelClass;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Conversions and Helpers
@@ -742,6 +743,7 @@ void registerLMVLClasses();
 void registerLMClipClasses();
 void registerLMLayaClasses();
 void registerLMGrammarClass();
+void registerLMModernBertClass();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // bro.lm Namespace Bindings
@@ -758,6 +760,7 @@ Value js_loadTokenizer(Value, std::span<const Value>);
 Value js_loadLlama3Tokenizer(Value, std::span<const Value>);
 Value js_loadClip(Value, std::span<const Value>);
 Value js_loadT5(Value, std::span<const Value>);
+Value js_loadModernBert(Value, std::span<const Value>);
 Value js_loadLaya(Value, std::span<const Value>);
 Value js_loadLayaAsync(Value, std::span<const Value>);
 Value js_lm_generate(Value, std::span<const Value>);
