@@ -16,9 +16,23 @@ JSON states are stored both as the reference serialisation (json.dumps,
 ensure_ascii=False) and as the compact form JSON.stringify produces, so the
 C++ side can check its Python-style re-spacer.
 
+One fixture per checkpoint of the Laya family (the repo root is English, the
+other two are subfolders):
+
+    english          -> laya_parity.json
+    multilingual     -> laya_parity_multilingual.json
+    typed-decisions  -> laya_parity_typed_decisions.json
+
+The non-English fixtures add their own calls (laya_cases.py): states and
+questions in several languages and scripts for multilingual, the four
+typed-decisions workflows for typed-decisions, and a harder tokenizer battery
+(CJK, Devanagari, Arabic, emoji, whitespace runs, byte-fallback characters,
+added tokens) for the Metaspace/ByteFallback BPE.
+
 Usage (needs torch + transformers + safetensors; CUDA optional):
-    USE_TF=0 python tests/ref/gen_laya_parity.py [LAYA_DIR]
-LAYA_DIR defaults to ../laya relative to the brolm checkout.
+    USE_TF=0 python tests/ref/gen_laya_parity.py [CHECKPOINT] [LAYA_DIR]
+CHECKPOINT defaults to english; LAYA_DIR to ../laya relative to the brolm
+checkout.
 """
 import json
 import os
@@ -27,15 +41,24 @@ import sys
 os.environ.setdefault("USE_TF", "0")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LAYA_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.normpath(os.path.join(HERE, "..", "..", "..", "laya"))
-sys.path.insert(0, LAYA_DIR)
+CHECKPOINTS = {"english": ("", "laya_parity.json"),
+               "multilingual": ("multilingual", "laya_parity_multilingual.json"),
+               "typed-decisions": ("typed-decisions", "laya_parity_typed_decisions.json")}
+CHECKPOINT = sys.argv[1] if len(sys.argv) > 1 else "english"
+if CHECKPOINT not in CHECKPOINTS:
+    sys.exit("unknown checkpoint %r (one of %s)" % (CHECKPOINT, ", ".join(CHECKPOINTS)))
+LAYA_ROOT = sys.argv[2] if len(sys.argv) > 2 else os.path.normpath(os.path.join(HERE, "..", "..", "..", "laya"))
+LAYA_DIR = os.path.join(LAYA_ROOT, CHECKPOINTS[CHECKPOINT][0]) if CHECKPOINTS[CHECKPOINT][0] else LAYA_ROOT
+sys.path.insert(0, LAYA_ROOT)  # rl_common.py / rl_agent_api.py live at the repo root
+sys.path.insert(0, HERE)
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from rl_agent_api import RLAgent  # noqa: E402
 from rl_common import QTYPES, build_sequence, collate_items, render_options, serialize_state, temp_bucket  # noqa: E402
+import laya_cases  # noqa: E402
 
-OUT = os.path.join(HERE, "laya_parity.json")
+OUT = os.path.join(HERE, CHECKPOINTS[CHECKPOINT][1])
 
 EMAIL = {"from": "user@acme.com", "subject": "Duplicate charge on invoice #4411",
          "body": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan."}
@@ -78,8 +101,9 @@ INTENTS = ["activate_my_card", "age_limit", "apple_pay_or_google_pay", "atm_supp
            "wrong_exchange_rate_for_cash_withdrawal"]
 
 
-def calls(tok):
+def calls(tok, cfg):
     """(name, state, questions, overrides). overrides: max_len / head_max_len / truncate_left."""
+    max_len, head_max_len = cfg["max_len"], cfg["head_max_len"]
     out = []
     out.append(("readme_email", EMAIL, {"department": DEPT, "urgency": URGENCY, "churn_risk": CHURN,
                                         "refund_requested": REFUND}, {}))
@@ -127,8 +151,8 @@ def calls(tok):
         mid = (lo + hi + 1) // 2
         st = " ".join(words[:mid])
         n_state = len(tok(st, add_special_tokens=False)["input_ids"])
-        n_head = len(build_sequence(tok, "", q0, 512, 192)[0]) - 1
-        if n_head + n_state + 1 <= 512:
+        n_head = len(build_sequence(tok, "", q0, max_len, head_max_len)[0]) - 1
+        if n_head + n_state + 1 <= max_len:
             lo = mid
         else:
             hi = mid - 1
@@ -218,7 +242,15 @@ def calibrate(agent, qt, logits):
 def main():
     agent = RLAgent(LAYA_DIR)
     fixtures = []
-    for name, state, questions, ov in calls(agent.tok):
+    all_calls = calls(agent.tok, agent.cfg)
+    strings = list(TOKENIZER_STRINGS)
+    if CHECKPOINT == "multilingual":
+        all_calls += laya_cases.multilingual_calls()
+        strings += laya_cases.HARD_TOKENIZER_STRINGS
+    elif CHECKPOINT == "typed-decisions":
+        all_calls += laya_cases.typed_decisions_calls()
+        all_calls += laya_cases.multilingual_calls()[:2]
+    for name, state, questions, ov in all_calls:
         max_len = ov.get("max_len", agent.cfg["max_len"])
         head_max_len = ov.get("head_max_len", agent.cfg["head_max_len"])
         tl = bool(ov.get("truncate_left", False))
@@ -258,10 +290,17 @@ def main():
                        "probs_fp32": probs, "probs_bf16": probs16})
         fixtures.append(entry)
         print("%-20s %d questions, lens %s" % (name, len(items), [len(it["ids"]) for it in items]))
-    tok_cases = [{"text": s, "ids": agent.tok(s, add_special_tokens=False)["input_ids"]} for s in TOKENIZER_STRINGS]
+    tok_cases = [{"text": s, "ids": agent.tok(s, add_special_tokens=False)["input_ids"]} for s in strings]
+    t = agent.tok
+    special = {"cls": t.cls_token_id, "sep": t.sep_token_id, "pad": t.pad_token_id, "mask": t.mask_token_id,
+               "mask_token": t.mask_token}
+    doc = {"generator": "tests/ref/gen_laya_parity.py", "torch": torch.__version__, "tokenizer": tok_cases,
+           "calls": fixtures}
+    if CHECKPOINT != "english":  # the English fixture predates these keys; keep it byte-stable
+        doc.update({"checkpoint": CHECKPOINT, "subdir": CHECKPOINTS[CHECKPOINT][0], "special": special,
+                    "config": {k: agent.cfg[k] for k in ("encoder", "max_len", "head_max_len", "max_prefixes")}})
     with open(OUT, "w", encoding="utf-8") as f:
-        json.dump({"generator": "tests/ref/gen_laya_parity.py", "torch": torch.__version__,
-                   "tokenizer": tok_cases, "calls": fixtures}, f, ensure_ascii=False)
+        json.dump(doc, f, ensure_ascii=False)
     print("wrote", OUT, os.path.getsize(OUT), "bytes")
 
 

@@ -1,14 +1,21 @@
-#include "brolm/laya_tokenizer.h"
-#include "brolm/laya.h"
+// LayaTokenizer: loading and encode() — the tokenizer.json pipeline of a Laya
+// checkpoint (see laya_tokenizer.h). Sequence building lives in
+// laya_sequence.cpp.
 
+#include "brolm/laya_tokenizer.h"
+
+#include "brolm/detail/byte_level_bpe.h"
+#include "brolm/detail/hf_bpe.h"
 #include "brolm/detail/json.h"
 #include "brolm/detail/unicode.h"
 
-#include <algorithm>
+#include <filesystem>
+#include <functional>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace brolm::laya {
 
@@ -30,26 +37,20 @@ std::string slurp(const std::string& path) {
     return ss.str();
 }
 
-std::string replace_all(std::string str, const std::string& from, const std::string& to) {
-    std::size_t start_pos = 0;
-    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
-        str.replace(start_pos, from.length(), to);
-        start_pos += to.length();
-    }
-    return str;
-}
+constexpr std::string_view kMetaspace = "\xE2\x96\x81";  // U+2581
 
 bool is_other(uint32_t cp) {
     return !uni::is_white_space(cp) && !uni::is_letter(cp) && !uni::is_number(cp);
 }
 
 // The GPT-2 ByteLevel split ModernBERT's tokenizer.json declares
-// (ByteLevel, use_regex=true, add_prefix_space=false):
+// (ByteLevel, use_regex=true):
 //   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
 // Contractions are case-sensitive, there is no digit-run limit, and a
 // punctuation run does not swallow trailing newlines (all three differ from
 // the Qwen2/Llama-3 pattern).
-std::vector<std::string_view> pre_tokenize(std::string_view text) {
+template <class Emit>
+void byte_level_split(std::string_view text, Emit&& emit_piece) {
     std::vector<uint32_t> cps;
     std::vector<std::size_t> offs;
     cps.reserve(text.size());
@@ -60,16 +61,11 @@ std::vector<std::string_view> pre_tokenize(std::string_view text) {
     }
     offs.push_back(text.size());
     const std::size_t n = cps.size();
-
-    std::vector<std::string_view> pieces;
-    auto emit = [&](std::size_t a, std::size_t b) {
-        pieces.push_back(text.substr(offs[a], offs[b] - offs[a]));
-    };
+    auto emit = [&](std::size_t a, std::size_t b) { emit_piece(text.substr(offs[a], offs[b] - offs[a])); };
 
     std::size_t i = 0;
     while (i < n) {
         const uint32_t c = cps[i];
-
         if (c == '\'' && i + 1 < n) {
             const uint32_t d = cps[i + 1];
             if (d == 's' || d == 't' || d == 'm' || d == 'd') {
@@ -79,77 +75,80 @@ std::vector<std::string_view> pre_tokenize(std::string_view text) {
             }
             if (i + 2 < n) {
                 const uint32_t e = cps[i + 2];
-                if ((d == 'r' && e == 'e') || (d == 'v' && e == 'e') ||
-                    (d == 'l' && e == 'l')) {
+                if ((d == 'r' && e == 'e') || (d == 'v' && e == 'e') || (d == 'l' && e == 'l')) {
                     emit(i, i + 3);
                     i += 3;
                     continue;
                 }
             }
         }
-
-        // ?\p{L}+
-        {
-            std::size_t j_idx = i;
-            if (c == ' ') ++j_idx;
-            if (j_idx < n && uni::is_letter(cps[j_idx])) {
-                std::size_t k = j_idx + 1;
-                while (k < n && uni::is_letter(cps[k])) ++k;
+        // ` ?\p{L}+`, ` ?\p{N}+`, ` ?[^\s\p{L}\p{N}]+`
+        bool matched = false;
+        for (int cls = 0; cls < 3 && !matched; ++cls) {
+            auto in_cls = [cls](uint32_t cp) {
+                return cls == 0 ? uni::is_letter(cp) : cls == 1 ? uni::is_number(cp) : is_other(cp);
+            };
+            std::size_t k = i + (c == ' ' ? 1 : 0);
+            if (k < n && in_cls(cps[k])) {
+                ++k;
+                while (k < n && in_cls(cps[k])) ++k;
                 emit(i, k);
                 i = k;
-                continue;
+                matched = true;
             }
         }
-
-        // ?\p{N}+
-        {
-            std::size_t j_idx = i;
-            if (c == ' ') ++j_idx;
-            if (j_idx < n && uni::is_number(cps[j_idx])) {
-                std::size_t k = j_idx + 1;
-                while (k < n && uni::is_number(cps[k])) ++k;
-                emit(i, k);
-                i = k;
-                continue;
-            }
-        }
-
-        // ?[^\s\p{L}\p{N}]+
-        {
-            std::size_t j_idx = i;
-            if (c == ' ') ++j_idx;
-            if (j_idx < n && is_other(cps[j_idx])) {
-                std::size_t k = j_idx + 1;
-                while (k < n && is_other(cps[k])) ++k;
-                emit(i, k);
-                i = k;
-                continue;
-            }
-        }
-
-        // Only whitespace reaches here (every other code point is L, N or
-        // "other", all matched above).
+        if (matched) continue;
+        // Only whitespace reaches here. \s+(?!\S): the whole run at end of
+        // text; otherwise the run minus its last code point, which is left for
+        // the next token (a ' ' joins it, anything else falls to \s+ alone).
         std::size_t run_end = i + 1;
         while (run_end < n && uni::is_white_space(cps[run_end])) ++run_end;
-
-        // \s+(?!\S): the whole run at end of text; otherwise the run minus its
-        // last code point, which is left for the next token (a ' ' joins it,
-        // anything else falls to \s+ as a single code point).
-        if (run_end == n) {
+        if (run_end == n || run_end - i == 1) {
             emit(i, run_end);
             i = run_end;
-        } else if (run_end - i > 1) {
+        } else {
             emit(i, run_end - 1);
             i = run_end - 1;
-        } else {
-            emit(i, run_end);
-            i = run_end;
         }
     }
-    return pieces;
+}
+
+// The code point ending just before byte `end` (UTF-8), and its start.
+uint32_t prev_codepoint(std::string_view s, std::size_t end, std::size_t& start) {
+    start = end - 1;
+    while (start > 0 && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) --start;
+    std::size_t i = start;
+    return uni::decode_utf8(s, i);
+}
+
+std::string token_content(const j::Value* v) {
+    if (!v) return {};
+    if (v->is_string()) return v->as_string();
+    if (v->is_object()) return v->get_string("content", "");
+    return {};
 }
 
 }  // namespace
+
+struct LayaTokenizer::Model {
+    brolm::detail::hfbpe::Model bpe;
+    bpe::SpecialTokens added;                 // every added token, matched on the raw text
+    std::unordered_map<int32_t, uint8_t> strip;  // added-token id -> 1 lstrip | 2 rstrip
+
+    // Normalizer steps in order: NFC, or Replace(from -> to).
+    struct Norm {
+        bool nfc = false;
+        std::string from, to;
+    };
+    std::vector<Norm> norms;
+
+    // ByteLevel
+    std::string byte_to_unicode[256];
+    bool byte_level_prefix_space = false;
+    // Metaspace
+    enum class Prepend { Always, First, Never } prepend = Prepend::Always;
+    bool split = true;
+};
 
 struct LayaTokenizer::PieceCache {
     static constexpr std::size_t kMaxEntries = 1 << 16;
@@ -157,9 +156,134 @@ struct LayaTokenizer::PieceCache {
     std::unordered_map<std::string, std::vector<int32_t>> ids;
 };
 
+LayaTokenizer::LayaTokenizer() = default;
+
+std::size_t LayaTokenizer::vocab_size() const { return model_ ? model_->bpe.vocab_size() : 0; }
+
+LayaTokenizer LayaTokenizer::load(const std::string& tokenizer_json_path) {
+    LayaTokenizer t;
+    t.cache_ = std::make_shared<PieceCache>();
+    auto m = std::make_shared<Model>();
+
+    j::Value root;
+    try {
+        root = j::parse(slurp(tokenizer_json_path));
+    } catch (const std::runtime_error& e) {
+        if (std::string(e.what()).rfind("laya::", 0) == 0) throw;
+        fail_tok(std::string("json parse: ") + e.what());
+    }
+    if (!root.is_object()) fail_tok("root is not a JSON object");
+
+    const j::Value* model = root.find("model");
+    if (!model || !model->is_object()) fail_tok("missing 'model' object");
+    m->bpe.load(*model);
+
+    // Added tokens: matched verbatim before normalization (all Laya
+    // checkpoints' added tokens are normalized=false).
+    std::unordered_map<std::string, int32_t> added_ids;
+    if (const j::Value* at = root.find("added_tokens"); at && at->is_array()) {
+        for (const auto& tok : at->as_array()) {
+            const j::Value* content = tok.find("content");
+            const j::Value* idv = tok.find("id");
+            if (!content || !content->is_string() || !idv || !idv->is_number()) continue;
+            const int32_t id = static_cast<int32_t>(idv->as_number());
+            m->added.add(content->as_string(), id);
+            added_ids[content->as_string()] = id;
+            const uint8_t s = (tok.get_bool("lstrip", false) ? 1 : 0) | (tok.get_bool("rstrip", false) ? 2 : 0);
+            if (s) m->strip[id] = s;
+        }
+    }
+
+    // Normalizer.
+    std::function<void(const j::Value&)> add_norm = [&](const j::Value& n) {
+        if (n.is_null()) return;
+        const std::string type = n.get_string("type", "");
+        if (type == "NFC") {
+            m->norms.push_back(Model::Norm{true, {}, {}});
+        } else if (type == "Replace") {
+            const j::Value* pat = n.find("pattern");
+            const j::Value* s = pat ? pat->find("String") : nullptr;
+            if (!s || !s->is_string()) fail_tok("Replace normalizer: only a String pattern is supported");
+            m->norms.push_back(Model::Norm{false, s->as_string(), n.get_string("content", "")});
+        } else if (type == "Sequence") {
+            if (const j::Value* list = n.find("normalizers"); list && list->is_array())
+                for (const auto& e : list->as_array()) add_norm(e);
+        } else {
+            fail_tok("unsupported normalizer '" + type + "'");
+        }
+    };
+    if (const j::Value* n = root.find("normalizer"); n) add_norm(*n);
+
+    // Pre-tokenizer.
+    const j::Value* pre = root.find("pre_tokenizer");
+    if (!pre || !pre->is_object()) fail_tok("missing 'pre_tokenizer'");
+    const std::string pre_type = pre->get_string("type", "");
+    if (pre_type == "ByteLevel") {
+        t.kind_ = Kind::ByteLevel;
+        if (!pre->get_bool("use_regex", true)) fail_tok("ByteLevel pre-tokenizer without use_regex is not supported");
+        m->byte_level_prefix_space = pre->get_bool("add_prefix_space", false);
+        bpe::build_byte_to_unicode(m->byte_to_unicode);
+    } else if (pre_type == "Metaspace") {
+        t.kind_ = Kind::Metaspace;
+        if (pre->get_string("replacement", std::string(kMetaspace)) != kMetaspace)
+            fail_tok("Metaspace pre-tokenizer: only the U+2581 replacement is supported");
+        std::string scheme = pre->get_string("prepend_scheme", "");
+        if (scheme.empty()) scheme = pre->get_bool("add_prefix_space", true) ? "always" : "never";
+        m->prepend = scheme == "always" ? Model::Prepend::Always
+                   : scheme == "first"  ? Model::Prepend::First
+                                        : Model::Prepend::Never;
+        m->split = pre->get_bool("split", true);
+    } else {
+        fail_tok("unsupported pre_tokenizer '" + pre_type + "'");
+    }
+
+    // Special-token roles from tokenizer_config.json (the reference reads
+    // tok.cls_token_id etc. through it).
+    const std::filesystem::path cfg_path =
+        std::filesystem::path(tokenizer_json_path).parent_path() / "tokenizer_config.json";
+    std::string cls = "[CLS]", sep = "[SEP]", pad = "[PAD]", mask = "[MASK]", unk = "[UNK]";
+    if (std::filesystem::exists(cfg_path)) {
+        const j::Value cfg = j::parse(slurp(cfg_path.string()));
+        auto role = [&](const char* key, std::string& out) {
+            const std::string s = token_content(cfg.find(key));
+            if (!s.empty()) out = s;
+        };
+        role("cls_token", cls);
+        role("sep_token", sep);
+        role("pad_token", pad);
+        role("mask_token", mask);
+        role("unk_token", unk);
+    }
+    auto id_of = [&](const std::string& tok, bool required) -> int32_t {
+        if (const auto it = added_ids.find(tok); it != added_ids.end()) return it->second;
+        const int32_t id = m->bpe.id(tok);
+        if (id < 0 && required) fail_tok("special token '" + tok + "' is not in the vocabulary");
+        return id;
+    };
+    t.cls_id_ = id_of(cls, true);
+    t.sep_id_ = id_of(sep, true);
+    t.pad_id_ = id_of(pad, true);
+    t.mask_id_ = id_of(mask, true);
+    t.unk_id_ = id_of(unk, false);
+    t.mask_token_ = mask;
+    t.model_ = std::move(m);
+    return t;
+}
+
 void LayaTokenizer::encode_piece_cached_(std::string_view piece, std::vector<int32_t>& out) const {
+    const Model& m = *model_;
+    auto run = [&](std::vector<int32_t>& dst) {
+        if (kind_ == Kind::ByteLevel) {
+            std::string mapped;
+            mapped.reserve(piece.size() * 2);
+            for (unsigned char c : piece) mapped += m.byte_to_unicode[c];
+            m.bpe.encode_word(mapped, dst);
+        } else {
+            m.bpe.encode_word(piece, dst);
+        }
+    };
     if (!cache_) {
-        bpe::encode_piece(piece, byte_to_unicode_, vocab_, merge_ranks_, /*append_end_of_word=*/false, out);
+        run(out);
         return;
     }
     const std::string key(piece);
@@ -172,256 +296,113 @@ void LayaTokenizer::encode_piece_cached_(std::string_view piece, std::vector<int
         }
     }
     const std::size_t at = out.size();
-    bpe::encode_piece(piece, byte_to_unicode_, vocab_, merge_ranks_, /*append_end_of_word=*/false, out);
+    run(out);
     std::lock_guard<std::mutex> lock(cache_->mu);
     if (cache_->ids.size() >= PieceCache::kMaxEntries) cache_->ids.clear();
     cache_->ids.emplace(key, std::vector<int32_t>(out.begin() + static_cast<std::ptrdiff_t>(at), out.end()));
 }
 
-LayaTokenizer LayaTokenizer::load(const std::string& tokenizer_json_path) {
-    LayaTokenizer t;
-    t.cache_ = std::make_shared<PieceCache>();
-    std::unordered_map<uint32_t, unsigned char> inv;
-    bpe::build_byte_unicode_maps(t.byte_to_unicode_, inv);
-
-    j::Value root;
-    try {
-        root = j::parse(slurp(tokenizer_json_path));
-    } catch (const std::exception& e) {
-        fail_tok(std::string("json parse: ") + e.what());
-    }
-    if (!root.is_object()) fail_tok("root is not a JSON object");
-
-    const j::Value* model = root.find("model");
-    if (!model || !model->is_object()) fail_tok("missing 'model' object");
-
-    const j::Value* vocab = model->find("vocab");
-    if (!vocab || !vocab->is_object()) fail_tok("missing 'model.vocab' object");
-
-    for (const auto& [tok, idv] : vocab->as_object()) {
-        if (idv.is_number()) {
-            t.vocab_.emplace(tok, static_cast<int32_t>(idv.as_number()));
+// One span between added tokens: normalize, pre-tokenize, BPE each piece.
+// `at_start`: the span begins the input (Metaspace prepend_scheme "first").
+void LayaTokenizer::encode_span_(std::string_view span, bool at_start, std::vector<int32_t>& out) const {
+    const Model& m = *model_;
+    std::string buf;
+    for (const Model::Norm& n : m.norms) {
+        if (n.nfc) {
+            if (!uni::is_nfc(span)) {
+                buf = uni::nfc(span);
+                span = buf;
+            }
+        } else if (!n.from.empty() && span.find(n.from) != std::string_view::npos) {
+            std::string r;
+            r.reserve(span.size() + span.size() / 2);
+            std::size_t pos = 0;
+            for (std::size_t hit; (hit = span.find(n.from, pos)) != std::string_view::npos; pos = hit + n.from.size()) {
+                r.append(span.substr(pos, hit - pos));
+                r += n.to;
+            }
+            r.append(span.substr(pos));
+            buf = std::move(r);
+            span = buf;
         }
     }
+    if (span.empty()) return;
 
-    const j::Value* merges = model->find("merges");
-    if (merges && merges->is_array()) {
-        const auto& arr = merges->as_array();
-        for (std::size_t i = 0; i < arr.size(); ++i) {
-            std::string a, b;
-            if (arr[i].is_array()) {
-                const auto& pair = arr[i].as_array();
-                if (pair.size() == 2 && pair[0].is_string() && pair[1].is_string()) {
-                    a = pair[0].as_string();
-                    b = pair[1].as_string();
-                }
-            } else if (arr[i].is_string()) {
-                const std::string& line = arr[i].as_string();
-                const auto sp = line.find(' ');
-                if (sp != std::string::npos) {
-                    a = line.substr(0, sp);
-                    b = line.substr(sp + 1);
-                }
-            }
-            if (!a.empty() && !b.empty()) {
-                t.merge_ranks_.emplace(a + '\x01' + b, static_cast<int32_t>(i));
-            }
+    if (kind_ == Kind::ByteLevel) {
+        std::string prefixed;
+        if (m.byte_level_prefix_space && span.front() != ' ') {
+            prefixed = " " + std::string(span);
+            span = prefixed;
         }
+        byte_level_split(span, [&](std::string_view p) { encode_piece_cached_(p, out); });
+        return;
     }
 
-    if (const j::Value* at = root.find("added_tokens"); at && at->is_array()) {
-        for (const auto& tok : at->as_array()) {
-            if (!tok.is_object()) continue;
-            const j::Value* content = tok.find("content");
-            const j::Value* idv = tok.find("id");
-            if (content && content->is_string() && idv && idv->is_number()) {
-                const std::string& s = content->as_string();
-                const int32_t id = static_cast<int32_t>(idv->as_number());
-                t.vocab_[s] = id;
-                t.specials_.add(s, id);
-            }
-        }
+    // Metaspace: ' ' -> U+2581, prepend one when the span does not start
+    // with it, then split before every U+2581 (MergedWithNext: a run of
+    // metaspaces leaves each but the last as a piece of its own).
+    std::string s;
+    s.reserve(span.size() + span.size() / 2 + 3);
+    for (char c : span) {
+        if (c == ' ') s += kMetaspace;
+        else s += c;
     }
-
-    t.specials_.add("[CLS]", kClsTokenId);
-    t.specials_.add("[SEP]", kSepTokenId);
-    t.specials_.add("[PAD]", kPadTokenId);
-    t.specials_.add("[MASK]", kMaskTokenId);
-    t.specials_.add("[UNK]", kUnkTokenId);
-
-    return t;
+    const bool starts_ms = s.compare(0, kMetaspace.size(), kMetaspace) == 0;
+    if (!starts_ms && (m.prepend == Model::Prepend::Always || (m.prepend == Model::Prepend::First && at_start)))
+        s.insert(0, kMetaspace);
+    const std::string_view sv = s;
+    if (!m.split) {
+        encode_piece_cached_(sv, out);
+        return;
+    }
+    std::size_t start = 0;
+    while (start < sv.size()) {
+        std::size_t next = sv.find(kMetaspace, start + (sv.compare(start, kMetaspace.size(), kMetaspace) == 0
+                                                            ? kMetaspace.size() : 1));
+        if (next == std::string_view::npos) next = sv.size();
+        encode_piece_cached_(sv.substr(start, next - start), out);
+        start = next;
+    }
 }
 
 std::vector<int32_t> LayaTokenizer::encode(std::string_view text) const {
+    if (!model_) fail_tok("encode: no tokenizer loaded");
+    const Model& m = *model_;
     std::vector<int32_t> ids;
-    ids.reserve(text.size());
+    ids.reserve(text.size() / 2 + 4);
 
-    bpe::encode_with_specials(
-        text, specials_,
-        [this](std::string_view span, std::vector<int32_t>& out) {
-            std::string normalized;
-            if (normalize_nfc_ && !uni::is_nfc(span)) {
-                normalized = uni::nfc(span);
-                span = normalized;
-            }
-            for (const auto p : pre_tokenize(span)) encode_piece_cached_(p, out);
-        },
-        ids);
-
-    return ids;
-}
-
-std::vector<std::string> LayaTokenizer::render_options(const LayaQuestion& q) {
-    std::vector<std::string> opts;
-    if (q.type == "choice") {
-        opts.reserve(q.criteria_choice.size());
-        for (const auto& [k, v] : q.criteria_choice) {
-            if (v.empty()) {
-                opts.push_back(k);
-            } else {
-                opts.push_back(k + ": " + v);
-            }
-        }
-        return opts;
-    }
-    if (q.type == "score") {
-        opts.reserve(q.criteria_score.size());
-        for (std::size_t i = 0; i < q.criteria_score.size(); ++i) {
-            opts.push_back("level " + std::to_string(i) + ": " + q.criteria_score[i]);
-        }
-        return opts;
-    }
-    // noul
-    std::string f_crit = q.criteria_noul_false.empty() ? "no, the statement does not hold" : q.criteria_noul_false;
-    std::string t_crit = q.criteria_noul_true.empty() ? "yes, the statement holds" : q.criteria_noul_true;
-    return {"false: " + f_crit, "true: " + t_crit};
-}
-
-std::string python_json_spacing(std::string_view json) {
-    std::string out;
-    out.reserve(json.size() + json.size() / 8);
-    bool in_str = false;
-    for (std::size_t i = 0; i < json.size(); ++i) {
-        const char c = json[i];
-        out.push_back(c);
-        if (in_str) {
-            if (c == '\\' && i + 1 < json.size()) {
-                out.push_back(json[++i]);
-            } else if (c == '"') {
-                in_str = false;
-            }
+    // Added tokens first, leftmost-longest, then the spans between them.
+    // lstrip / rstrip tokens also swallow the whitespace beside them.
+    std::size_t span_start = 0, i = 0;
+    while (i < text.size()) {
+        const auto hit = m.added.match(text, i);
+        if (hit.first == 0) {
+            ++i;
             continue;
         }
-        if (c == '"') {
-            in_str = true;
-        } else if (c == ',' || c == ':') {
-            out.push_back(' ');
-            // tolerate input that is already spaced
-            while (i + 1 < json.size() &&
-                   (json[i + 1] == ' ' || json[i + 1] == '\n' || json[i + 1] == '\t' || json[i + 1] == '\r')) {
-                ++i;
+        std::size_t span_end = i, stop = i + hit.first;
+        if (const auto it = m.strip.find(hit.second); it != m.strip.end()) {
+            if (it->second & 1) {
+                while (span_end > span_start) {
+                    std::size_t cs = 0;
+                    if (!uni::is_white_space(prev_codepoint(text, span_end, cs))) break;
+                    span_end = cs;
+                }
+            }
+            if (it->second & 2) {
+                while (stop < text.size()) {
+                    std::size_t k = stop;
+                    if (!uni::is_white_space(uni::decode_utf8(text, k))) break;
+                    stop = k;
+                }
             }
         }
+        if (span_end > span_start) encode_span_(text.substr(span_start, span_end - span_start), span_start == 0, ids);
+        ids.push_back(hit.second);
+        i = span_start = stop;
     }
-    return out;
-}
-
-std::vector<int32_t> LayaTokenizer::encode_state(const std::string& state_json_or_text) const {
-    return encode(replace_all(state_json_or_text, "[MASK]", " "));
-}
-
-SequenceResult LayaTokenizer::build_sequence(const std::string& state_json_or_text,
-                                            const LayaQuestion& q,
-                                            int max_len,
-                                            int head_max_len,
-                                            bool truncate_left) const {
-    return build_sequence_ids(encode_state(state_json_or_text), q, max_len, head_max_len,
-                              truncate_left);
-}
-
-SequenceResult LayaTokenizer::build_sequence_ids(const std::vector<int32_t>& state_ids,
-                                                 const LayaQuestion& q,
-                                                 int max_len,
-                                                 int head_max_len,
-                                                 bool truncate_left) const {
-    const std::vector<std::string> opts = render_options(q);
-    const std::string ins = replace_all(q.instructions, "[MASK]", " ");
-    const std::string head_text = q.type + " question: " + ins;
-    std::vector<int32_t> head_ids = encode(head_text);
-
-    std::vector<std::vector<int32_t>> opt_ids;
-    opt_ids.reserve(opts.size());
-    for (const auto& opt : opts) {
-        std::string opt_text = " " + replace_all(opt, "[MASK]", " ");
-        std::vector<int32_t> piece = encode(opt_text);
-        if (piece.size() > 48) piece.resize(48);
-        std::vector<int32_t> cur;
-        cur.reserve(1 + piece.size());
-        cur.push_back(kMaskTokenId);
-        cur.insert(cur.end(), piece.begin(), piece.end());
-        opt_ids.push_back(std::move(cur));
-    }
-
-    int total_opt_len = 0;
-    for (const auto& o : opt_ids) total_opt_len += static_cast<int>(o.size());
-    int opt_budget = head_max_len - total_opt_len;
-
-    if (opt_budget < 16) {
-        const int n_opts = std::max(1, static_cast<int>(opt_ids.size()));
-        const int per = std::max(4, (head_max_len - 16) / n_opts);
-        for (auto& o : opt_ids) {
-            if (static_cast<int>(o.size()) > per) o.resize(static_cast<std::size_t>(per));
-        }
-        total_opt_len = 0;
-        for (const auto& o : opt_ids) total_opt_len += static_cast<int>(o.size());
-        opt_budget = head_max_len - total_opt_len;
-    }
-
-    const int head_budget = std::max(8, opt_budget);
-    if (static_cast<int>(head_ids.size()) > head_budget) {
-        head_ids.resize(static_cast<std::size_t>(head_budget));
-    }
-
-    std::vector<int32_t> ids;
-    ids.reserve(static_cast<std::size_t>(max_len));
-    ids.push_back(kClsTokenId);
-    ids.insert(ids.end(), head_ids.begin(), head_ids.end());
-    ids.push_back(kSepTokenId);
-
-    std::vector<int32_t> markers;
-    markers.reserve(opt_ids.size());
-    for (const auto& o : opt_ids) {
-        markers.push_back(static_cast<int32_t>(ids.size()));
-        ids.insert(ids.end(), o.begin(), o.end());
-    }
-    ids.push_back(kSepTokenId);
-
-    const int room = std::max(0, max_len - static_cast<int>(ids.size()) - 1);
-    // Reference: `st[-room:] if truncate_left else st[:room]`. Python's
-    // st[-0:] is the whole list, so a left-truncated state with no room left
-    // is kept whole and cut by the final ids[:max_len] below; mirrored as is.
-    const int n_st = static_cast<int>(state_ids.size());
-    auto st_begin = state_ids.begin();
-    auto st_end = state_ids.end();
-    if (n_st > room) {
-        if (!truncate_left) {
-            st_end = state_ids.begin() + room;
-        } else if (room > 0) {
-            st_begin = state_ids.end() - room;
-        }
-    }
-    ids.insert(ids.end(), st_begin, st_end);
-    ids.push_back(kSepTokenId);
-
-    if (static_cast<int>(ids.size()) > max_len) {
-        ids.resize(static_cast<std::size_t>(max_len));
-    }
-
-    std::vector<int32_t> valid_markers;
-    for (int32_t m : markers) {
-        if (m < max_len) valid_markers.push_back(m);
-    }
-    return {std::move(ids), std::move(valid_markers)};
+    if (span_start < text.size()) encode_span_(text.substr(span_start), span_start == 0, ids);
+    return ids;
 }
 
 }  // namespace brolm::laya

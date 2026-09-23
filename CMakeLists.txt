@@ -166,6 +166,7 @@ target_sources(brolm PRIVATE
     src/detail/unicode.cpp
     src/detail/spm_unigram.cpp
     src/detail/spm_bpe.cpp
+    src/detail/hf_bpe.cpp
     src/detail/spm_normalizer.cpp
     src/detail/dense_decoder.cpp
     src/detail/generate.cpp
@@ -217,6 +218,7 @@ target_sources(brolm PRIVATE
     src/modernbert.cpp
     src/laya_config.cpp
     src/laya_tokenizer.cpp
+    src/laya_sequence.cpp
     src/laya.cpp
     src/laya_batch.cpp
     src/laya_questions.cpp

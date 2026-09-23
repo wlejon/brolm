@@ -98,8 +98,14 @@ void test_tokenizer(const brolm::laya::LayaTokenizer& tok, const j::Value& cases
 // ~0.23 logits from its fp32 run on these inputs (on a logit of 17); brolm
 // computes in FP16 (3 more mantissa bits than bf16) with FP32 accumulation.
 // Most questions agree to < 0.02; a saturated logit (|l| ~ 17) moves ~2 %.
+// A few questions are ill-conditioned — the reference's own bf16 run lands
+// 1-2.4 logits from its fp32 run (multilingual mixed_scripts_emoji/emoji,
+// specials_and_spaces/fmt) — and a different packing of the same item moves
+// brolm's FP16 answer there too, so a quarter of that per-question reference
+// gap is added to the budget.
 constexpr double kLogitAbsTol = 0.15;     // |logit - fp32 ref| ...
 constexpr double kLogitRelTol = 0.015;    // ... + this * max |ref logit|
+constexpr double kLogitRefGapTol = 0.25;  // ... + this * max |ref bf16 - ref fp32|
 constexpr double kProbAbsTol = 0.02;      // calibrated probability
 constexpr double kActProbAbsTol = 1e-3;
 
@@ -125,7 +131,7 @@ void check_answer(const std::string& name, const brolm::laya::LayaQuestion& q, c
           name + "/" + q.id + ": temperature bucket");
     double lmax = 0;
     for (double v : l32) lmax = std::max(lmax, std::fabs(v));
-    check(dl <= kLogitAbsTol + kLogitRelTol * lmax, name + "/" + q.id + ": logits off by " + std::to_string(dl));
+    check(dl <= kLogitAbsTol + kLogitRelTol * lmax + kLogitRefGapTol * dl16, name + "/" + q.id + ": logits off by " + std::to_string(dl));
     check(dp <= kProbAbsTol, name + "/" + q.id + ": probabilities off by " + std::to_string(dp));
     check(da <= kActProbAbsTol, name + "/" + q.id + ": act probability off by " + std::to_string(da));
     // Argmax must agree unless the reference's own top-2 are within tolerance.
@@ -318,35 +324,76 @@ void test_scheduler(const std::string& model_dir, const j::Value& calls) {
     }
 }
 
-}  // namespace
-
-int main() {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep the table if a later phase dies
-    const std::string fixture = std::string(BROLM_TEST_REF_DIR) + "/laya_parity.json";
+// One checkpoint of the family: its fixture against its directory.
+void run_checkpoint(const std::string& name, const std::string& fixture_file, const std::string& model_dir,
+                    bool with_scheduler) {
+    std::printf("\n=== %s (%s) ===\n", name.c_str(), model_dir.c_str());
+    const std::string fixture = std::string(BROLM_TEST_REF_DIR) + "/" + fixture_file;
     if (!fs::exists(fixture)) {
         std::cout << "SKIP: fixture not found at " << fixture << "\n";
-        return 0;
+        return;
+    }
+    if (!fs::exists(model_dir + "/tokenizer/tokenizer.json")) {
+        std::cout << "SKIP: checkpoint not found at " << model_dir << "\n";
+        return;
     }
     const j::Value root = j::parse(slurp(fixture));
 
-    const char* env_dir = std::getenv("LAYA_MODEL_DIR");
-    const std::string model_dir = (env_dir && env_dir[0]) ? env_dir : std::string(BROLM_SIBLING_DIR) + "/laya";
-    if (!fs::exists(model_dir + "/tokenizer/tokenizer.json")) {
-        std::cout << "SKIP: Laya checkpoint not found at " << model_dir << "\n";
-        return 0;
-    }
-
     const auto tok = brolm::laya::LayaTokenizer::load(model_dir + "/tokenizer/tokenizer.json");
+    std::printf("tokenizer: %s, %zu pieces, cls %d sep %d pad %d mask %d ('%s')\n", tok.kind_name(),
+                tok.vocab_size(), tok.cls_token_id(), tok.sep_token_id(), tok.pad_token_id(), tok.mask_token_id(),
+                tok.mask_token().c_str());
+    if (const j::Value* sp = root.find("special")) {
+        check(tok.cls_token_id() == sp->at("cls").as_number() && tok.sep_token_id() == sp->at("sep").as_number() &&
+                  tok.pad_token_id() == sp->at("pad").as_number() &&
+                  tok.mask_token_id() == sp->at("mask").as_number() &&
+                  tok.mask_token() == sp->at("mask_token").as_string(),
+              name + ": special-token roles differ from the reference tokenizer");
+    }
     test_tokenizer(tok, root.at("tokenizer"));
 
-    if (fs::exists(model_dir + "/model.safetensors")) {
-        brotensor::init();
+    if (!fs::exists(model_dir + "/model.safetensors")) {
+        std::cout << "SKIP model half: no model.safetensors in " << model_dir << "\n";
+        return;
+    }
+    brotensor::init();
+    {
         brolm::laya::DecisionModel model;
         model.load_model(model_dir);
+        if (const j::Value* c = root.find("config")) {
+            check(model.config().max_len == c->at("max_len").as_number() &&
+                      model.config().head_max_len == c->at("head_max_len").as_number(),
+                  name + ": max_len / head_max_len not read from rl_agent_config.json");
+        }
         test_model(model, root.at("calls"));
-        test_scheduler(model_dir, root.at("calls"));
-    } else {
-        std::cout << "SKIP model half: no model.safetensors in " << model_dir << "\n";
+    }
+    if (with_scheduler) test_scheduler(model_dir, root.at("calls"));
+}
+
+}  // namespace
+
+// Usage: brolm_test_laya_parity [english|multilingual|typed-decisions ...]
+// (default: all three; a checkpoint whose directory or fixture is absent is
+// skipped). LAYA_MODEL_DIR overrides the family root (default ../laya).
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep the table if a later phase dies
+    const char* env_dir = std::getenv("LAYA_MODEL_DIR");
+    const std::string root_dir = (env_dir && env_dir[0]) ? env_dir : std::string(BROLM_SIBLING_DIR) + "/laya";
+
+    struct Ckpt {
+        const char* name;
+        const char* subdir;
+        const char* fixture;
+    };
+    const Ckpt all[] = {{"english", "", "laya_parity.json"},
+                        {"multilingual", "multilingual", "laya_parity_multilingual.json"},
+                        {"typed-decisions", "typed-decisions", "laya_parity_typed_decisions.json"}};
+    std::vector<std::string> want;
+    for (int i = 1; i < argc; ++i) want.emplace_back(argv[i]);
+    for (const Ckpt& c : all) {
+        if (!want.empty() && std::find(want.begin(), want.end(), c.name) == want.end()) continue;
+        const std::string dir = c.subdir[0] ? root_dir + "/" + c.subdir : root_dir;
+        run_checkpoint(c.name, c.fixture, dir, /*with_scheduler=*/true);
     }
 
     if (g_failures) {

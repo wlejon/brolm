@@ -62,6 +62,18 @@ Config Config::from_json_text(const std::string& json_text) {
         }
     }
 
+    // Older configs (transformers < 5) carry no layer_types: every
+    // global_attn_every_n_layers-th layer (from 0) is global, the rest
+    // sliding — how HF's ModernBertAttention decides it.
+    if (cfg.layer_types.empty()) {
+        const int every = root.get_int("global_attn_every_n_layers", 3);
+        for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+            cfg.layer_types.push_back(every > 0 && i % every == 0 ? "full_attention" : "sliding_attention");
+        }
+    }
+    // ... and name their rotary bases global_rope_theta / local_rope_theta.
+    cfg.rope_theta_full = root.get_float("global_rope_theta", cfg.rope_theta_full);
+    cfg.rope_theta_sliding = root.get_float("local_rope_theta", cfg.rope_theta_sliding);
     if (const j::Value* rp = root.find("rope_parameters"); rp && rp->is_object()) {
         if (const j::Value* full = rp->find("full_attention"); full && full->is_object()) {
             if (const j::Value* theta = full->find("rope_theta"); theta && theta->is_number()) {
