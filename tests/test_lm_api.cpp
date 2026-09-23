@@ -565,6 +565,9 @@ static void test_modernbert() {
                 const byIds = m.encode(toks, { pooling: "cls" });
                 for (let i = 0; i < D; ++i)
                     if (byIds.pooled[i] !== r.data[i]) throw new Error("ids path / cls pooling differ at " + i);
+                // Ids in a Float32Array are values, not reinterpreted bits.
+                const fIds = m.encode(new Float32Array(toks)).ids;
+                if (fIds.some((v, i) => v !== toks[i])) throw new Error("Float32Array ids read as bits");
             }
             // addSpecialTokens: false drops [CLS]/[SEP]; maxLength keeps both.
             const bare = m.tokenize("Hello, world!", { addSpecialTokens: false });

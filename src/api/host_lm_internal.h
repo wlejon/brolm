@@ -421,7 +421,9 @@ inline std::vector<int32_t> readInt32Array(Value v) {
     std::vector<int32_t> out;
     if (!ev::isObject(v)) return out;
     auto tinfo = ev::typedArrayInfo(v);
-    if (tinfo.data && tinfo.bytesPerElement == 4) {
+    // Only an Int32Array is copied as raw words: a Float32Array or
+    // Uint32Array is 4 bytes per element too, but its bits are not ids.
+    if (tinfo.data && tinfo.elementKind == ev::elements::Int32) {
         const int32_t* src = reinterpret_cast<const int32_t*>(tinfo.data);
         out.assign(src, src + tinfo.elementCount);
         return out;
@@ -522,7 +524,8 @@ inline bool readImageArg(Value val, std::vector<uint8_t>& rgba, int& w, int& h, 
     Value dataVal = ev::getProperty(img.get(), "data");
     auto tinfo = ev::typedArrayInfo(dataVal);
     const size_t need = static_cast<size_t>(w) * h * 4;
-    if (tinfo.data && tinfo.byteLength >= need) {
+    const bool bytes = tinfo.elementKind == ev::elements::Uint8 || tinfo.elementKind == ev::elements::Uint8Clamped;
+    if (tinfo.data && bytes && tinfo.byteLength >= need) {
         rgba.assign(tinfo.data, tinfo.data + need);
         return true;
     }
