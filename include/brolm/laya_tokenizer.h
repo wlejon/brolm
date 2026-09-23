@@ -49,6 +49,17 @@ public:
                                   int head_max_len = 192,
                                   bool truncate_left = false) const;
 
+    // The same, over a state already run through encode_state() — lets one
+    // predict() tokenize the state once for all of its questions.
+    SequenceResult build_sequence_ids(const std::vector<int32_t>& state_ids,
+                                      const LayaQuestion& q,
+                                      int max_len = 512,
+                                      int head_max_len = 192,
+                                      bool truncate_left = false) const;
+
+    // State text -> ids as build_sequence tokenizes it ([MASK] blanked out).
+    std::vector<int32_t> encode_state(const std::string& state_json_or_text) const;
+
     static std::vector<std::string> render_options(const LayaQuestion& q);
 
     int32_t cls_token_id() const { return kClsTokenId; }

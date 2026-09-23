@@ -300,11 +300,24 @@ std::string python_json_spacing(std::string_view json) {
     return out;
 }
 
+std::vector<int32_t> LayaTokenizer::encode_state(const std::string& state_json_or_text) const {
+    return encode(replace_all(state_json_or_text, "[MASK]", " "));
+}
+
 SequenceResult LayaTokenizer::build_sequence(const std::string& state_json_or_text,
                                             const LayaQuestion& q,
                                             int max_len,
                                             int head_max_len,
                                             bool truncate_left) const {
+    return build_sequence_ids(encode_state(state_json_or_text), q, max_len, head_max_len,
+                              truncate_left);
+}
+
+SequenceResult LayaTokenizer::build_sequence_ids(const std::vector<int32_t>& state_ids,
+                                                 const LayaQuestion& q,
+                                                 int max_len,
+                                                 int head_max_len,
+                                                 bool truncate_left) const {
     const std::vector<std::string> opts = render_options(q);
     const std::string ins = replace_all(q.instructions, "[MASK]", " ");
     const std::string head_text = q.type + " question: " + ins;
@@ -358,19 +371,20 @@ SequenceResult LayaTokenizer::build_sequence(const std::string& state_json_or_te
     ids.push_back(kSepTokenId);
 
     const int room = std::max(0, max_len - static_cast<int>(ids.size()) - 1);
-    const std::string st_text = replace_all(state_json_or_text, "[MASK]", " ");
-    std::vector<int32_t> st = encode(st_text);
     // Reference: `st[-room:] if truncate_left else st[:room]`. Python's
     // st[-0:] is the whole list, so a left-truncated state with no room left
     // is kept whole and cut by the final ids[:max_len] below; mirrored as is.
-    if (static_cast<int>(st.size()) > room) {
+    const int n_st = static_cast<int>(state_ids.size());
+    auto st_begin = state_ids.begin();
+    auto st_end = state_ids.end();
+    if (n_st > room) {
         if (!truncate_left) {
-            st.resize(static_cast<std::size_t>(room));
+            st_end = state_ids.begin() + room;
         } else if (room > 0) {
-            st.erase(st.begin(), st.end() - room);
+            st_begin = state_ids.end() - room;
         }
     }
-    ids.insert(ids.end(), st.begin(), st.end());
+    ids.insert(ids.end(), st_begin, st_end);
     ids.push_back(kSepTokenId);
 
     if (static_cast<int>(ids.size()) > max_len) {

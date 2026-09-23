@@ -192,6 +192,12 @@ void DecisionModel::init_synthetic(const modernbert::Config& enc_cfg,
 SequenceResult DecisionModel::build_sequence(const std::string& state_json_or_text,
                                              const LayaQuestion& q,
                                              const PredictOptions& opts) const {
+    return build_sequence_ids_(tokenizer_.encode_state(state_json_or_text), q, opts);
+}
+
+SequenceResult DecisionModel::build_sequence_ids_(const std::vector<int32_t>& state_ids,
+                                                  const LayaQuestion& q,
+                                                  const PredictOptions& opts) const {
     if (q.type != "choice" && q.type != "score" && q.type != "noul") {
         fail("question '" + q.id + "': unknown type '" + q.type +
              "' (expected choice, score or noul)");
@@ -200,8 +206,8 @@ SequenceResult DecisionModel::build_sequence(const std::string& state_json_or_te
     if (n_opts == 0) fail("question '" + q.id + "': " + q.type + " question has no criteria");
     const int max_len = opts.max_len > 0 ? opts.max_len : cfg_.max_len;
     const int head_max_len = opts.head_max_len > 0 ? opts.head_max_len : cfg_.head_max_len;
-    SequenceResult seq = tokenizer_.build_sequence(state_json_or_text, q, max_len,
-                                                   head_max_len, opts.truncate_left);
+    SequenceResult seq = tokenizer_.build_sequence_ids(state_ids, q, max_len, head_max_len,
+                                                       opts.truncate_left);
     if (seq.marker_pos.size() != n_opts) {
         fail("question '" + q.id + "': options do not fit in head_max_len=" +
              std::to_string(head_max_len) + " tokens (" + std::to_string(seq.marker_pos.size()) +
@@ -251,7 +257,7 @@ LayaAnswer DecisionModel::forward_question(const LayaQuestion& q,
             bt::copy_d2d_strided(qkv_, 0,     3 * D, q_, 0, D, D, seq_len);
             bt::copy_d2d_strided(qkv_, D,     3 * D, k_, 0, D, D, seq_len);
             bt::copy_d2d_strided(qkv_, 2 * D, 3 * D, v_, 0, D, D, seq_len);
-            bt::flash_attention_gqa_forward(q_, k_, v_, nullptr, H, H, /*causal=*/false, attn_out_);
+            modernbert::full_attention(q_, k_, v_, H, attn_out_);
             brolm::detail::linear_batched(L.out_proj_W, &L.out_proj_b, attn_out_, proj_out_);
             bt::add_inplace(h_, proj_out_);
 
@@ -376,7 +382,8 @@ LayaResult DecisionModel::predict(const std::string& state_json_or_text,
     seqs.reserve(questions.size());
     {
         StageTimer t(profiling_, timings_.tokenize_ms);
-        for (const auto& q : questions) seqs.push_back(build_sequence(state_json_or_text, q, opts));
+        const std::vector<int32_t> state_ids = tokenizer_.encode_state(state_json_or_text);
+        for (const auto& q : questions) seqs.push_back(build_sequence_ids_(state_ids, q, opts));
     }
 
     LayaResult res;

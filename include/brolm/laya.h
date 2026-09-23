@@ -154,6 +154,10 @@ public:
     const LayaTokenizer& tokenizer() const { return tokenizer_; }
 
 private:
+    SequenceResult build_sequence_ids_(const std::vector<int32_t>& state_ids,
+                                       const LayaQuestion& q,
+                                       const PredictOptions& opts) const;
+
     Config cfg_;
     modernbert::ModernBertModel encoder_;
     LayaTokenizer tokenizer_;

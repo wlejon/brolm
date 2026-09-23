@@ -19,6 +19,12 @@ struct LayerWeights {
     brotensor::Tensor mlp_Wo;     // (hidden_size, intermediate_size)
 };
 
+// Bidirectional multi-head self-attention over pre-projected (L, H*hd) Q/K/V:
+// the fused WMMA flash kernel on FP16/BF16, the generic GQA kernel on FP32.
+// Shared by the encoder's global layers and Laya's head layers.
+void full_attention(const brotensor::Tensor& q, const brotensor::Tensor& k,
+                    const brotensor::Tensor& v, int num_heads, brotensor::Tensor& out);
+
 // Encoder wall time split by op family, accumulated over forward() calls
 // while profiling is on (each op family is bracketed by a device sync).
 struct EncoderTimings {

@@ -32,6 +32,25 @@ inline void layernorm_bias_free(const bt::Tensor& X, const bt::Tensor& gamma,
     }
 }
 
+}  // namespace
+
+// Bidirectional multi-head attention. On FP16/BF16 this is brotensor's fused
+// FlashAttention-2 WMMA kernel (flash_attention_forward); the GQA entry point
+// runs a scalar one-block-per-(query, head) kernel ~50x slower at L = 512.
+// FP32 (the CPU backend) keeps the GQA path, which is the one with an FP32
+// implementation.
+void full_attention(const bt::Tensor& q, const bt::Tensor& k, const bt::Tensor& v,
+                    int num_heads, bt::Tensor& out) {
+    if (q.dtype == bt::Dtype::FP16 || q.dtype == bt::Dtype::BF16) {
+        bt::flash_attention_forward(q, k, v, nullptr, num_heads, /*causal=*/false, out);
+    } else {
+        bt::flash_attention_gqa_forward(q, k, v, nullptr, num_heads, num_heads,
+                                        /*causal=*/false, out);
+    }
+}
+
+namespace {
+
 // Upload host FP16 bits at the compute dtype (FP16 on GPU, FP32 on CPU).
 bt::Tensor upload_fp16_bits(const std::vector<std::uint16_t>& bits, int rows, int cols) {
     if (brolm::compute_dtype() == bt::Dtype::FP16) {
@@ -269,8 +288,7 @@ void ModernBertModel::forward(const int32_t* input_ids, int seq_len, bt::Tensor&
                                                  /*causal=*/false);
         } else {
             FamilyTimer t(prof, T.attn_full_ms);
-            bt::flash_attention_gqa_forward(q_rope_, k_rope_, v_, nullptr,
-                                            H, H, /*causal=*/false, attn_out_);
+            full_attention(q_rope_, k_rope_, v_, H, attn_out_);
         }
 
         {
