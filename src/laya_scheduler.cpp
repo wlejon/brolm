@@ -107,6 +107,17 @@ struct Scheduler::Impl {
         const double r = (ms / std::max(corr, 1e-3) - fit_a) / std::max(fit_b, 1e-6);
         return r <= 0 ? 0 : static_cast<int>(std::min(r, 1e9));
     }
+    // The largest row count whose estimate fits the forward target, never
+    // below one full-length item (an item is never split). Recomputed as the
+    // online correction learns what real batches cost: the pre-warm fit uses
+    // synthetic long items, and real batches of many short items run slower
+    // per token (more scorer rows, more attention segments).
+    int floor_rows = 512;
+    void refresh_budget() {
+        budget = opts.target_forward_ms > 0
+                     ? std::clamp(rows_for_ms(opts.target_forward_ms), floor_rows, opts.max_batch_tokens)
+                     : opts.max_batch_tokens;
+    }
 
     void start(std::vector<int> devs);
     void run(Worker& w);
@@ -188,14 +199,8 @@ void Scheduler::Impl::finish_load() {
         fit_b = std::max(1e-6, (n * sxy - sx * sy) / (n * sxx - sx * sx));
         fit_a = std::max(0.0, (sy - fit_b * sx) / n);
     }
-    budget = opts.max_batch_tokens;
-    if (opts.target_forward_ms > 0) {
-        // The largest bucket whose estimate fits the target, never below one
-        // full-length item (an item is never split).
-        const int floor_rows = DecisionModel::token_bucket(workers.front()->model.config().max_len);
-        budget = std::clamp(rows_for_ms(opts.target_forward_ms), std::min(floor_rows, opts.max_batch_tokens),
-                            opts.max_batch_tokens);
-    }
+    floor_rows = std::min(DecisionModel::token_bucket(workers.front()->model.config().max_len), opts.max_batch_tokens);
+    refresh_budget();
     t_start = window_start = Clock::now();
     ready = true;
 }
@@ -341,6 +346,7 @@ void Scheduler::Impl::forward(Worker& w, std::vector<Taken>& batch, int batch_bu
         if (!err) {
             const double ratio = ms / std::max(1e-3, fit_a + fit_b * DecisionModel::token_bucket(rows));
             corr = std::clamp(0.95 * corr + 0.05 * ratio, 0.25, 4.0);
+            refresh_budget();
         }
         SchedulerBatchRecord rec{++batch_seq, w.device, static_cast<int>(reqs.size()),
                                  static_cast<int>(batch.size()), rows, batch_budget, ms_between(t_start, t0), ms};

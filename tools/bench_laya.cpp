@@ -210,6 +210,7 @@ struct Cell {
     int replicas = 0, clients = 0;
     double offered_rps = 0, achieved_rps = 0, max = 0, missed_pct = 0;
     double batch_items = 0, batch_requests = 0, occupancy = 0;
+    double fwd_ms = 0, busy = 0;  // mean device ms per forward; mean device busy fraction
     int budget = 0;
 };
 
@@ -363,6 +364,15 @@ Cell open_cell(const bench_laya::OpenLoopResult& r, int replicas, int nq, const 
     c.batch_requests = r.stats.mean_batch_requests;
     c.occupancy = r.stats.mean_occupancy;
     c.budget = r.stats.token_budget;
+    double busy = 0, frac = 0;
+    uint64_t fwd = 0;
+    for (const auto& d : r.stats.devices) {
+        busy += d.busy_ms;
+        frac += d.busy_fraction;
+        fwd += d.forwards;
+    }
+    c.fwd_ms = fwd ? busy / static_cast<double>(fwd) : 0;
+    c.busy = r.stats.devices.empty() ? 0 : frac / static_cast<double>(r.stats.devices.size());
     return c;
 }
 
@@ -427,16 +437,16 @@ void print_open(const std::vector<Cell>& cells) {
     for (const Cell& c : cells) any = any || c.replicas > 0;
     if (!any) return;
     std::printf("\nopen loop (Poisson arrivals, latency = submit -> result incl. tokenize, ms)\n");
-    std::printf("%-30s %7s %7s %7s %7s %7s %7s %6s %6s %6s %5s %6s\n", "cell", "offered", "achvd", "p50", "p95",
-                "p99", "max", "items", "reqs", "occ", "miss%", "budget");
+    std::printf("%-30s %7s %7s %7s %7s %7s %7s %6s %6s %6s %6s %5s %5s %6s\n", "cell", "offered", "achvd", "p50",
+                "p95", "p99", "max", "items", "reqs", "occ", "fwdms", "busy", "miss%", "budget");
     for (const Cell& c : cells) {
         if (c.replicas == 0) continue;
-        std::printf("%-30s %7.0f %7.0f %7.2f %7.2f %7.2f %7.2f %6.1f %6.1f %6.2f %5.1f %6d\n", c.key.c_str(),
-                    c.offered_rps, c.achieved_rps, c.p50, c.p95, c.p99, c.max, c.batch_items, c.batch_requests,
-                    c.occupancy, c.missed_pct, c.budget);
+        std::printf("%-30s %7.0f %7.0f %7.2f %7.2f %7.2f %7.2f %6.1f %6.1f %6.2f %6.2f %5.2f %5.1f %6d\n",
+                    c.key.c_str(), c.offered_rps, c.achieved_rps, c.p50, c.p95, c.p99, c.max, c.batch_items,
+                    c.batch_requests, c.occupancy, c.fwd_ms, c.busy, c.missed_pct, c.budget);
     }
-    std::printf("(items / reqs = mean per forward; occ = mean forward rows / token budget; miss = past the 30 ms "
-                "default deadline)\n");
+    std::printf("(items / reqs = mean per forward; occ = mean forward rows / token budget; fwdms = device ms per "
+                "forward; busy = device busy fraction; miss = past the 30 ms default deadline)\n");
 }
 
 void print_latency(const std::vector<Cell>& cells) {
@@ -491,7 +501,7 @@ std::string to_json(const std::vector<Cell>& cells, const Args& a, const std::st
               << ", \"offered_rps\": " << c.offered_rps << ", \"achieved_rps\": " << c.achieved_rps
               << ", \"max\": " << c.max << ", \"missed_pct\": " << c.missed_pct << ", \"batch_items\": "
               << c.batch_items << ", \"batch_requests\": " << c.batch_requests << ", \"occupancy\": " << c.occupancy
-              << ", \"budget\": " << c.budget << "}}" << (i + 1 < cells.size() ? "," : "") << "\n";
+              << ", \"fwd_ms\": " << c.fwd_ms << ", \"busy\": " << c.busy << ", \"budget\": " << c.budget << "}}" << (i + 1 < cells.size() ? "," : "") << "\n";
             continue;
         }
         o << ",\n      \"stages\": {\"tokenize\": " << s.tokenize_ms
