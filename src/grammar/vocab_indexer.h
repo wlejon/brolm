@@ -31,6 +31,11 @@ public:
     // Clears the cached state bitmasks
     void clear_cache();
 
+    // True when `vocab` is exactly the vocabulary the masks were built for,
+    // token by token. Two tokenizers of the same size are different
+    // vocabularies, so the cache is keyed on content, never on size alone.
+    bool same_vocab(const std::vector<std::string>& vocab) const noexcept;
+
     uint64_t vocab_size() const noexcept { return num_tokens_; }
     size_t num_words() const noexcept { return num_words_; }
     bool has_vocab() const noexcept { return num_tokens_ > 0; }

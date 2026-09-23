@@ -10,6 +10,17 @@ VocabIndexer::VocabIndexer(const std::vector<std::string>& vocab,
     set_vocab(vocab, filter_fn);
 }
 
+bool VocabIndexer::same_vocab(const std::vector<std::string>& vocab) const noexcept {
+    if (num_tokens_ == 0 || vocab.size() != num_tokens_) return false;
+    for (size_t i = 0; i < vocab.size(); ++i) {
+        const uint32_t off = token_offsets_[i];
+        const size_t len = token_offsets_[i + 1] - off;
+        if (vocab[i].size() != len) return false;
+        if (len && std::memcmp(vocab[i].data(), token_bytes_.data() + off, len) != 0) return false;
+    }
+    return true;
+}
+
 void VocabIndexer::set_vocab(const std::vector<std::string>& vocab,
                              brass::codegen::DfaFilterTokensFn filter_fn) {
     filter_fn_ = filter_fn;

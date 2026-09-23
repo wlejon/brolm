@@ -413,6 +413,41 @@ void test_latency_benchmark() {
     CHECK(jit_per_step_ms < 1.0);
 }
 
+// ─── 5. Same-size vocabularies do not share masks ────────────────────────────
+
+void test_vocab_cache_keyed_on_content() {
+    std::printf("Running test_vocab_cache_keyed_on_content...\n");
+
+    // Two tokenizers with the same vocabulary size and different tokens: the
+    // grammar's cached state masks must follow the vocabulary handed in, not
+    // the size, or the second tokenizer is masked with the first one's bits.
+    const std::vector<std::string> va = {"1", "a", "2", "b", "", "3"};
+    const std::vector<std::string> vb = {"x", "7", "y", "8", "", "z"};
+    const int n = static_cast<int>(va.size());
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    auto grammar = brolm::Grammar::regex("[0-9]+");
+    std::vector<float> la(n, 0.0f), lb(n, 0.0f), la2(n, 0.0f);
+    grammar.mask_logits(la.data(), n, va, /*eos_id=*/-1);
+    grammar.mask_logits(lb.data(), n, vb, /*eos_id=*/-1);
+    grammar.mask_logits(la2.data(), n, va, /*eos_id=*/-1);
+    for (int i = 0; i < n; ++i) {
+        const bool a_ok = !va[i].empty() && va[i][0] >= '0' && va[i][0] <= '9';
+        const bool b_ok = !vb[i].empty() && vb[i][0] >= '0' && vb[i][0] <= '9';
+        CHECK_EQ(la[i] == neg_inf, !a_ok);
+        CHECK_EQ(lb[i] == neg_inf, !b_ok);
+        CHECK_EQ(la2[i] == neg_inf, !a_ok);
+    }
+
+    // The same vocabulary content in a different vector reuses the cache.
+    VocabIndexer idx(va);
+    const std::vector<std::string> va_copy = va;
+    CHECK(idx.same_vocab(va_copy));
+    CHECK(!idx.same_vocab(vb));
+    std::vector<std::string> va_short(va.begin(), va.end() - 1);
+    CHECK(!idx.same_vocab(va_short));
+}
+
 // ─── Main Driver ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -423,6 +458,7 @@ int main() {
     test_dfa_compilation_json_schema();
     test_jit_grammar_lifecycle();
     test_logit_masking_correctness();
+    test_vocab_cache_keyed_on_content();
     test_latency_benchmark();
 
     if (g_failures > 0) {

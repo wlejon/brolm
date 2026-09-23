@@ -222,7 +222,7 @@ void JitGrammar::reset() {
 void JitGrammar::precompute_vocab(const std::vector<std::string>& vocab_tokens) {
     if (!vocab_indexer_) {
         vocab_indexer_ = std::make_unique<VocabIndexer>(vocab_tokens, filter_fn_);
-    } else if (!vocab_indexer_->has_vocab() || vocab_indexer_->vocab_size() != vocab_tokens.size()) {
+    } else if (!vocab_indexer_->same_vocab(vocab_tokens)) {
         vocab_indexer_->set_vocab(vocab_tokens, filter_fn_);
     }
     vocab_indexer_->precompute_all(dfa_);
@@ -237,7 +237,7 @@ void JitGrammar::mask_logits(float* logits, int vocab_size,
         vocab_indexer_ = std::make_unique<VocabIndexer>();
     }
 
-    if (!vocab_indexer_->has_vocab() || vocab_indexer_->vocab_size() != vocab_tokens.size()) {
+    if (!vocab_indexer_->same_vocab(vocab_tokens)) {
         vocab_indexer_->set_vocab(vocab_tokens, filter_fn_);
     }
 
