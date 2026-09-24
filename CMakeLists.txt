@@ -18,6 +18,8 @@ if(BROLM_COVERAGE AND PROJECT_IS_TOP_LEVEL)
     endif()
     add_compile_options(--coverage -O0 -g)
     add_link_options(--coverage)
+    # Lets tests drop wall-clock bounds that instrumentation cannot meet.
+    add_compile_definitions(BROLM_COVERAGE_BUILD=1)
     message(STATUS "brolm: coverage instrumentation ON (-O0)")
 endif()
 

@@ -409,8 +409,21 @@ void test_latency_benchmark() {
     double speedup = nfa_per_step_ms / jit_per_step_ms;
     std::printf("  [BENCHMARK] Speedup: %.1fx faster with JIT masking\n", speedup);
 
-    // Requirement: sub-millisecond masking across 128k tokens
+    // The timed JIT path masks exactly what the per-token NFA walk does.
+    size_t mismatches = 0;
+    for (size_t i = 0; i < kVocabSize; ++i) {
+        if (logits_jit[i] != logits_nfa[i]) ++mismatches;
+    }
+    CHECK_EQ(mismatches, size_t{0});
+
+    // Requirement: sub-millisecond masking across 128k tokens. A wall-clock
+    // bound only means something in an optimized, uninstrumented build; the
+    // coverage build is -O0 with a counter on every edge, and Debug is -O0.
+#if defined(NDEBUG) && !defined(BROLM_COVERAGE_BUILD)
     CHECK(jit_per_step_ms < 1.0);
+#else
+    std::printf("  [BENCHMARK] sub-ms bound not enforced (unoptimized or instrumented build)\n");
+#endif
 }
 
 // ─── 5. Same-size vocabularies do not share masks ────────────────────────────
