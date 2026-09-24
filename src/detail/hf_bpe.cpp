@@ -1,5 +1,6 @@
 #include "brolm/detail/hf_bpe.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <queue>
 #include <stdexcept>

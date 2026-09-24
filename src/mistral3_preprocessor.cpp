@@ -3,6 +3,7 @@
 #include "broimage/geometric.h"
 #include "brotensor/tensor.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>

@@ -25,6 +25,7 @@
 
 #include "test_compute.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

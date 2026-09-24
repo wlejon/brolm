@@ -14,6 +14,8 @@
 #include <brolm/laya_tokenizer.h>
 #include <brolm/modernbert.h>
 
+#include <algorithm>
+
 namespace brolm::api {
 
 HostClass g_modernBertModelClass;
