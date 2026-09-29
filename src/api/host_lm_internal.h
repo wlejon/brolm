@@ -282,6 +282,7 @@ extern HostClass g_modernBertModelClass;
 
 inline brotensor::Device autoDevice() {
     if (brotensor::is_available(brotensor::Device::CUDA))  return brotensor::Device::CUDA;
+    if (brotensor::is_available(brotensor::Device::HIP))   return brotensor::Device::HIP;
     if (brotensor::is_available(brotensor::Device::Metal)) return brotensor::Device::Metal;
     return brotensor::Device::CPU;
 }
@@ -289,6 +290,7 @@ inline brotensor::Device autoDevice() {
 inline const char* deviceName(brotensor::Device d) {
     switch (d.type) {
         case brotensor::DeviceType::CUDA:  return "CUDA";
+        case brotensor::DeviceType::HIP:   return "HIP";
         case brotensor::DeviceType::Metal: return "Metal";
         case brotensor::DeviceType::CPU:   return "CPU";
     }
@@ -300,14 +302,15 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err)
     Value v = ev::getProperty(opts, "device");
     if (ev::isUndefined(v) || ev::isNull(v)) return true;
     if (!ev::isString(v)) {
-        err = "opts.device must be a string ('cpu', 'cuda', or 'metal')";
+        err = "opts.device must be a string ('cpu', 'cuda', 'hip', or 'metal')";
         return false;
     }
     std::string sv = ev::toUtf8(v);
     if (sv == "cpu")   { out = brotensor::Device::CPU;   return true; }
     if (sv == "cuda")  { out = brotensor::Device::CUDA;  return true; }
+    if (sv == "hip")   { out = brotensor::Device::HIP;   return true; }
     if (sv == "metal") { out = brotensor::Device::Metal; return true; }
-    err = "opts.device must be 'cpu', 'cuda', or 'metal' (got '" + sv + "')";
+    err = "opts.device must be 'cpu', 'cuda', 'hip', or 'metal' (got '" + sv + "')";
     return false;
 }
 

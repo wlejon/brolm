@@ -43,6 +43,7 @@ endif()
 # if(NOT TARGET ...) guards below reuse it, backend and all.
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
+option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
 
 # --- Siblings: bromath (header-only) + brotensor (tensor + ops) ---
 #
