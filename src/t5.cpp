@@ -363,7 +363,7 @@ void TextEncoder::load_weights_impl_(
     // standard half precision for T5. Re-cast the dense FP16 weights to BF16 so
     // the whole forward (which inherits the weight dtype) runs in BF16. The INT8
     // (W8A16) path keeps its FP16 activation contract, so skip it there.
-    if (bt::default_device() == bt::Device::CUDA && !do_quantize) {
+    if ((bt::default_device() == bt::Device::CUDA || bt::default_device() == bt::Device::HIP) && !do_quantize) {
         auto to_bf16 = [](bt::Tensor& t) {
             if (t.dtype == bt::Dtype::FP16) {
                 bt::Tensor b;

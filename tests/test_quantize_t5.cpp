@@ -179,8 +179,7 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
+    if (!bt::default_device().is_gpu()) {
         std::fprintf(stderr,
                      "INT8 quantization is GPU-only — skipping\n");
         return 0;

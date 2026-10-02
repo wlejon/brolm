@@ -308,7 +308,7 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err)
     std::string sv = ev::toUtf8(v);
     if (sv == "cpu")   { out = brotensor::Device::CPU;   return true; }
     if (sv == "cuda")  { out = brotensor::Device::CUDA;  return true; }
-    if (sv == "hip")   { out = brotensor::Device::HIP;   return true; }
+    if (sv == "hip" || sv == "rocm") { out = brotensor::Device::HIP; return true; }
     if (sv == "metal") { out = brotensor::Device::Metal; return true; }
     err = "opts.device must be 'cpu', 'cuda', 'hip', or 'metal' (got '" + sv + "')";
     return false;
