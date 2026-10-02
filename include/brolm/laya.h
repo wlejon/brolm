@@ -177,7 +177,7 @@ public:
     // are packed back to back without padding and run through the encoder,
     // head, scorer and act head together; the result per item equals running
     // it alone. One host->device upload and one device->host readback per
-    // call. On CUDA, the device work replays a CUDA graph cached per
+    // call. On CUDA and HIP, the device work replays a graph cached per
     // (token-count, item-count, marker-count) bucket.
     // Not thread-safe: one call at a time per model.
     //
@@ -198,8 +198,8 @@ public:
                                 const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& marker_pos);
 
-    // Enable / disable CUDA-graph replay (default on; env BROLM_LAYA_GRAPHS=0
-    // turns it off). Graphs are never used while profiling.
+    // Enable / disable graph replay on CUDA / HIP (default on; env
+    // BROLM_LAYA_GRAPHS=0 turns it off). Graphs are never used while profiling.
     void set_graphs_enabled(bool on);
     bool graphs_enabled() const;
     std::size_t cached_graphs() const;
@@ -217,7 +217,7 @@ public:
     // cache key, and the unit of a forward's cost.
     static int token_bucket(int tokens);
 
-    // Pre-warm: capture the CUDA graph of every token bucket up to
+    // Pre-warm: capture the graph of every token bucket up to
     // bucket(max_tokens) (largest first, so scratch and rotary tables are
     // reserved once), then time one replay of each — host packing, upload,
     // device work and readback, i.e. what a forward_items() of that size

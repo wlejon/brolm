@@ -205,11 +205,11 @@ private:
     // lm_head). h_ holds the L-row residual stream on entry.
     void run_layers_encode_(int L, brotensor::Tensor& hidden_out);
 
-    // Graph-captured single-token decode (CUDA only). try_graph_step_ runs
+    // Graph-captured single-token decode (CUDA / HIP). try_graph_step_ runs
     // one forward_last(ids, 1, ...) step through the captured session and
-    // returns true, or returns false (CPU backend, BROLM_NO_GRAPH,
-    // BROLM_PROFILE, or capture unavailable) so the caller falls back to the
-    // eager path. invalidate_graph_ drops the session whenever weights or
+    // returns true, or returns false (CPU backend, HIP without
+    // BROLM_HIP_GRAPH=1, BROLM_NO_GRAPH, BROLM_PROFILE, or capture
+    // unavailable) so the caller falls back to the eager path. invalidate_graph_ drops the session whenever weights or
     // cache storage are replaced.
     bool try_graph_step_(int32_t token, brotensor::Tensor& logits_out);
     void invalidate_graph_();

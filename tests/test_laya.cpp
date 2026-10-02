@@ -6,6 +6,7 @@
 
 #include "brotensor/runtime.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -216,14 +217,15 @@ void test_real_checkpoint(const std::string& model_dir) {
 }
 
 // A forward larger than the pre-warmed scratch (a per-call max_len far above
-// the checkpoint's) must not throw away the pre-warmed CUDA graphs: it opens
+// the checkpoint's) must not throw away the pre-warmed graphs: it opens
 // a second scratch arena, captures its own bucket there, and the small
 // buckets keep replaying their graphs on the first arena, with the same
 // results.
 void test_oversize_keeps_graphs() {
     std::cout << "--- Running Test 3: oversized forward keeps pre-warmed graphs ---" << std::endl;
-    if (brotensor::default_device().type != brotensor::DeviceType::CUDA) {
-        std::cout << "SKIP: no CUDA device" << std::endl;
+    const brotensor::DeviceType dt = brotensor::default_device().type;
+    if (dt != brotensor::DeviceType::CUDA && dt != brotensor::DeviceType::HIP) {
+        std::cout << "SKIP: no CUDA / HIP device" << std::endl;
         return;
     }
     brolm::modernbert::Config enc_cfg;
@@ -264,6 +266,16 @@ void test_oversize_keeps_graphs() {
     }
     std::cout << "graphs " << g0 << " -> " << model.cached_graphs() << ", arenas " << model.scratch_arenas()
               << ", rows " << rows0 << " -> " << model.scratch_rows() << std::endl;
+    // Replay against the eager forward of the same item (exact shapes, no
+    // bucket padding, so only accumulation order may differ).
+    model.set_graphs_enabled(false);
+    const auto eager = model.forward_items({small_item});
+    float max_diff = 0.0f;
+    for (std::size_t k = 0; k < before[0].logits.size(); ++k) {
+        max_diff = std::max(max_diff, std::fabs(before[0].logits[k] - eager[0].logits[k]));
+    }
+    std::cout << "graph replay vs eager: max |logit diff| = " << max_diff << std::endl;
+    check(max_diff < 1e-2f, "the replayed graph matches the eager forward");
     std::cout << "Test 3 passed successfully!" << std::endl;
 }
 

@@ -10,7 +10,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
 #include "brotensor/cuda_graph.h"
 #include "brotensor/detail/dispatch.h"
 #endif
@@ -51,9 +51,9 @@ bt::Tensor make_idx_device(const int32_t* host, int n, bt::Device dev = bt::defa
 // replayed per generated token (the brosoundml Qwen-TTS Talker treatment).
 // The eager forward_last(ids, 1, ...) re-issues ~18 ops per layer per token,
 // each paying a host launch; the captured step replays the whole stack as one
-// cudaGraphLaunch. Three host scalars normally bake shapes into the step —
-// they are replaced by device-resident state the staging code updates between
-// replays:
+// cudaGraphLaunch (hipGraphLaunch on HIP). Three host scalars normally bake
+// shapes into the step — they are replaced by device-resident state the
+// staging code updates between replays:
 //   - KV append row (kv_cache_append's cur_len)  -> scatter_rows + idx_row
 //   - attention length (flash_attention_decode's valid_len)
 //                                  -> flash_attention_decode_masked + key mask
@@ -89,7 +89,7 @@ struct DecodeGraphSession {
     brotensor::Tensor h, norm, q, k, v, qn, kn, attn, proj, gate, up;
     brotensor::Tensor logits;             // (1, vocab)
 
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     brotensor::CudaGraph graph;
 #endif
 };
@@ -376,13 +376,30 @@ void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
 void DenseDecoder::invalidate_graph_() { graph_.reset(); }
 
 bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
-#ifndef BROTENSOR_HAS_CUDA
+#if !defined(BROTENSOR_HAS_CUDA) && !defined(BROTENSOR_HAS_HIP)
     (void)token;
     (void)logits_out;
     return false;
 #else
     if (cfg_.pipeline_devices.size() > 1) return false;
-    if (bt::default_device() != bt::Device::CUDA) return false;
+    if (bt::default_device() != bt::Device::CUDA &&
+        bt::default_device() != bt::Device::HIP) return false;
+    // HIP replays this step correctly (logits bit-identical to eager over 128
+    // Qwen3-0.6B tokens) but slower, so it stays eager there unless
+    // BROLM_HIP_GRAPH=1. Two reasons: a HIP launch costs the same ~2 us per
+    // kernel replayed or not (brotensor's launch microbench on gfx1151), so
+    // the graph saves nothing; and the capturable step trades the eager
+    // decode's valid_len attention for flash_attention_decode_masked over the
+    // whole cache capacity, which grows with max_seq_len — on ROCm 7.2.4 /
+    // Radeon 8060S eager runs 7.8 ms/token at any capacity, the graph 8.3 /
+    // 14.8 / 37.7 ms/token at a 160 / 1024 / 4096-token cache.
+    if (bt::default_device() == bt::Device::HIP) {
+        static const bool hip_opt_in = [] {
+            const char* v = std::getenv("BROLM_HIP_GRAPH");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (!hip_opt_in) return false;
+    }
     // BROLM_PROFILE brackets every op in sync pairs — capturing those scopes
     // is illegal and pointless (profiling wants per-stage attribution, which
     // a single graph launch hides). BROLM_NO_GRAPH is the explicit opt-out.
