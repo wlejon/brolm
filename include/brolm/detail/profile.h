@@ -33,6 +33,13 @@ enum class Stage : int {
     lm_head,
     logits_download,
     sample,
+    lin_proj,
+    lin_conv,
+    lin_split,
+    lin_z_ab,
+    lin_l2,
+    lin_delta_step,
+    lin_norm_gate,
     other,
     COUNT,
 };

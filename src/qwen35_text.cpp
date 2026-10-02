@@ -1,12 +1,11 @@
 #include "brolm/qwen35_text.h"
+#include "qwen35_detail.h"
 
 #include "brolm/detail/compute.h"
 #include "brolm/detail/device.h"
-#include "brolm/detail/weights.h"
-#include "brotensor/gguf.h"
+#include "brolm/detail/profile.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
-#include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 
 #include <algorithm>
@@ -20,9 +19,6 @@
 namespace brolm::qwen35 {
 
 namespace bt = ::brotensor;
-namespace st = ::brotensor::safetensors;
-
-using st::upload_compute_checked;
 
 namespace {
 
@@ -30,202 +26,11 @@ namespace {
     throw std::runtime_error("qwen35::TextModel: " + msg);
 }
 
-const st::TensorView& need(const std::vector<const st::File*>& shards,
-                           const std::string& key) {
-    for (const st::File* f : shards) {
-        if (const auto* v = f->find(key)) return *v;
-    }
-    fail("missing tensor '" + key + "'");
-}
-
-const st::TensorView* find_in(const std::vector<const st::File*>& shards,
-                              const std::string& key) {
-    for (const st::File* f : shards) {
-        if (const auto* v = f->find(key)) return v;
-    }
-    return nullptr;
-}
-
 bt::Tensor make_idx_device(const int32_t* host, int n, bt::Device dev = bt::default_device()) {
     bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
     std::memcpy(cpu.host_raw_mut(), host,
                 static_cast<std::size_t>(n) * sizeof(int32_t));
     return cpu.to(dev);
-}
-
-// HF's Qwen3_5RMSNorm applies `(1 + weight)` as the gain (init zeros, centred
-// on identity). brotensor's rms_norm_forward expects the raw gain, so we add
-// 1.0 to every Qwen3_5RMSNorm weight at load time. Qwen3_5RMSNormGated (the
-// linear-attn `linear_attn.norm`) uses plain `weight` (init ones) and is
-// EXCLUDED from this transform. See HF transformers
-// `Qwen3_5RMSNorm.forward` and the `_init_weights` comment "We initialize
-// with 0s to be 1 centered as the RMSNorm here does (1 + weight)".
-void add_one_to_norm_weight(bt::Tensor& t) {
-    // Stage on host (FP32), add 1, re-upload at the original compute dtype on the tensor's device.
-    // Load-path only — runs once per layer.
-    std::vector<float> h(static_cast<std::size_t>(t.size()));
-    if (t.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(h.size());
-        t.copy_to_host_fp16(bits.data());
-        for (std::size_t i = 0; i < h.size(); ++i)
-            h[i] = bt::fp16_bits_to_fp32(bits[i]) + 1.0f;
-    } else {
-        h = t.to_host_vector();
-        for (float& v : h) v += 1.0f;
-    }
-    const int r = t.rows;
-    const int c = t.cols;
-    const bt::Device dev = t.device;
-    if (t.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(h.size());
-        for (std::size_t i = 0; i < bits.size(); ++i) {
-            bits[i] = bt::fp32_to_fp16_bits(h[i]);
-        }
-        t = bt::Tensor::from_host_fp16_on(dev, bits.data(), r, c);
-    } else {
-        t = bt::Tensor::from_host_on(dev, h.data(), r, c);
-    }
-}
-
-std::vector<float> download_fp32(const bt::Tensor& t) {
-    const std::size_t n = static_cast<std::size_t>(t.size());
-    if (t.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(n);
-        t.copy_to_host_fp16(bits.data());
-        std::vector<float> out(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            out[i] = bt::fp16_bits_to_fp32(bits[i]);
-        }
-        return out;
-    }
-    return t.to_host_vector();
-}
-
-// HF M-RoPE interleaves three position streams (t,h,w) at the pair-index level.
-// `apply_interleaved_mrope` (modeling_qwen3_5.py) overwrites the T-axis freq
-// vector with H-axis values at slice(1, d_h*3, 3) and W-axis values at
-// slice(2, d_w*3, 3); the remaining indices stay T. Concretely, with
-// mrope_section=[d_t,d_h,d_w] and rotary_dim/2=d_t+d_h+d_w:
-//   axis owner of HF pair-index j is:
-//     'H' if j in {1, 4, 7, ..., 1 + 3*(d_h-1)}
-//     'W' if j in {2, 5, 8, ..., 2 + 3*(d_w-1)}
-//     'T' otherwise
-// inv_freq[j] (from the global rotary_dim/2 schedule) is always used at HF
-// pair-index j, regardless of axis ownership.
-//
-// brotensor's `rope_apply_mrope` assumes the chunked-axis layout: T owns the
-// FIRST d_t pairs, H the next d_h, W the last d_w. To reconcile, we permute
-// q_proj/k_proj rows (and q_norm/k_norm gains) at load time so that HF's
-// scattered-by-axis ordering becomes brotensor's chunked ordering. The same
-// permutation, plus the original rotate_half->pair conversion, is folded into
-// a single row-index map below; `build_axis_tables` consumes the matching
-// inv_freq index list per axis so that frequencies stay aligned.
-//
-// Returns, for each axis A in (T,H,W), the list of HF pair-indices owned by A
-// in ascending pair-index order. Sum of sizes == rotary_dim/2.
-struct MRopePairing {
-    std::vector<int> t_pairs, h_pairs, w_pairs;
-};
-
-MRopePairing mrope_pairing(int d_t, int d_h, int d_w) {
-    const int half = d_t + d_h + d_w;
-    std::vector<char> owner(static_cast<std::size_t>(half), 'T');
-    for (int k = 0; k < d_h; ++k) owner[static_cast<std::size_t>(1 + 3*k)] = 'H';
-    for (int k = 0; k < d_w; ++k) owner[static_cast<std::size_t>(2 + 3*k)] = 'W';
-    MRopePairing p;
-    for (int j = 0; j < half; ++j) {
-        switch (owner[static_cast<std::size_t>(j)]) {
-            case 'T': p.t_pairs.push_back(j); break;
-            case 'H': p.h_pairs.push_back(j); break;
-            case 'W': p.w_pairs.push_back(j); break;
-        }
-    }
-    return p;
-}
-
-// Build the brolm-dim -> HF-dim permutation for the rotary subrange of one
-// head. For brolm pair b in [0, half), the source HF pair is
-//   T_pairs[b]                              if b in [0, d_t)
-//   H_pairs[b - d_t]                        if b in [d_t, d_t+d_h)
-//   W_pairs[b - d_t - d_h]                  if b in [d_t+d_h, half)
-// The HF dim for pair p slot s in {0,1} is `p + s*half` (rotate_half layout).
-std::vector<int> rotary_row_perm(int rotary_dim, int d_t, int d_h, int d_w) {
-    const int half = rotary_dim / 2;
-    MRopePairing P = mrope_pairing(d_t, d_h, d_w);
-    std::vector<int> hf_pair_for_brolm;
-    hf_pair_for_brolm.reserve(static_cast<std::size_t>(half));
-    hf_pair_for_brolm.insert(hf_pair_for_brolm.end(), P.t_pairs.begin(), P.t_pairs.end());
-    hf_pair_for_brolm.insert(hf_pair_for_brolm.end(), P.h_pairs.begin(), P.h_pairs.end());
-    hf_pair_for_brolm.insert(hf_pair_for_brolm.end(), P.w_pairs.begin(), P.w_pairs.end());
-    std::vector<int> brolm_to_hf(static_cast<std::size_t>(rotary_dim));
-    for (int b = 0; b < half; ++b) {
-        const int hp = hf_pair_for_brolm[static_cast<std::size_t>(b)];
-        brolm_to_hf[static_cast<std::size_t>(2*b)]     = hp;
-        brolm_to_hf[static_cast<std::size_t>(2*b + 1)] = hp + half;
-    }
-    return brolm_to_hf;
-}
-
-// Permute the first `rotary_dim` rows within each head's `head_dim` row block
-// from HF rotate_half order into brotensor's chunked-axis interleaved-pair
-// order. Rows [rotary_dim, head_dim) are pass-through.
-// src/dst are (num_heads*head_dim, cols) host buffers.
-std::vector<float> permute_rotary_rows(const std::vector<float>& src,
-                                       int num_heads, int head_dim,
-                                       int rotary_dim, int cols,
-                                       int d_t, int d_h, int d_w) {
-    std::vector<int> brolm_to_hf = rotary_row_perm(rotary_dim, d_t, d_h, d_w);
-    std::vector<float> dst(src.size());
-    const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(float);
-    for (int h = 0; h < num_heads; ++h) {
-        const std::size_t base =
-            static_cast<std::size_t>(h) * head_dim *
-            static_cast<std::size_t>(cols);
-        // Rotated subrange [0, rotary_dim): dst[b] <- src[brolm_to_hf[b]].
-        for (int b = 0; b < rotary_dim; ++b) {
-            const std::size_t doff = base + static_cast<std::size_t>(b) * cols;
-            const std::size_t soff = base +
-                static_cast<std::size_t>(brolm_to_hf[static_cast<std::size_t>(b)]) * cols;
-            std::memcpy(&dst[doff], &src[soff], row_bytes);
-        }
-        // Pass-through tail [rotary_dim, head_dim): copy as is.
-        for (int r = rotary_dim; r < head_dim; ++r) {
-            const std::size_t off = base + static_cast<std::size_t>(r) * cols;
-            std::memcpy(&dst[off], &src[off], row_bytes);
-        }
-    }
-    return dst;
-}
-
-// Split q_proj's fanned-out weight (rows organized per-head as
-// [head_h q (head_dim rows), head_h gate (head_dim rows), ...]) into two
-// separate (n_q*head_dim, hidden) matrices `q_rows` and `g_rows`.
-void split_q_gate_rows(const std::vector<float>& src,
-                       int n_q, int head_dim, int cols,
-                       std::vector<float>& q_rows,
-                       std::vector<float>& g_rows) {
-    const std::size_t per_head_rows = static_cast<std::size_t>(2 * head_dim);
-    const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(float);
-    const std::size_t single_dim = static_cast<std::size_t>(n_q) *
-                                   static_cast<std::size_t>(head_dim) *
-                                   static_cast<std::size_t>(cols);
-    q_rows.assign(single_dim, 0.0f);
-    g_rows.assign(single_dim, 0.0f);
-    for (int h = 0; h < n_q; ++h) {
-        const std::size_t src_base = static_cast<std::size_t>(h) *
-                                     per_head_rows *
-                                     static_cast<std::size_t>(cols);
-        const std::size_t dst_base = static_cast<std::size_t>(h) *
-                                     static_cast<std::size_t>(head_dim) *
-                                     static_cast<std::size_t>(cols);
-        for (int r = 0; r < head_dim; ++r) {
-            const std::size_t soff = src_base + static_cast<std::size_t>(r) * cols;
-            const std::size_t goff = src_base + static_cast<std::size_t>(head_dim + r) * cols;
-            const std::size_t doff = dst_base + static_cast<std::size_t>(r) * cols;
-            std::memcpy(&q_rows[doff], &src[soff], row_bytes);
-            std::memcpy(&g_rows[doff], &src[goff], row_bytes);
-        }
-    }
 }
 
 // Build a per-axis sin/cos table (max_pos+1, d_axis) using base rope_theta and
@@ -344,260 +149,6 @@ bt::Device TextModel::final_device() const {
     return cfg_.pipeline_devices.back();
 }
 
-// ─── HF → ggml tensor-name map (Qwen3.5 / Qwen3.8) ─────────────────────────
-
-namespace {
-
-bool starts_with(std::string_view s, std::string_view p) {
-    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
-}
-
-}  // namespace
-
-std::string qwen35_hf_to_ggml(std::string_view hf_name) {
-    if (hf_name == "model.embed_tokens.weight" || hf_name == "embed_tokens.weight" ||
-        hf_name == "model.language_model.embed_tokens.weight" || hf_name == "language_model.embed_tokens.weight") {
-        return "token_embd.weight";
-    }
-    if (hf_name == "model.norm.weight" || hf_name == "norm.weight" ||
-        hf_name == "model.language_model.norm.weight" || hf_name == "language_model.norm.weight") {
-        return "output_norm.weight";
-    }
-    if (hf_name == "lm_head.weight" || hf_name == "model.lm_head.weight" ||
-        hf_name == "model.language_model.lm_head.weight" || hf_name == "language_model.lm_head.weight") {
-        return "output.weight";
-    }
-
-    auto match_layer = [&](std::string_view prefix) -> std::pair<std::string_view, std::string_view> {
-        if (!starts_with(hf_name, prefix)) return {{}, {}};
-        const auto dot = hf_name.find('.', prefix.size());
-        if (dot == std::string_view::npos) return {{}, {}};
-        const std::string_view idx = hf_name.substr(prefix.size(), dot - prefix.size());
-        const std::string_view tail = hf_name.substr(dot + 1);
-        return {idx, tail};
-    };
-
-    auto res = match_layer("model.layers.");
-    if (res.first.empty()) res = match_layer("layers.");
-    if (res.first.empty()) res = match_layer("model.language_model.layers.");
-    if (res.first.empty()) res = match_layer("language_model.layers.");
-    if (res.first.empty()) return {};
-
-    const std::string_view idx = res.first;
-    const std::string_view tail = res.second;
-
-    auto blk = [&](std::string_view suffix) -> std::string {
-        std::string out;
-        out.reserve(4 + idx.size() + 1 + suffix.size());
-        out.append("blk.");
-        out.append(idx);
-        out.push_back('.');
-        out.append(suffix);
-        return out;
-    };
-
-    if (tail == "input_layernorm.weight")          return blk("attn_norm.weight");
-    if (tail == "post_attention_layernorm.weight") return blk("post_attention_norm.weight");
-    if (tail == "mlp.gate_proj.weight")            return blk("ffn_gate.weight");
-    if (tail == "mlp.up_proj.weight")              return blk("ffn_up.weight");
-    if (tail == "mlp.down_proj.weight")            return blk("ffn_down.weight");
-
-    // Full attention
-    if (tail == "self_attn.q_proj.weight")         return blk("attn_q.weight");
-    if (tail == "self_attn.k_proj.weight")         return blk("attn_k.weight");
-    if (tail == "self_attn.v_proj.weight")         return blk("attn_v.weight");
-    if (tail == "self_attn.o_proj.weight")         return blk("attn_output.weight");
-    if (tail == "self_attn.q_norm.weight")         return blk("attn_q_norm.weight");
-    if (tail == "self_attn.k_norm.weight")         return blk("attn_k_norm.weight");
-
-    // Linear attention
-    if (tail == "linear_attn.in_proj_qkv.weight")  return blk("attn_qkv.weight");
-    if (tail == "linear_attn.in_proj_z.weight")    return blk("attn_gate.weight");
-    if (tail == "linear_attn.in_proj_a.weight")    return blk("ssm_alpha.weight");
-    if (tail == "linear_attn.in_proj_b.weight")    return blk("ssm_beta.weight");
-    if (tail == "linear_attn.A_log")               return blk("ssm_a");
-    if (tail == "linear_attn.conv1d.weight")       return blk("ssm_conv1d.weight");
-    if (tail == "linear_attn.dt_bias")             return blk("ssm_dt.bias");
-    if (tail == "linear_attn.norm.weight")         return blk("ssm_norm.weight");
-    if (tail == "linear_attn.out_proj.weight")     return blk("ssm_out.weight");
-
-    return {};
-}
-
-// ─── load_weights ──────────────────────────────────────────────────────────
-
-void TextModel::load_weights(const st::File& f, const std::string& prefix) {
-    const std::vector<const st::File*> shards = {&f};
-    load_weights(shards, prefix);
-}
-
-void TextModel::load_weights(const std::vector<const st::File*>& shards,
-                             const std::string& prefix) {
-    if (shards.empty()) fail("load_weights: no safetensors shards");
-    brolm::detail::weights::SafetensorsSource src(shards, prefix);
-    load_weights_impl_(src);
-}
-
-void TextModel::load_weights(const brotensor::gguf::File& f) {
-    const std::vector<const brotensor::gguf::File*> shards = {&f};
-    load_weights(shards);
-}
-
-void TextModel::load_weights(const std::vector<const brotensor::gguf::File*>& shards) {
-    if (shards.empty()) fail("load_weights: no gguf shards");
-    brolm::detail::weights::GgufSource src(shards, [](std::string_view hf) {
-        return qwen35_hf_to_ggml(hf);
-    });
-    load_weights_impl_(src);
-}
-
-void TextModel::load_weights_impl_(const brolm::detail::weights::Source& src) {
-    const int V    = cfg_.vocab_size;
-    const int H    = cfg_.hidden_size;
-    const int Fm   = cfg_.intermediate_size;
-    const int HD   = cfg_.head_dim;
-    const int n_q  = cfg_.num_attention_heads;
-    const int n_kv = cfg_.num_key_value_heads;
-    const int q_dim    = n_q  * HD;
-    const int kv_dim   = n_kv * HD;
-    const int q_dim2   = 2 * q_dim;        // q_proj output width (q + gate)
-
-    const int lin_h_v = cfg_.linear_num_value_heads;
-    const int lin_h_k = cfg_.linear_num_key_heads;
-    const int lin_d_v = cfg_.linear_value_head_dim;
-    const int lin_d_k = cfg_.linear_key_head_dim;
-    const int kdim    = lin_h_k * lin_d_k;
-    const int vdim    = lin_h_v * lin_d_v;
-    const int qkv_ch  = 2 * kdim + vdim;
-    const int conv_kd = cfg_.linear_conv_kernel_dim;
-
-    const bool is_gguf = src.is_gguf();
-
-    {
-        bt::DeviceScope scope(embed_device());
-        src.upload_compute_dequant("embed_tokens.weight",
-                                   V, H, embed_, "embed_tokens.weight");
-    }
-
-    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-        const bt::Device dev = layer_device(i);
-        bt::DeviceScope scope(dev);
-        const std::string p = "layers." + std::to_string(i) + ".";
-        LayerSlot& L = layers_[static_cast<std::size_t>(i)];
-
-        src.upload_compute_dequant(p + "input_layernorm.weight",
-                                   H, 1, L.in_norm, "input_layernorm.weight");
-        if (!is_gguf) add_one_to_norm_weight(L.in_norm);
-
-        src.upload_compute_dequant(p + "post_attention_layernorm.weight",
-                                   H, 1, L.post_attn_norm, "post_attention_layernorm.weight");
-        if (!is_gguf) add_one_to_norm_weight(L.post_attn_norm);
-
-        // MLP — same shape on every layer.
-        src.upload_compute_checked(p + "mlp.gate_proj.weight",
-                                   Fm, H, L.mlp.gate_W, "mlp.gate_proj.weight");
-        src.upload_compute_checked(p + "mlp.up_proj.weight",
-                                   Fm, H, L.mlp.up_W, "mlp.up_proj.weight");
-        src.upload_compute_checked(p + "mlp.down_proj.weight",
-                                   H, Fm, L.mlp.down_W, "mlp.down_proj.weight");
-
-        if (L.type == LayerType::Full) {
-            // q_proj: (2*q_dim, hidden), per-head layout [q, gate]. Load raw,
-            // split into Wq/Wg, then permute the rotary subrange of Wq's rows
-            // (per-head, only the q half) and of Wk's rows for interleaved RoPE.
-            bt::Tensor q_raw;
-            src.upload_compute_dequant(p + "self_attn.q_proj.weight",
-                                       q_dim2, H, q_raw, "self_attn.q_proj.weight");
-            std::vector<float> q_host = download_fp32(q_raw);
-            std::vector<float> q_rows, g_rows;
-            split_q_gate_rows(q_host, n_q, HD, H, q_rows, g_rows);
-            std::vector<float> q_perm =
-                permute_rotary_rows(q_rows, n_q, HD, rotary_dim_, H,
-                                    d_t_, d_h_, d_w_);
-            L.full.Wq = brolm::detail::upload_host(q_perm.data(), q_dim, H);
-            L.full.Wg = brolm::detail::upload_host(g_rows.data(), q_dim, H);
-
-            bt::Tensor k_raw;
-            src.upload_compute_dequant(p + "self_attn.k_proj.weight",
-                                       kv_dim, H, k_raw, "self_attn.k_proj.weight");
-            std::vector<float> k_host = download_fp32(k_raw);
-            std::vector<float> k_perm =
-                permute_rotary_rows(k_host, n_kv, HD, rotary_dim_, H,
-                                    d_t_, d_h_, d_w_);
-            L.full.Wk = brolm::detail::upload_host(k_perm.data(), kv_dim, H);
-
-            src.upload_compute_checked(p + "self_attn.v_proj.weight",
-                                       kv_dim, H, L.full.Wv, "self_attn.v_proj.weight");
-            src.upload_compute_checked(p + "self_attn.o_proj.weight",
-                                       H, q_dim, L.full.Wo, "self_attn.o_proj.weight");
-
-            // Per-head norms: permute the rotary subrange [0, rotary_dim).
-            bt::Tensor qn_raw, kn_raw;
-            src.upload_compute_dequant(p + "self_attn.q_norm.weight",
-                                       HD, 1, qn_raw, "self_attn.q_norm.weight");
-            src.upload_compute_dequant(p + "self_attn.k_norm.weight",
-                                       HD, 1, kn_raw, "self_attn.k_norm.weight");
-            std::vector<float> qn_host = download_fp32(qn_raw);
-            std::vector<float> kn_host = download_fp32(kn_raw);
-            if (!is_gguf) {
-                for (float& v : qn_host) v += 1.0f;
-                for (float& v : kn_host) v += 1.0f;
-            }
-            std::vector<float> qn_perm =
-                permute_rotary_rows(qn_host, /*num_heads=*/1, HD, rotary_dim_, 1,
-                                    d_t_, d_h_, d_w_);
-            std::vector<float> kn_perm =
-                permute_rotary_rows(kn_host, /*num_heads=*/1, HD, rotary_dim_, 1,
-                                    d_t_, d_h_, d_w_);
-            L.full.q_norm = brolm::detail::upload_host(qn_perm.data(), HD, 1);
-            L.full.k_norm = brolm::detail::upload_host(kn_perm.data(), HD, 1);
-        } else {
-            // Linear-attn layer (Gated DeltaNet).
-            const std::string lp = p + "linear_attn.";
-            auto load_fp32 = [&](const std::string& key, int rows, int cols, bt::Tensor& dst, const std::string& label) {
-                bt::Tensor tmp;
-                src.upload_compute_dequant(key, rows, cols, tmp, label);
-                if (tmp.dtype == bt::Dtype::FP32 && tmp.device == dev) {
-                    dst = std::move(tmp);
-                } else {
-                    std::vector<float> host = download_fp32(tmp);
-                    dst = bt::Tensor::from_host_on(dev, host.data(), rows, cols);
-                }
-            };
-            load_fp32(lp + "A_log",             lin_h_v, 1, L.lin.A_log, "A_log");
-            load_fp32(lp + "conv1d.weight",     qkv_ch, conv_kd, L.lin.conv1d, "conv1d");
-            load_fp32(lp + "dt_bias",           lin_h_v, 1, L.lin.dt_bias, "dt_bias");
-            load_fp32(lp + "in_proj_a.weight",  lin_h_v, H, L.lin.in_proj_a, "in_proj_a");
-            load_fp32(lp + "in_proj_b.weight",  lin_h_v, H, L.lin.in_proj_b, "in_proj_b");
-            load_fp32(lp + "norm.weight",       lin_d_v, 1, L.lin.norm, "norm");
-
-            src.upload_compute_checked(lp + "in_proj_qkv.weight", qkv_ch, H, L.lin.in_proj_qkv, "in_proj_qkv");
-            src.upload_compute_checked(lp + "in_proj_z.weight",   vdim, H,   L.lin.in_proj_z,   "in_proj_z");
-            src.upload_compute_checked(lp + "out_proj.weight",    H, vdim,   L.lin.out_proj,    "out_proj");
-        }
-    }
-
-    {
-        bt::DeviceScope scope(final_device());
-        src.upload_compute_dequant("norm.weight",
-                                   H, 1, final_norm_, "norm.weight");
-        if (!is_gguf) add_one_to_norm_weight(final_norm_);
-
-        if (src.has("lm_head.weight")) {
-            src.upload_compute_checked("lm_head.weight",
-                                       V, H, lm_head_, "lm_head.weight");
-        } else {
-            if (!cfg_.tie_word_embeddings) {
-                fail("tie_word_embeddings=false but lm_head.weight missing");
-            }
-            if (embed_.device == final_device()) {
-                lm_head_ = embed_.clone();
-            } else {
-                lm_head_ = embed_.to(final_device());
-            }
-        }
-    }
-}
 
 // ─── cache ─────────────────────────────────────────────────────────────────
 
@@ -728,7 +279,7 @@ void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L) {
 
     if (mrope_max_pos_ > dev_st->tbl_max_pos) {
         const int cap = std::max({mrope_max_pos_, 2 * dev_st->tbl_max_pos, 1023});
-        MRopePairing pairing = mrope_pairing(d_t_, d_h_, d_w_);
+        internal::MRopePairing pairing = internal::mrope_pairing(d_t_, d_h_, d_w_);
         build_axis_tables(cap, d_t_, rd, cfg_.rope.rope_theta,
                           pairing.t_pairs, dev_st->cos_t, dev_st->sin_t, dev);
         build_axis_tables(cap, d_h_, rd, cfg_.rope.rope_theta,
@@ -772,15 +323,31 @@ void TextModel::apply_partial_mrope_(bt::Tensor& qk, int num_heads, int L) {
 
 void TextModel::mlp_block_(const MLP& mlp, int L) {
     (void)L;
-    detail::linear_batched(mlp.gate_W, /*bias=*/nullptr, norm_, mlp_gate_);
-    detail::linear_batched(mlp.up_W,   /*bias=*/nullptr, norm_, mlp_up_);
+    if (mlp.gate_up_W.size() > 0) {
+        {
+            brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::mlp_proj);
+            bt::linear_forward_batched_ex(mlp.gate_up_W, /*bias=*/nullptr, norm_, 0,
+                                          bt::kLinearEpiSwiglu, nullptr, mlp_gate_);
+        }
+    } else {
+        {
+            brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::mlp_proj);
+            detail::linear_batched(mlp.gate_W, /*bias=*/nullptr, norm_, mlp_gate_);
+            detail::linear_batched(mlp.up_W,   /*bias=*/nullptr, norm_, mlp_up_);
+        }
 
-    // SwiGLU without concat staging: gate <- silu(gate) * up, in place
-    // (silu_forward allows aliasing), then down-project.
-    bt::silu_forward(mlp_gate_, mlp_gate_);
-    bt::mul_inplace(mlp_gate_, mlp_up_);
-    detail::linear_batched(mlp.down_W, /*bias=*/nullptr, mlp_gate_, proj_);
-    bt::add_inplace(h_, proj_);
+        // SwiGLU without concat staging: gate <- silu(gate) * up, in place
+        // (silu_forward allows aliasing), then down-project.
+        {
+            brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::swiglu);
+            bt::silu_forward(mlp_gate_, mlp_gate_);
+            bt::mul_inplace(mlp_gate_, mlp_up_);
+        }
+    }
+    {
+        brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::mlp_proj);
+        detail::linear_batched_accumulate(mlp.down_W, /*bias=*/nullptr, mlp_gate_, h_);
+    }
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────
@@ -794,10 +361,17 @@ bt::Tensor TextModel::embed_tokens(const std::vector<int>& token_ids) const {
         ids32[static_cast<std::size_t>(i)] =
             static_cast<int32_t>(token_ids[static_cast<std::size_t>(i)]);
     }
-    bt::Tensor ids_dev = make_idx_device(ids32.data(), L, embed_device());
+    bt::Tensor ids_dev;
+    {
+        brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::idx_upload);
+        ids_dev = make_idx_device(ids32.data(), L, embed_device());
+    }
     bt::Tensor out;
-    bt::embedding_lookup_forward(
-        embed_, static_cast<const int32_t*>(ids_dev.data), L, out);
+    {
+        brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::embed);
+        bt::embedding_lookup_forward(
+            embed_, static_cast<const int32_t*>(ids_dev.data), L, out);
+    }
     // Clone so the result owns its own storage (embedding_lookup_forward may
     // alias internal scratch on some backends).
     return out.clone();
@@ -873,7 +447,7 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             q_ = bt::Tensor(); k_ = bt::Tensor(); v_ = bt::Tensor(); gate_ = bt::Tensor();
             qn_ = bt::Tensor(); kn_ = bt::Tensor(); q_rot_ = bt::Tensor(); k_rot_ = bt::Tensor();
             attn_ = bt::Tensor(); gate_sig_ = bt::Tensor(); proj_ = bt::Tensor();
-            mlp_gate_ = bt::Tensor(); mlp_up_ = bt::Tensor();
+            mlp_gate_ = bt::Tensor(); mlp_up_ = bt::Tensor(); mlp_gate_up_ = bt::Tensor();
             lin_qkv_ = bt::Tensor(); lin_qkv_ncl_ = bt::Tensor(); lin_conv_ncl_ = bt::Tensor();
             lin_qkv_conv_ = bt::Tensor(); lin_q_ = bt::Tensor(); lin_k_ = bt::Tensor(); lin_v_ = bt::Tensor();
             lin_a_raw_ = bt::Tensor(); lin_beta_ = bt::Tensor(); lin_z_ = bt::Tensor(); lin_zsilu_ = bt::Tensor();
@@ -885,7 +459,10 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
         }
 
         // ── attention sub-layer ───────────────────────────────────────────
-        bt::rms_norm_forward(h_, layer.in_norm, eps, norm_);
+        {
+            brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::rms_norm);
+            bt::rms_norm_forward(h_, layer.in_norm, eps, norm_);
+        }
 
         if (layer.type == LayerType::Full) {
             FullAttnKVCache& kvc = c.full;
@@ -895,69 +472,62 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 fail("forward: cache_len + L exceeds allocated capacity");
             }
 
-            detail::linear_batched(layer.full.Wq, nullptr, norm_, q_);
-            detail::linear_batched(layer.full.Wg, nullptr, norm_, gate_);
-            detail::linear_batched(layer.full.Wk, nullptr, norm_, k_);
-            detail::linear_batched(layer.full.Wv, nullptr, norm_, v_);
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::qkv_proj);
+                detail::linear_batched(layer.full.Wq, nullptr, norm_, q_);
+                detail::linear_batched(layer.full.Wg, nullptr, norm_, gate_);
+                detail::linear_batched(layer.full.Wk, nullptr, norm_, k_);
+                detail::linear_batched(layer.full.Wv, nullptr, norm_, v_);
+            }
 
             // Per-head RMSNorm (q/k only; full head_dim including pass-through).
-            auto headnorm = [&](const bt::Tensor& src, int num_heads,
-                                const bt::Tensor& gain, bt::Tensor& dst) {
-                const int rows = src.rows;
-                bt::Tensor src_v = bt::Tensor::view(
-                    src.device, src.data, rows * num_heads, HD, src.dtype);
-                bt::rms_norm_forward(src_v, gain, eps, dst);
-                dst.rows = rows;
-                dst.cols = num_heads * HD;
-            };
-            headnorm(q_, n_q,  layer.full.q_norm, qn_);
-            headnorm(k_, n_kv, layer.full.k_norm, kn_);
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::qk_norm);
+                auto headnorm = [&](const bt::Tensor& src, int num_heads,
+                                    const bt::Tensor& gain, bt::Tensor& dst) {
+                    const int rows = src.rows;
+                    bt::Tensor src_v = bt::Tensor::view(
+                        src.device, src.data, rows * num_heads, HD, src.dtype);
+                    bt::rms_norm_forward(src_v, gain, eps, dst);
+                    dst.rows = rows;
+                    dst.cols = num_heads * HD;
+                };
+                headnorm(q_, n_q,  layer.full.q_norm, qn_);
+                headnorm(k_, n_kv, layer.full.k_norm, kn_);
+            }
 
             // Partial M-RoPE on q and k.
-            apply_partial_mrope_(qn_, n_q,  L);
-            apply_partial_mrope_(kn_, n_kv, L);
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::rope);
+                apply_partial_mrope_(qn_, n_q,  L);
+                apply_partial_mrope_(kn_, n_kv, L);
+            }
 
             // GQA: append the n_kv-width k/v straight to the cache; the decode
             // op maps query head h to KV head h/(n_q/n_kv).
-            bt::kv_cache_append(kn_, v_, kvc.len, kvc.k, kvc.v);
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::kv_append);
+                bt::kv_cache_append(kn_, v_, kvc.len, kvc.k, kvc.v);
+            }
 
             // Causal attention against the populated cache.
-            bt::flash_attention_decode(qn_, kvc.k, kvc.v,
-                                       kvc.len + L, n_q, n_kv, attn_);
-            kvc.len += L;
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::attention);
+                bt::flash_attention_decode(qn_, kvc.k, kvc.v,
+                                           kvc.len + L, n_q, n_kv, attn_);
+                kvc.len += L;
 
-            // attn_output_gate: attn = attn * sigmoid(gate) BEFORE o_proj.
-            bt::sigmoid_forward(gate_, gate_sig_);
-            bt::mul_inplace(attn_, gate_sig_);
+                // attn_output_gate: attn = attn * sigmoid(gate) BEFORE o_proj.
+                bt::sigmoid_forward(gate_, gate_sig_);
+                bt::mul_inplace(attn_, gate_sig_);
+            }
 
-            detail::linear_batched(layer.full.Wo, nullptr, attn_, proj_);
-            bt::add_inplace(h_, proj_);
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::o_proj);
+                detail::linear_batched_accumulate(layer.full.Wo, nullptr, attn_, h_);
+            }
         } else {
             // ── Gated DeltaNet (linear-attention) sub-layer ───────────────
-            //
-            // Faithful port of HF transformers' Qwen3NextGatedDeltaNet.forward
-            // (https://raw.githubusercontent.com/huggingface/transformers/main/
-            //  src/transformers/models/qwen3_next/modeling_qwen3_next.py).
-            //
-            // Per-token rule (prefill T > 1 runs it via the chunked WY/UT
-            // formulation, decode T == 1 via the streaming step — identical
-            // math against the same persistent state, see delta_rule.h):
-            //
-            //   x      = rms_norm(h, in_norm)                  [already done]
-            //   qkv    = in_proj_qkv @ x                       (T, 3*H*D_k)
-            //   qkv    = silu( causal_conv1d_update(qkv, conv_state) )
-            //   q,k,v  = split qkv  -> each (T, H*D_k or H*D_v)
-            //   z      = in_proj_z @ x                         (T, H*D_v)
-            //   a_raw  = in_proj_a @ x + dt_bias               (T, H) FP32
-            //   b_raw  = in_proj_b @ x                         (T, H) FP32
-            //   O, S'  = gated_delta_rule(q,k,v,a_raw,b_raw,log_A,S)
-            //     (per HF: g = -A_log.exp() * softplus(a + dt_bias);
-            //              beta = sigmoid(b); applied inside brotensor's op.)
-            //   O'     = rms_norm_per_head(O, norm.weight)     [per HF: norm
-            //              before gate]
-            //   O'     = O' * silu(z)                          (Qwen3NextRMSNormGated)
-            //   out    = out_proj @ O'                         (T, hidden)
-            //   h     += out
             const int lin_h_v = cfg_.linear_num_value_heads;
             const int lin_h_k = cfg_.linear_num_key_heads;
             const int lin_d_k = cfg_.linear_key_head_dim;
@@ -973,15 +543,66 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 fail("forward: linear-attn state must be FP32");
             }
 
+            const bool has_fused_in_proj = (layer.lin.in_proj_all.size() > 0);
             const bt::Tensor* lin_x = &norm_;
-            if (norm_.dtype != bt::Dtype::FP32) {
-                bt::cast(norm_, lin_x_fp32_, bt::Dtype::FP32);
-                lin_x = &lin_x_fp32_;
-            }
 
-            // 1) in_proj_qkv -> (L, qkv_ch)
-            const bt::Tensor* qkv_in = (layer.lin.in_proj_qkv.dtype == bt::Dtype::FP32) ? lin_x : &norm_;
-            detail::linear_batched(layer.lin.in_proj_qkv, nullptr, *qkv_in, lin_qkv_);
+            if (has_fused_in_proj) {
+                {
+                    brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_proj);
+                    detail::linear_batched(layer.lin.in_proj_all, nullptr, norm_, lin_in_all_);
+                }
+                if (L == 1) {
+                    char* all_bytes = static_cast<char*>(lin_in_all_.data);
+                    const std::size_t es = bt::dtype_size_bytes(lin_in_all_.dtype);
+                    lin_qkv_ = bt::Tensor::view(lin_in_all_.device, all_bytes, 1, qkv_ch, lin_in_all_.dtype);
+                    lin_z_   = bt::Tensor::view(lin_in_all_.device, all_bytes + qkv_ch * es, 1, vdim, lin_in_all_.dtype);
+                    bt::Tensor lin_a_sl = bt::Tensor::view(lin_in_all_.device, all_bytes + (qkv_ch + vdim) * es, 1, lin_h_v, lin_in_all_.dtype);
+                    bt::Tensor lin_b_sl = bt::Tensor::view(lin_in_all_.device, all_bytes + (qkv_ch + vdim + lin_h_v) * es, 1, lin_h_v, lin_in_all_.dtype);
+
+                    bt::cast(lin_a_sl, lin_a_raw_, bt::Dtype::FP32);
+                    bt::add_inplace(lin_a_raw_, layer.lin.dt_bias);
+                    bt::cast(lin_b_sl, lin_beta_, bt::Dtype::FP32);
+                } else {
+                    const int total_in_ch = qkv_ch + vdim + 2 * lin_h_v;
+                    brolm::detail::resize_like(lin_qkv_, L, qkv_ch, lin_in_all_.dtype, lin_in_all_.device);
+                    brolm::detail::resize_like(lin_z_,   L, vdim,   lin_in_all_.dtype, lin_in_all_.device);
+                    bt::Tensor lin_a_sl, lin_b_sl;
+                    brolm::detail::resize_like(lin_a_sl, L, lin_h_v, lin_in_all_.dtype, lin_in_all_.device);
+                    brolm::detail::resize_like(lin_b_sl, L, lin_h_v, lin_in_all_.dtype, lin_in_all_.device);
+
+                    bt::copy_d2d_strided(lin_in_all_, 0, total_in_ch,
+                                         lin_qkv_, 0, qkv_ch, qkv_ch, L);
+                    bt::copy_d2d_strided(lin_in_all_, qkv_ch, total_in_ch,
+                                         lin_z_, 0, vdim, vdim, L);
+                    bt::copy_d2d_strided(lin_in_all_, qkv_ch + vdim, total_in_ch,
+                                         lin_a_sl, 0, lin_h_v, lin_h_v, L);
+                    bt::copy_d2d_strided(lin_in_all_, qkv_ch + vdim + lin_h_v, total_in_ch,
+                                         lin_b_sl, 0, lin_h_v, lin_h_v, L);
+
+                    bt::cast(lin_a_sl, lin_a_raw_, bt::Dtype::FP32);
+                    for (int l = 0; l < L; ++l) {
+                        bt::Tensor row_a = bt::Tensor::view(lin_a_raw_.device,
+                            static_cast<float*>(lin_a_raw_.data) + l * lin_h_v, 1, lin_h_v, bt::Dtype::FP32);
+                        bt::add_inplace(row_a, layer.lin.dt_bias);
+                    }
+                    bt::cast(lin_b_sl, lin_beta_, bt::Dtype::FP32);
+                }
+                lin_log_A_ = layer.lin.A_log;
+                lin_log_A_.rows = lin_h_v;
+                lin_log_A_.cols = 1;
+            } else {
+                if (norm_.dtype != bt::Dtype::FP32) {
+                    bt::cast(norm_, lin_x_fp32_, bt::Dtype::FP32);
+                    lin_x = &lin_x_fp32_;
+                }
+
+                // 1) in_proj_qkv -> (L, qkv_ch)
+                {
+                    brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_proj);
+                    const bt::Tensor* qkv_in = (layer.lin.in_proj_qkv.dtype == bt::Dtype::FP32) ? lin_x : &norm_;
+                    detail::linear_batched(layer.lin.in_proj_qkv, nullptr, *qkv_in, lin_qkv_);
+                }
+            }
 
             const bt::Tensor* qkv_conv_in = &lin_qkv_;
             if (lin_qkv_.dtype != bt::Dtype::FP32) {
@@ -990,130 +611,146 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             }
 
             // 2) Depthwise causal conv1d against the rolling conv_state, then SiLU
-            if (L == 1) {
-                bt::causal_conv1d_update(*qkv_conv_in, layer.lin.conv1d,
-                                         /*bias=*/nullptr,
-                                         /*N=*/1, /*C=*/qkv_ch, /*L_step=*/1,
-                                         /*kL=*/kK, /*dilation=*/1,
-                                         c.lin.conv_state, lin_qkv_conv_);
-            } else {
-                bt::sequence_to_nchw(*qkv_conv_in, /*N=*/1, /*C=*/qkv_ch,
-                                     /*H=*/1, /*W=*/L, lin_qkv_ncl_);
-                bt::causal_conv1d_update(lin_qkv_ncl_, layer.lin.conv1d,
-                                         /*bias=*/nullptr,
-                                         /*N=*/1, /*C=*/qkv_ch, /*L_step=*/L,
-                                         /*kL=*/kK, /*dilation=*/1,
-                                         c.lin.conv_state, lin_conv_ncl_);
-                bt::nchw_to_sequence(lin_conv_ncl_, /*N=*/1, /*C=*/qkv_ch,
-                                     /*H=*/1, /*W=*/L, lin_qkv_conv_);
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_conv);
+                if (L == 1) {
+                    bt::causal_conv1d_update(*qkv_conv_in, layer.lin.conv1d,
+                                             /*bias=*/nullptr,
+                                             /*N=*/1, /*C=*/qkv_ch, /*L_step=*/1,
+                                             /*kL=*/kK, /*dilation=*/1,
+                                             c.lin.conv_state, lin_qkv_conv_);
+                } else {
+                    bt::sequence_to_nchw(*qkv_conv_in, /*N=*/1, /*C=*/qkv_ch,
+                                         /*H=*/1, /*W=*/L, lin_qkv_ncl_);
+                    bt::causal_conv1d_update(lin_qkv_ncl_, layer.lin.conv1d,
+                                             /*bias=*/nullptr,
+                                             /*N=*/1, /*C=*/qkv_ch, /*L_step=*/L,
+                                             /*kL=*/kK, /*dilation=*/1,
+                                             c.lin.conv_state, lin_conv_ncl_);
+                    bt::nchw_to_sequence(lin_conv_ncl_, /*N=*/1, /*C=*/qkv_ch,
+                                         /*H=*/1, /*W=*/L, lin_qkv_conv_);
+                }
+                bt::silu_forward(lin_qkv_conv_, lin_qkv_conv_);
             }
-            bt::silu_forward(lin_qkv_conv_, lin_qkv_conv_);
 
-            // 3) Split qkv_conv into q,k,v.
-            brolm::detail::resize_like(lin_q_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
-            brolm::detail::resize_like(lin_k_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
-            brolm::detail::resize_like(lin_v_, L, vdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
-            bt::copy_d2d_strided(lin_qkv_conv_, 0 * kdim, qkv_ch,
-                                 lin_q_, 0, kdim, kdim, L);
-            bt::copy_d2d_strided(lin_qkv_conv_, 1 * kdim, qkv_ch,
-                                 lin_k_, 0, kdim, kdim, L);
-            bt::copy_d2d_strided(lin_qkv_conv_, 2 * kdim, qkv_ch,
-                                 lin_v_, 0, vdim, vdim, L);
+            // 3) Split qkv_conv into q,k,v
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_split);
+                brolm::detail::resize_like(lin_q_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
+                brolm::detail::resize_like(lin_k_, L, kdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
+                brolm::detail::resize_like(lin_v_, L, vdim, lin_qkv_conv_.dtype, lin_qkv_conv_.device);
+                bt::copy_d2d_strided(lin_qkv_conv_, 0 * kdim, qkv_ch,
+                                     lin_q_, 0, kdim, kdim, L);
+                bt::copy_d2d_strided(lin_qkv_conv_, 1 * kdim, qkv_ch,
+                                     lin_k_, 0, kdim, kdim, L);
+                bt::copy_d2d_strided(lin_qkv_conv_, 2 * kdim, qkv_ch,
+                                     lin_v_, 0, vdim, vdim, L);
+            }
 
-            // 4) z = in_proj_z @ x  (T, H*D_v)
-            const bt::Tensor* z_in = (layer.lin.in_proj_z.dtype == bt::Dtype::FP32) ? lin_x : &norm_;
-            detail::linear_batched(layer.lin.in_proj_z, nullptr, *z_in, lin_z_);
+            // 4) z, a_raw, beta, log_A (only if unfused)
+            if (!has_fused_in_proj) {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_z_ab);
+                const bt::Tensor* z_in = (layer.lin.in_proj_z.dtype == bt::Dtype::FP32) ? lin_x : &norm_;
+                detail::linear_batched(layer.lin.in_proj_z, nullptr, *z_in, lin_z_);
+
+                // 5) a_raw = in_proj_a @ x + dt_bias    (T, H).
+                detail::linear_batched(layer.lin.in_proj_a, &layer.lin.dt_bias,
+                                       *lin_x, lin_a_raw_);
+                detail::linear_batched(layer.lin.in_proj_b, nullptr,
+                                       *lin_x, lin_beta_);
+
+                // 6) log_A as (num_heads, 1) FP32
+                lin_log_A_ = layer.lin.A_log;
+                lin_log_A_.rows = lin_h_v;
+                lin_log_A_.cols = 1;
+            }
+
+            // 7) Pre-recurrence q/k transforms + GQA expansion
+            const bt::Tensor* q_rec = &lin_q_;
+            const bt::Tensor* k_rec = &lin_k_;
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_l2);
+                bt::l2_norm_forward(lin_q_, /*head_dim=*/lin_d_k,
+                                    /*num_heads=*/lin_h_k, /*eps=*/1e-6f, lin_q_);
+                bt::l2_norm_forward(lin_k_, /*head_dim=*/lin_d_k,
+                                    /*num_heads=*/lin_h_k, /*eps=*/1e-6f, lin_k_);
+                bt::scale_inplace(lin_q_, 1.0f / std::sqrt(static_cast<float>(lin_d_k)));
+
+                if (lin_h_k != lin_h_v) {
+                    const int gqa_ratio = lin_h_v / lin_h_k;
+                    const int v_kdim = lin_h_v * lin_d_k;
+                    brolm::detail::resize_like(lin_q_exp_, L, v_kdim, lin_q_.dtype, lin_q_.device);
+                    brolm::detail::resize_like(lin_k_exp_, L, v_kdim, lin_k_.dtype, lin_k_.device);
+                    for (int hk = 0; hk < lin_h_k; ++hk) {
+                        for (int r = 0; r < gqa_ratio; ++r) {
+                            const int hv = hk * gqa_ratio + r;
+                            bt::copy_d2d_strided(lin_q_, hk * lin_d_k, kdim,
+                                                 lin_q_exp_, hv * lin_d_k, v_kdim, lin_d_k, L);
+                            bt::copy_d2d_strided(lin_k_, hk * lin_d_k, kdim,
+                                                 lin_k_exp_, hv * lin_d_k, v_kdim, lin_d_k, L);
+                        }
+                    }
+                    q_rec = &lin_q_exp_;
+                    k_rec = &lin_k_exp_;
+                }
+            }
+
+            // 9) Recurrence: updates c.lin.recurrent in place; writes O.
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_delta_step);
+                if (L == 1) {
+                    bt::gated_delta_rule_step(*q_rec, *k_rec, lin_v_,
+                                              lin_a_raw_, lin_beta_, lin_log_A_,
+                                              /*num_heads=*/lin_h_v,
+                                              /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
+                                              c.lin.recurrent, lin_O_);
+                } else {
+                    bt::gated_delta_rule_chunked(*q_rec, *k_rec, lin_v_,
+                                                 lin_a_raw_, lin_beta_, lin_log_A_,
+                                                 /*num_heads=*/lin_h_v,
+                                                 /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
+                                                 c.lin.recurrent, lin_O_);
+                }
+                c.lin.len += L;
+            }
+
             const bt::Tensor* z_fp32 = &lin_z_;
             if (lin_z_.dtype != bt::Dtype::FP32) {
                 bt::cast(lin_z_, lin_z_fp32_, bt::Dtype::FP32);
                 z_fp32 = &lin_z_fp32_;
             }
 
-            // 5) a_raw = in_proj_a @ x + dt_bias    (T, H).
-            detail::linear_batched(layer.lin.in_proj_a, &layer.lin.dt_bias,
-                                   *lin_x, lin_a_raw_);
-            detail::linear_batched(layer.lin.in_proj_b, nullptr,
-                                   *lin_x, lin_beta_);
-
-            // 6) log_A as (num_heads, 1) FP32
-            lin_log_A_ = layer.lin.A_log;
-            lin_log_A_.rows = lin_h_v;
-            lin_log_A_.cols = 1;
-
-            // 7) Pre-recurrence q/k transforms
-            bt::l2_norm_forward(lin_q_, /*head_dim=*/lin_d_k,
-                                /*num_heads=*/lin_h_k, /*eps=*/1e-6f, lin_q_);
-            bt::l2_norm_forward(lin_k_, /*head_dim=*/lin_d_k,
-                                /*num_heads=*/lin_h_k, /*eps=*/1e-6f, lin_k_);
-            bt::scale_inplace(lin_q_, 1.0f / std::sqrt(static_cast<float>(lin_d_k)));
-
-            // 8) GQA expansion for key heads if lin_h_k < lin_h_v
-            const bt::Tensor* q_rec = &lin_q_;
-            const bt::Tensor* k_rec = &lin_k_;
-            if (lin_h_k != lin_h_v) {
-                const int gqa_ratio = lin_h_v / lin_h_k;
-                const int v_kdim = lin_h_v * lin_d_k;
-                brolm::detail::resize_like(lin_q_exp_, L, v_kdim, lin_q_.dtype, lin_q_.device);
-                brolm::detail::resize_like(lin_k_exp_, L, v_kdim, lin_k_.dtype, lin_k_.device);
-                for (int hk = 0; hk < lin_h_k; ++hk) {
-                    for (int r = 0; r < gqa_ratio; ++r) {
-                        const int hv = hk * gqa_ratio + r;
-                        bt::copy_d2d_strided(lin_q_, hk * lin_d_k, kdim,
-                                             lin_q_exp_, hv * lin_d_k, v_kdim, lin_d_k, L);
-                        bt::copy_d2d_strided(lin_k_, hk * lin_d_k, kdim,
-                                             lin_k_exp_, hv * lin_d_k, v_kdim, lin_d_k, L);
-                    }
-                }
-                q_rec = &lin_q_exp_;
-                k_rec = &lin_k_exp_;
-            }
-
-            // 9) Recurrence: updates c.lin.recurrent in place; writes O.
-            if (L == 1) {
-                bt::gated_delta_rule_step(*q_rec, *k_rec, lin_v_,
-                                          lin_a_raw_, lin_beta_, lin_log_A_,
-                                          /*num_heads=*/lin_h_v,
-                                          /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
-                                          c.lin.recurrent, lin_O_);
-            } else {
-                bt::gated_delta_rule_chunked(*q_rec, *k_rec, lin_v_,
-                                             lin_a_raw_, lin_beta_, lin_log_A_,
-                                             /*num_heads=*/lin_h_v,
-                                             /*d_k=*/lin_d_k, /*d_v=*/lin_d_v,
-                                             c.lin.recurrent, lin_O_);
-            }
-            c.lin.len += L;
-
             // 10) Per-head RMSNorm with norm.weight, then multiply by silu(z)
             {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_norm_gate);
                 bt::Tensor o_view = bt::Tensor::view(
                     lin_O_.device, lin_O_.data,
                     L * lin_h_v, lin_d_v, lin_O_.dtype);
                 bt::rms_norm_forward(o_view, layer.lin.norm, eps, lin_O_norm_);
                 lin_O_norm_.rows = L;
                 lin_O_norm_.cols = vdim;
+                bt::silu_forward(*z_fp32, lin_zsilu_);
+                bt::mul_inplace(lin_O_norm_, lin_zsilu_);
             }
-            bt::silu_forward(*z_fp32, lin_zsilu_);
-            bt::mul_inplace(lin_O_norm_, lin_zsilu_);
 
             // 11) out_proj back to hidden, residual add.
-            const bt::Tensor* out_proj_in = &lin_O_norm_;
-            if (layer.lin.out_proj.dtype != bt::Dtype::FP32 && lin_O_norm_.dtype != bt::Dtype::FP16) {
-                bt::cast(lin_O_norm_, lin_O_cast_, bt::Dtype::FP16);
-                out_proj_in = &lin_O_cast_;
+            {
+                brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::o_proj);
+                const bt::Tensor* out_proj_in = &lin_O_norm_;
+                if (lin_O_norm_.dtype != layer.lin.out_proj.dtype) {
+                    bt::cast(lin_O_norm_, lin_O_cast_, layer.lin.out_proj.dtype);
+                    out_proj_in = &lin_O_cast_;
+                }
+                detail::linear_batched_accumulate(layer.lin.out_proj, nullptr, *out_proj_in, h_);
             }
-            detail::linear_batched(layer.lin.out_proj, nullptr, *out_proj_in, proj_);
-            const bt::Tensor* proj_to_add = &proj_;
-            if (proj_.dtype != h_.dtype) {
-                bt::cast(proj_, lin_proj_cast_, h_.dtype);
-                proj_to_add = &lin_proj_cast_;
-            }
-            bt::add_inplace(h_, *proj_to_add);
             (void)n_kv;
         }
 
         // ── MLP sub-layer ─────────────────────────────────────────────────
-        bt::rms_norm_forward(h_, layer.post_attn_norm, eps, norm_);
+        {
+            brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::rms_norm);
+            bt::rms_norm_forward(h_, layer.post_attn_norm, eps, norm_);
+        }
         mlp_block_(layer.mlp, L);
     }
 
@@ -1124,8 +761,14 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
     if (final_device() != prev_dev) {
         norm_ = bt::Tensor();
     }
-    bt::rms_norm_forward(h_, final_norm_, eps, norm_);
-    detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
+    {
+        brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::final_norm);
+        bt::rms_norm_forward(h_, final_norm_, eps, norm_);
+    }
+    {
+        brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lm_head);
+        detail::linear_batched(lm_head_, /*bias=*/nullptr, norm_, logits_out);
+    }
     (void)q_dim;
 }
 

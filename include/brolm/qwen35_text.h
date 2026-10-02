@@ -227,14 +227,16 @@ private:
         brotensor::Tensor in_proj_b;
         brotensor::Tensor in_proj_qkv;
         brotensor::Tensor in_proj_z;
+        brotensor::Tensor in_proj_all;  // (qkv_ch + vdim + 2*lin_h_v, H) fused projection
         brotensor::Tensor norm;
         brotensor::Tensor out_proj;
     };
 
     struct MLP {
-        brotensor::Tensor gate_W;   // (intermediate, hidden)
-        brotensor::Tensor up_W;     // (intermediate, hidden)
-        brotensor::Tensor down_W;   // (hidden, intermediate)
+        brotensor::Tensor gate_W;      // (intermediate, hidden)
+        brotensor::Tensor up_W;        // (intermediate, hidden)
+        brotensor::Tensor gate_up_W;   // (2*intermediate, hidden) fused gate + up
+        brotensor::Tensor down_W;      // (hidden, intermediate)
     };
 
     struct LayerSlot {
@@ -289,6 +291,7 @@ private:
     brotensor::Tensor proj_;        // o_proj / down_proj output
     brotensor::Tensor mlp_gate_, mlp_up_;   // mlp_gate_ becomes the SwiGLU
                                             // activation in place
+    brotensor::Tensor mlp_gate_up_; // fused gate+up GEMV output (L, 2*intermediate)
 
     // M-RoPE state staged by prepare_mrope_: per-axis cos/sin tables cached
     // per device to `tbl_max_pos` (inclusive), and the call's device-resident
@@ -306,6 +309,7 @@ private:
     int mrope_max_pos_ = 0;
 
     // Linear-attention scratch (see qwen35_text.cpp linear_attn_block_).
+    brotensor::Tensor lin_in_all_;     // (T, qkv_ch + vdim + 2*lin_h_v) fused input GEMV
     brotensor::Tensor lin_qkv_;        // (T, 3*num_heads*head_dim)
     brotensor::Tensor lin_qkv_ncl_;    // (1, C*T) NCL transpose for prefill conv
     brotensor::Tensor lin_conv_ncl_;   // (1, C*T) NCL conv output (prefill)

@@ -11,6 +11,7 @@
 #include "brolm/qwen35_text.h"
 #include "brolm/qwen35_tokenizer.h"
 #include "brolm/detail/generate.h"
+#include "brolm/detail/profile.h"
 
 #include "brotensor/gguf.h"
 #include "brotensor/safetensors.h"
@@ -318,6 +319,7 @@ int main(int argc, char** argv) {
             std::printf("\n[stats] Prefill: %.2f ms (%.1f tok/s) | Generated: %d tokens in %.2f s (%.2f tok/s)\n",
                         prefill_ms, (prefill_ms > 0 ? (L / (prefill_ms / 1000.0)) : 0.0),
                         generated_count, decode_sec, decode_tps);
+            brolm::detail::profile::report();
         };
 
         if (interactive_mode) {

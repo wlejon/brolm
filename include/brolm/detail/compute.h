@@ -85,6 +85,20 @@ inline void linear_batched(const brotensor::Tensor& W,
     brotensor::linear_forward_batched(W, zero, X, Y);
 }
 
+inline void linear_batched_accumulate(const brotensor::Tensor& W,
+                                      const brotensor::Tensor* bias,
+                                      const brotensor::Tensor& X,
+                                      brotensor::Tensor& Y) {
+    if ((W.dtype == brotensor::Dtype::FP16 || W.dtype == brotensor::Dtype::BF16) &&
+        X.dtype == W.dtype && Y.dtype == W.dtype) {
+        brotensor::linear_forward_batched_ex(W, bias, X, 0, brotensor::kLinearEpiAccumulate, nullptr, Y);
+        return;
+    }
+    brotensor::Tensor tmp;
+    linear_batched(W, bias, X, tmp);
+    brotensor::add_inplace(Y, tmp);
+}
+
 // Inference batched layernorm — same FP16-distinct-op situation.
 inline void layernorm_batched(const brotensor::Tensor& X,
                               const brotensor::Tensor& gamma,
