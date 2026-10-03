@@ -364,27 +364,14 @@ void TextEncoder::load_weights_impl_(
     // the whole forward (which inherits the weight dtype) runs in BF16. The INT8
     // (W8A16) path keeps its FP16 activation contract, so skip it there.
     //
-    // Vulkan cannot take that route: its matrix cores stage 16-bit operands
-    // as FP16 (brotensor docs/vulkan.md, dtype policy), so a BF16 activation
-    // past 65504 becomes inf inside the GEMM. There the weights stay at the
-    // FP16 compute dtype and the forward keeps its activations in FP32
-    // instead (f32_stream_): residual stream, norms and the whole FFN run in
-    // FP32 against the FP16 weights (Vulkan's FP32 x 16-bit GEMM, which never
-    // rounds the activations), and only the RMS-normed attention input, which
-    // is O(1) by construction, goes back to FP16 for the fused attention. No
-    // weight is widened: the FP32 scratch is a few (L, d_ff) buffers.
+    // Vulkan included: its matrix cores stage 16-bit operands as FP16, and
+    // brotensor scales each row of a BF16 activation into FP16's range as it
+    // stages it (a power of two per row, undone in the FP32 epilogue), so a
+    // BF16 activation past 65504 goes through the GEMM exactly
+    // (brotensor docs/vulkan-bf16.md).
     const bt::DeviceType dev_type = bt::default_device().type;
-    if (dev_type == bt::DeviceType::VULKAN && !do_quantize) {
-        auto to_f32 = [](bt::Tensor& t) {
-            bt::Tensor f;
-            bt::cast(t, f, bt::Dtype::FP32);
-            t = std::move(f);
-        };
-        // RMSNorm takes FP32 X against an FP32 gain.
-        to_f32(final_ln_);
-        for (auto& B : blocks_) { to_f32(B.ln0); to_f32(B.ln1); }
-        f32_stream_ = true;
-    } else if ((dev_type == bt::DeviceType::CUDA || dev_type == bt::DeviceType::HIP) && !do_quantize) {
+    if ((dev_type == bt::DeviceType::CUDA || dev_type == bt::DeviceType::HIP ||
+         dev_type == bt::DeviceType::VULKAN) && !do_quantize) {
         auto to_bf16 = [](bt::Tensor& t) {
             if (t.dtype == bt::Dtype::FP16) {
                 bt::Tensor b;
@@ -432,10 +419,6 @@ void TextEncoder::ffn_linear_(const bt::Tensor& W, const QWeight& q,
     if (q.active()) {
         bt::linear_forward_batched_int8w_fp16(q.W_int8, q.scales,
                                               /*bias=*/nullptr, X, Y);
-    } else if (f32_stream_) {
-        // FP32 X against the 16-bit W, FP32 Y: never rounds the activations.
-        static const bt::Tensor no_bias;
-        bt::linear_forward_batched(W, no_bias, X, Y);
     } else {
         detail::linear_batched(W, /*bias=*/nullptr, X, Y);
     }
@@ -510,8 +493,7 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out,
     // Clamp only when the residual stream is actually FP16 (T5's overflow
     // guard). With the BF16 re-cast above the stream is BF16, which has the
     // range to not need clamping; clamping it would needlessly clip.
-    const bool clamp_residual =
-        !f32_stream_ && token_embed_.dtype == bt::Dtype::FP16;
+    const bool clamp_residual = token_embed_.dtype == bt::Dtype::FP16;
     constexpr float kFp16Clamp = 64504.0f;   // finfo(fp16).max - 1000
 
     rebuild_position_bias_(L);
@@ -522,13 +504,7 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out,
     bt::embedding_lookup_forward(
         token_embed_, static_cast<const int32_t*>(ids_dev_.data), L, x_);
     // Own the residual stream — embedding output buffer is otherwise reused.
-    if (f32_stream_) {
-        bt::Tensor x32;
-        bt::cast(x_, x32, bt::Dtype::FP32);
-        x_ = std::move(x32);
-    } else {
-        x_ = x_.clone();
-    }
+    x_ = x_.clone();
 
     for (auto& B : blocks_) {
         // ── self-attention sub-layer ──────────────────────────────────────
@@ -540,20 +516,12 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out,
                 B.Wv_q.W_int8, B.Wv_q.scales,
                 B.Wo_q.W_int8, B.Wo_q.scales,
                 d_mask, &pos_bias_, H, /*scale=*/1.0f, attn_);
-        } else if (f32_stream_) {
-            // Projections, scores and the head outputs are FP32 inside the
-            // op whatever X's dtype; X and the weights must share one.
-            bt::cast(n_, n16_, B.Wq.dtype);
-            bt::self_attention_bias_forward(
-                n16_, B.Wq, B.Wk, B.Wv, B.Wo,
-                d_mask, &pos_bias_, H, /*scale=*/1.0f, attn_);
-            bt::cast(attn_, attn32_, bt::Dtype::FP32);
         } else {
             bt::self_attention_bias_forward(
                 n_, B.Wq, B.Wk, B.Wv, B.Wo,
                 d_mask, &pos_bias_, H, /*scale=*/1.0f, attn_);
         }
-        bt::add_inplace(x_, f32_stream_ ? attn32_ : attn_);
+        bt::add_inplace(x_, attn_);
         if (clamp_residual) bt::clamp(x_, -kFp16Clamp, kFp16Clamp);
 
         // ── FFN sub-layer (gated-gelu) ────────────────────────────────────
@@ -567,13 +535,6 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out,
         if (clamp_residual) bt::clamp(x_, -kFp16Clamp, kFp16Clamp);
     }
 
-    if (f32_stream_) {
-        // `out` stays at the compute dtype (FP16), as the contract says; the
-        // normed output is O(1) times the final gain.
-        bt::rms_norm_forward(x_, final_ln_, cfg_.layer_norm_eps, out32_);
-        bt::cast(out32_, out, bt::compute_dtype());
-        return;
-    }
     bt::rms_norm_forward(x_, final_ln_, cfg_.layer_norm_eps, out);
 }
 

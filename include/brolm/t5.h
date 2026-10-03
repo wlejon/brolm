@@ -127,7 +127,8 @@ public:
 
     // Forward over a length-L int32 token-id sequence (host pointer).
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
-    //   out: (L, d_model) Tensor at the compute dtype, resized as needed.
+    //   out: (L, d_model) Tensor at the forward's dtype (BF16 on a GPU, FP16
+    //        with INT8 weights, FP32 on CPU), resized as needed.
     //   pad_id: when >= 0, positions whose id equals pad_id are treated as
     //           padding and masked out of self-attention — every query
     //           ignores them as keys, the same effect as the attention_mask
@@ -217,14 +218,6 @@ private:
     brotensor::Tensor attn_;     // attention sub-layer output
     brotensor::Tensor g_, l_;    // FFN gate / linear branches
     brotensor::Tensor ffn_out_;  // FFN sub-layer output
-
-    // FP32-activation forward (Vulkan): the residual stream, the norms and
-    // the FFN run in FP32 against the 16-bit weights; only the attention
-    // input is cast back to the weight dtype. See load_weights_impl_.
-    bool f32_stream_ = false;
-    brotensor::Tensor n16_;      // n_ at the weight dtype, attention input
-    brotensor::Tensor attn32_;   // attention output widened to FP32
-    brotensor::Tensor out32_;    // final norm before the cast to `out`
 };
 
 }  // namespace brolm::t5

@@ -187,7 +187,8 @@ int main() {
         CHECK(out.rows == L);
         CHECK(out.cols == D);
         const auto expected_dt =
-            (bt::default_device().is_cuda() || bt::default_device().is_hip()
+            (bt::default_device().is_cuda() || bt::default_device().is_hip() ||
+                     bt::default_device().is_vulkan()
                  ? bt::Dtype::BF16
                  : brolm::compute_dtype());
         CHECK(out.dtype == expected_dt);
