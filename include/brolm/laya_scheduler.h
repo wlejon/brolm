@@ -23,7 +23,7 @@
 //    than one device idle, across devices, and a batch is shrunk when the
 //    most urgent queued item would otherwise miss its deadline behind it.
 //  * Pre-warm — every graph bucket up to the budget is captured at load (on
-//    a GPU with graph capture: CUDA, HIP, Vulkan), so no live request pays a
+//    a GPU with graph capture: CUDA, Vulkan), so no live request pays a
 //    capture.
 //
 // Missed deadlines are counted, never dropped: a late answer is still an
@@ -44,7 +44,7 @@ namespace brolm::laya {
 
 struct SchedulerOptions {
     // Device indices to run one replica on each. Empty = the default device
-    // only. Indices are of the default device's backend (CUDA, HIP or
+    // only. Indices are of the default device's backend (CUDA or
     // Vulkan); all_devices() lists every one of them (or the default device
     // on the CPU / Metal).
     std::vector<int> devices;

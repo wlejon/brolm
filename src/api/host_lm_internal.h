@@ -281,14 +281,14 @@ extern HostClass g_modernBertModelClass;
 // ═══════════════════════════════════════════════════════════════════════════
 
 // The device a load runs on when opts.device is absent: brotensor's default
-// device when it is a GPU (its policy: CUDA, Metal, then Vulkan before HIP
-// unless BROTENSOR_PREFER_HIP=1 / BROTENSOR_DEFAULT_DEVICE says otherwise),
+// device when it is a GPU (its policy: CUDA, Metal, then Vulkan, unless
+// BROTENSOR_DEFAULT_DEVICE says otherwise),
 // else the first GPU registered, else the CPU.
 inline brotensor::Device autoDevice() {
     const brotensor::Device def = brotensor::default_device();
     if (def.is_gpu()) return def;
-    for (brotensor::Device d : {brotensor::Device::CUDA, brotensor::Device::HIP,
-                                brotensor::Device::Metal, brotensor::Device::VULKAN}) {
+    for (brotensor::Device d : {brotensor::Device::CUDA, brotensor::Device::Metal,
+                                brotensor::Device::VULKAN}) {
         if (brotensor::is_available(d)) return d;
     }
     return brotensor::Device::CPU;
@@ -297,7 +297,6 @@ inline brotensor::Device autoDevice() {
 inline const char* deviceName(brotensor::Device d) {
     switch (d.type) {
         case brotensor::DeviceType::CUDA:   return "CUDA";
-        case brotensor::DeviceType::HIP:    return "HIP";
         case brotensor::DeviceType::Metal:  return "Metal";
         case brotensor::DeviceType::VULKAN: return "Vulkan";
         case brotensor::DeviceType::CPU:    return "CPU";
@@ -310,16 +309,15 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err)
     Value v = ev::getProperty(opts, "device");
     if (ev::isUndefined(v) || ev::isNull(v)) return true;
     if (!ev::isString(v)) {
-        err = "opts.device must be a string ('cpu', 'cuda', 'hip', 'vulkan', or 'metal')";
+        err = "opts.device must be a string ('cpu', 'cuda', 'vulkan', or 'metal')";
         return false;
     }
     std::string sv = ev::toUtf8(v);
     if (sv == "cpu")   { out = brotensor::Device::CPU;   return true; }
     if (sv == "cuda")  { out = brotensor::Device::CUDA;  return true; }
-    if (sv == "hip" || sv == "rocm") { out = brotensor::Device::HIP; return true; }
     if (sv == "vulkan" || sv == "vk") { out = brotensor::Device::VULKAN; return true; }
     if (sv == "metal") { out = brotensor::Device::Metal; return true; }
-    err = "opts.device must be 'cpu', 'cuda', 'hip', 'vulkan', or 'metal' (got '" + sv + "')";
+    err = "opts.device must be 'cpu', 'cuda', 'vulkan', or 'metal' (got '" + sv + "')";
     return false;
 }
 

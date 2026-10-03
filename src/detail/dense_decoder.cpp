@@ -49,7 +49,7 @@ bt::Tensor make_idx_device(const int32_t* host, int n, bt::Device dev = bt::defa
 // replayed per generated token (the brosoundml Qwen-TTS Talker treatment).
 // The eager forward_last(ids, 1, ...) re-issues ~18 ops per layer per token,
 // each paying a host launch; the captured step replays the whole stack as one
-// cudaGraphLaunch (hipGraphLaunch on HIP). Three host scalars normally bake
+// cudaGraphLaunch (or the backend's graph replay). Three host scalars normally bake
 // shapes into the step — they are replaced by device-resident state the
 // staging code updates between replays:
 //   - KV append row (kv_cache_append's cur_len)  -> scatter_rows + idx_row
@@ -374,29 +374,19 @@ void DenseDecoder::invalidate_graph_() { graph_.reset(); }
 bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
     if (cfg_.pipeline_devices.size() > 1) return false;
     if (!bt::graph_capture_available(bt::default_device())) return false;
-    // HIP replays this step correctly (logits bit-identical to eager over 128
-    // Qwen3-0.6B tokens) but slower, so it stays eager there unless
-    // BROLM_HIP_GRAPH=1. Two reasons: a HIP launch costs the same ~2 us per
-    // kernel replayed or not (brotensor's launch microbench on gfx1151), so
-    // the graph saves nothing; and the capturable step trades the eager
+    // Vulkan replays this step correctly (greedy ids identical to eager) but
+    // gains nothing: its eager path already records into a command buffer and
+    // submits in batches (brotensor's BROTENSOR_VK_BATCH), so the graph only
+    // skips the host-side recording, and the capturable step trades the eager
     // decode's valid_len attention for flash_attention_decode_masked over the
-    // whole cache capacity, which grows with max_seq_len — on ROCm 7.2.4 /
-    // Radeon 8060S eager runs 7.8 ms/token at any capacity, the graph 8.3 /
-    // 14.8 / 37.7 ms/token at a 160 / 1024 / 4096-token cache.
-    // Vulkan replays it too (greedy ids identical to eager), and gains
-    // nothing either: its eager path already records into a command buffer
-    // and submits in batches (brotensor's BROTENSOR_VK_BATCH), so the graph
-    // only skips the host-side recording. Qwen3-0.6B Q8_0 on the same GPU:
-    // 5.02 vs 5.07 ms/token (64-token prompt), 5.93 vs 6.00 (2048), 5.12 vs
-    // 4.92 (16) — noise. Both stay eager unless BROLM_DECODE_GRAPH=1
-    // (BROLM_HIP_GRAPH=1, the older name, still works).
+    // whole cache capacity, which grows with max_seq_len. Qwen3-0.6B Q8_0 on
+    // a Radeon 8060S: 5.02 vs 5.07 ms/token (64-token prompt), 5.93 vs 6.00
+    // (2048), 5.12 vs 4.92 (16) — noise. Anything but CUDA stays eager unless
+    // BROLM_DECODE_GRAPH=1.
     if (bt::default_device().type != bt::DeviceType::CUDA) {
         static const bool opt_in = [] {
-            for (const char* name : {"BROLM_DECODE_GRAPH", "BROLM_HIP_GRAPH"}) {
-                const char* v = std::getenv(name);
-                if (v != nullptr && v[0] == '1') return true;
-            }
-            return false;
+            const char* v = std::getenv("BROLM_DECODE_GRAPH");
+            return v != nullptr && v[0] == '1';
         }();
         if (!opt_in) return false;
     }

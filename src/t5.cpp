@@ -370,8 +370,8 @@ void TextEncoder::load_weights_impl_(
     // BF16 activation past 65504 goes through the GEMM exactly
     // (brotensor docs/vulkan-bf16.md).
     const bt::DeviceType dev_type = bt::default_device().type;
-    if ((dev_type == bt::DeviceType::CUDA || dev_type == bt::DeviceType::HIP ||
-         dev_type == bt::DeviceType::VULKAN) && !do_quantize) {
+    if ((dev_type == bt::DeviceType::CUDA || dev_type == bt::DeviceType::VULKAN) &&
+        !do_quantize) {
         auto to_bf16 = [](bt::Tensor& t) {
             if (t.dtype == bt::Dtype::FP16) {
                 bt::Tensor b;

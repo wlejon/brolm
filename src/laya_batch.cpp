@@ -4,7 +4,7 @@
 //
 // Per call: one host->device upload (every index buffer in one INT32 block),
 // the device work, one device->host readback (scorer logits and act logits in
-// one buffer). On a GPU with graph capture (CUDA, HIP, Vulkan) the device
+// one buffer). On a GPU with graph capture (CUDA, Vulkan) the device
 // work is replayed from a graph cached per (T, N, K) bucket — the token, item
 // and marker counts rounded up so a handful of graphs covers a live workload. Padding rows are singleton
 // sequences, padding items empty segments; neither touches a real item.

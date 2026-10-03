@@ -1,4 +1,4 @@
-// BioCLIP ViT-B/16 on AMD ROCm/HIP integration test.
+// BioCLIP ViT-B/16 integration test on the default GPU (CPU when there is none).
 #include "brolm/clip.h"
 #include "brolm/clip_image.h"
 #include "brolm/detail/compute.h"
@@ -18,7 +18,7 @@ namespace st = brotensor::safetensors;
 
 int main() {
     bt::init();
-    bt::Device dev = bt::is_available(bt::Device::HIP) ? bt::Device::HIP : bt::Device::CPU;
+    const bt::Device dev = bt::default_device();
     std::printf("BioCLIP test device: %s\n", bt::to_string(dev).c_str());
 
     const std::string model_path = "/home/j/models/bioclip/model.safetensors";

@@ -33,7 +33,6 @@ namespace {
 int gpu_count() {
     switch (bt::default_device().type) {
         case bt::DeviceType::CUDA:   return bt::cuda_device_count();
-        case bt::DeviceType::HIP:    return bt::hip_device_count();
         case bt::DeviceType::VULKAN: return bt::vulkan_device_count();
         default:                     return 0;
     }
