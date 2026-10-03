@@ -12,7 +12,8 @@ states into diffusion conditioning.
 
 CPU-by-default (FP32 scalar backend); a GPU backend (FP16) is enabled by
 forwarding `BROTENSOR_WITH_CUDA=ON`, `BROTENSOR_WITH_METAL=ON`, or on AMD
-`BROTENSOR_WITH_HIP=ON` plus `BROTENSOR_WITH_VULKAN=ON` (`build_vk`; Vulkan is
+`BROTENSOR_WITH_VULKAN=ON` (the AMD backend of choice) plus
+`BROTENSOR_WITH_HIP=ON` as the comparison backend (`build_vk`; Vulkan is
 then the default device, `BROTENSOR_PREFER_HIP=1` gives HIP) to brotensor.
 brolm itself ships **no GPU kernels** — it composes brotensor ops.
 

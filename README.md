@@ -68,8 +68,11 @@ bromath, brotensor, and broimage are resolved as standalone sibling repos at
 fallback. See
 [bro/docs/multi-repo-workflow.md](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
 for the layout. Override any of them with `-DBROMATH_DIR=...`,
-`-DBROTENSOR_DIR=...`, `-DBROIMAGE_DIR=...`. Pass `-DBROTENSOR_WITH_CUDA=ON` or
-`-DBROTENSOR_WITH_METAL=ON` to forward the GPU backend selection to brotensor.
+`-DBROTENSOR_DIR=...`, `-DBROIMAGE_DIR=...`. Pass `-DBROTENSOR_WITH_CUDA=ON`,
+`-DBROTENSOR_WITH_METAL=ON` or, on AMD, `-DBROTENSOR_WITH_VULKAN=ON` (the AMD
+backend of choice; add `-DBROTENSOR_WITH_HIP=ON` for HIP as the comparison
+backend, selected at run time with `BROTENSOR_PREFER_HIP=1`) to forward the GPU
+backend selection to brotensor.
 
 CMake options:
 
