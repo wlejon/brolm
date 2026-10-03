@@ -546,6 +546,15 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
             const bool has_fused_in_proj = (layer.lin.in_proj_all.size() > 0);
             const bt::Tensor* lin_x = &norm_;
 
+            // The qkv / z projections. Normally the owned scratch members; on
+            // the fused L == 1 decode path they are zero-copy views into
+            // lin_in_all_ held in these locals instead. The views must never
+            // be assigned into lin_qkv_ / lin_z_: a later multi-row call
+            // resize()s those members, and resizing a non-owning view throws.
+            bt::Tensor lin_qkv_view, lin_z_view;
+            const bt::Tensor* lin_qkv = &lin_qkv_;
+            const bt::Tensor* lin_z   = &lin_z_;
+
             if (has_fused_in_proj) {
                 {
                     brolm::detail::profile::ScopedStage ps(brolm::detail::profile::Stage::lin_proj);
@@ -554,8 +563,10 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 if (L == 1) {
                     char* all_bytes = static_cast<char*>(lin_in_all_.data);
                     const std::size_t es = bt::dtype_size_bytes(lin_in_all_.dtype);
-                    lin_qkv_ = bt::Tensor::view(lin_in_all_.device, all_bytes, 1, qkv_ch, lin_in_all_.dtype);
-                    lin_z_   = bt::Tensor::view(lin_in_all_.device, all_bytes + qkv_ch * es, 1, vdim, lin_in_all_.dtype);
+                    lin_qkv_view = bt::Tensor::view(lin_in_all_.device, all_bytes, 1, qkv_ch, lin_in_all_.dtype);
+                    lin_z_view   = bt::Tensor::view(lin_in_all_.device, all_bytes + qkv_ch * es, 1, vdim, lin_in_all_.dtype);
+                    lin_qkv = &lin_qkv_view;
+                    lin_z   = &lin_z_view;
                     bt::Tensor lin_a_sl = bt::Tensor::view(lin_in_all_.device, all_bytes + (qkv_ch + vdim) * es, 1, lin_h_v, lin_in_all_.dtype);
                     bt::Tensor lin_b_sl = bt::Tensor::view(lin_in_all_.device, all_bytes + (qkv_ch + vdim + lin_h_v) * es, 1, lin_h_v, lin_in_all_.dtype);
 
@@ -604,9 +615,9 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 }
             }
 
-            const bt::Tensor* qkv_conv_in = &lin_qkv_;
-            if (lin_qkv_.dtype != bt::Dtype::FP32) {
-                bt::cast(lin_qkv_, lin_qkv_fp32_, bt::Dtype::FP32);
+            const bt::Tensor* qkv_conv_in = lin_qkv;
+            if (lin_qkv->dtype != bt::Dtype::FP32) {
+                bt::cast(*lin_qkv, lin_qkv_fp32_, bt::Dtype::FP32);
                 qkv_conv_in = &lin_qkv_fp32_;
             }
 
@@ -714,9 +725,9 @@ void TextModel::forward_embeds(const bt::Tensor& embeds,
                 c.lin.len += L;
             }
 
-            const bt::Tensor* z_fp32 = &lin_z_;
-            if (lin_z_.dtype != bt::Dtype::FP32) {
-                bt::cast(lin_z_, lin_z_fp32_, bt::Dtype::FP32);
+            const bt::Tensor* z_fp32 = lin_z;
+            if (lin_z->dtype != bt::Dtype::FP32) {
+                bt::cast(*lin_z, lin_z_fp32_, bt::Dtype::FP32);
                 z_fp32 = &lin_z_fp32_;
             }
 

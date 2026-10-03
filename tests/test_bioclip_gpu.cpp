@@ -21,10 +21,17 @@ int main() {
     const bt::Device dev = bt::default_device();
     std::printf("BioCLIP test device: %s\n", bt::to_string(dev).c_str());
 
-    const std::string model_path = "/home/j/models/bioclip/model.safetensors";
+    // BROLM_BIOCLIP_DIR names the checkpoint directory (holding
+    // model.safetensors); unset, it falls back to the local default. A missing
+    // checkpoint is a skip, not a failure, so CPU-only CI without the weights
+    // stays green.
+    const char* dir_env = std::getenv("BROLM_BIOCLIP_DIR");
+    const std::filesystem::path dir = dir_env ? dir_env : "/home/j/models/bioclip";
+    const std::string model_path = (dir / "model.safetensors").string();
     if (!std::filesystem::exists(model_path)) {
-        std::fprintf(stderr, "BioCLIP model not found at %s\n", model_path.c_str());
-        return 1;
+        std::printf("[skip] BioCLIP checkpoint not found at %s (set BROLM_BIOCLIP_DIR)\n",
+                    model_path.c_str());
+        return 0;
     }
 
     auto f = st::File::open(model_path);
