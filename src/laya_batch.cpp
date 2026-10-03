@@ -4,9 +4,9 @@
 //
 // Per call: one host->device upload (every index buffer in one INT32 block),
 // the device work, one device->host readback (scorer logits and act logits in
-// one buffer). On CUDA and HIP the device work is replayed from a graph cached
-// per (T, N, K) bucket — the token, item and marker counts rounded up so a
-// handful of graphs covers a live workload. Padding rows are singleton
+// one buffer). On a GPU with graph capture (CUDA, HIP, Vulkan) the device
+// work is replayed from a graph cached per (T, N, K) bucket — the token, item
+// and marker counts rounded up so a handful of graphs covers a live workload. Padding rows are singleton
 // sequences, padding items empty segments; neither touches a real item.
 //
 // Graph replay needs every device pointer the graph captured to stay put.
@@ -26,9 +26,7 @@
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
 #include "brotensor/cuda_graph.h"
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -130,38 +128,26 @@ struct DecisionModel::Batch {
     std::vector<uint16_t> out_bits;
     std::vector<float> out_f32;
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     struct Cached {
         bt::CudaGraph graph;
         std::shared_ptr<Arena> arena;  // keeps the buffers it captured alive
     };
     std::map<std::tuple<int, int, int, int>, Cached> graphs;  // (T, N, K, soft rows) buckets
-#endif
 
-    void clear_graphs() {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-        graphs.clear();
-#endif
-    }
+    void clear_graphs() { graphs.clear(); }
     // Drop the graphs captured on `a` (its buffers moved under them).
     void clear_graphs_on(const Arena* a) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
         for (auto it = graphs.begin(); it != graphs.end();) {
             if (it->second.arena.get() == a) it = graphs.erase(it);
             else ++it;
         }
-#else
-        (void)a;
-#endif
     }
     std::size_t arenas() const {
         std::vector<const Arena*> seen;
         if (cur) seen.push_back(cur.get());
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
         for (const auto& [k, c] : graphs) {
             if (std::find(seen.begin(), seen.end(), c.arena.get()) == seen.end()) seen.push_back(c.arena.get());
         }
-#endif
         return seen.size();
     }
 };
@@ -199,11 +185,7 @@ bool DecisionModel::graphs_enabled() const {
 }
 
 std::size_t DecisionModel::cached_graphs() const {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     return batch_ ? batch_->graphs.size() : 0;
-#else
-    return 0;
-#endif
 }
 
 std::size_t DecisionModel::scratch_arenas() const { return batch_ ? batch_->arenas() : 0; }
@@ -215,8 +197,7 @@ int DecisionModel::token_bucket(int tokens) { return bucket_rows(std::max(1, tok
 std::vector<DecisionModel::WarmPoint> DecisionModel::prewarm_graphs(int max_tokens) {
     const int top = bucket_rows(std::max(16, max_tokens));
     const int item_len = std::max(1, std::min(cfg_.max_len, 128));
-    const bt::DeviceType dt = bt::default_device().type;
-    const bool graphs = (dt == bt::DeviceType::CUDA || dt == bt::DeviceType::HIP) && graphs_enabled() && !profiling_;
+    const bool graphs = bt::graph_capture_available(bt::default_device()) && graphs_enabled() && !profiling_;
 
     // Sizes to warm: every bucket with graphs, a handful for the cost model without.
     std::vector<int> sizes;
@@ -450,12 +431,7 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     Batch& b = batch();
     const bt::Device dev = bt::default_device();
     const bt::Dtype dt = brolm::compute_dtype();
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-    const bool use_graphs = (dev.type == bt::DeviceType::CUDA || dev.type == bt::DeviceType::HIP) &&
-                            b.graphs_on && !b.graphs_broken && !profiling_;
-#else
-    const bool use_graphs = false;
-#endif
+    const bool use_graphs = bt::graph_capture_available(dev) && b.graphs_on && !b.graphs_broken && !profiling_;
 
     // Bucketed shapes when replaying graphs; exact shapes otherwise. The item
     // and marker buckets have floors that follow the token bucket (one item
@@ -475,14 +451,10 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     // The arena: a cached graph's own when this bucket was captured (it may
     // be an older, smaller arena), else the current one (grown if short).
     std::shared_ptr<Arena> arena;
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     const auto key = std::make_tuple(Tb, Nb, Kb, Sb);
     auto cached = use_graphs ? b.graphs.find(key) : b.graphs.end();
     const bool replay = cached != b.graphs.end();
     if (replay) arena = cached->second.arena;
-#else
-    const bool replay = false;
-#endif
     if (!arena) {
         reserve_batch_(Tb, Nb, Kb);
         arena = b.cur;
@@ -554,7 +526,6 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
     }
 
     bool ran = false;
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (replay) {
         cached->second.graph.launch();
         ran = true;
@@ -581,7 +552,6 @@ std::vector<LayaItemLogits> DecisionModel::forward_items(const std::vector<LayaI
             b.clear_graphs();
         }
     }
-#endif
     if (!ran) run_device_(A, Tb, Nb, Kb, Sb);
 
     // One readback: logits (Kb) then act logits (2 * Nb). A replayed graph

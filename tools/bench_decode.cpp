@@ -251,22 +251,27 @@ int main(int argc, char** argv) {
             row.data(), cfg.vocab_size, greedy, rng));
         const double prefill_ms = now_ms() - t0;
 
-        // Decode: token-by-token, greedy.
+        // Decode: token-by-token, greedy. The greedy ids are folded into a
+        // hash (FNV-1a), printed per rep, so two backends / graph on-off runs
+        // can be compared for identical output.
+        std::uint64_t ids_hash = 1469598103934665603ull;
         const double t1 = now_ms();
         for (int t = 0; t < decode_n; ++t) {
             model.forward_last(&next, 1, logits);
             row  = brolm::detail::last_row_fp32(logits);
             next = static_cast<int32_t>(brolm::detail::sample_token(
                 row.data(), cfg.vocab_size, greedy, rng));
+            ids_hash = (ids_hash ^ static_cast<std::uint32_t>(next)) * 1099511628211ull;
         }
         const double decode_ms = now_ms() - t1;
 
         std::printf(
             "rep %d: prefill %4d tok %8.1f ms (%7.1f tok/s)   "
-            "decode %4d tok %8.1f ms (%6.2f ms/tok, %6.1f tok/s)\n",
+            "decode %4d tok %8.1f ms (%6.2f ms/tok, %6.1f tok/s)  ids %016llx\n",
             rep, prefill_n, prefill_ms, 1000.0 * prefill_n / prefill_ms,
             decode_n, decode_ms, decode_ms / decode_n,
-            1000.0 * decode_n / decode_ms);
+            1000.0 * decode_n / decode_ms,
+            static_cast<unsigned long long>(ids_hash));
 
         if (rep == 0 || prefill_ms < best_prefill_ms) {
             best_prefill_ms = prefill_ms;

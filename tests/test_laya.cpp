@@ -4,6 +4,7 @@
 #include "brolm/modernbert.h"
 #include "brolm/modernbert_config.h"
 
+#include "brotensor/cuda_graph.h"
 #include "brotensor/runtime.h"
 
 #include <algorithm>
@@ -223,9 +224,8 @@ void test_real_checkpoint(const std::string& model_dir) {
 // results.
 void test_oversize_keeps_graphs() {
     std::cout << "--- Running Test 3: oversized forward keeps pre-warmed graphs ---" << std::endl;
-    const brotensor::DeviceType dt = brotensor::default_device().type;
-    if (dt != brotensor::DeviceType::CUDA && dt != brotensor::DeviceType::HIP) {
-        std::cout << "SKIP: no CUDA / HIP device" << std::endl;
+    if (!brotensor::graph_capture_available(brotensor::default_device())) {
+        std::cout << "SKIP: the default device has no graph capture" << std::endl;
         return;
     }
     brolm::modernbert::Config enc_cfg;

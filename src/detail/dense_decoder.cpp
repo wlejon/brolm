@@ -10,10 +10,8 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
 #include "brotensor/cuda_graph.h"
 #include "brotensor/detail/dispatch.h"
-#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -89,9 +87,7 @@ struct DecodeGraphSession {
     brotensor::Tensor h, norm, q, k, v, qn, kn, attn, proj, gate, up;
     brotensor::Tensor logits;             // (1, vocab)
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     brotensor::CudaGraph graph;
-#endif
 };
 
 // ─── ctor / dtor ─────────────────────────────────────────────────────────────
@@ -376,14 +372,8 @@ void DenseDecoder::forward_embeds(const bt::Tensor& embeds, int L,
 void DenseDecoder::invalidate_graph_() { graph_.reset(); }
 
 bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
-#if !defined(BROTENSOR_HAS_CUDA) && !defined(BROTENSOR_HAS_HIP)
-    (void)token;
-    (void)logits_out;
-    return false;
-#else
     if (cfg_.pipeline_devices.size() > 1) return false;
-    if (bt::default_device() != bt::Device::CUDA &&
-        bt::default_device() != bt::Device::HIP) return false;
+    if (!bt::graph_capture_available(bt::default_device())) return false;
     // HIP replays this step correctly (logits bit-identical to eager over 128
     // Qwen3-0.6B tokens) but slower, so it stays eager there unless
     // BROLM_HIP_GRAPH=1. Two reasons: a HIP launch costs the same ~2 us per
@@ -393,12 +383,22 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
     // whole cache capacity, which grows with max_seq_len — on ROCm 7.2.4 /
     // Radeon 8060S eager runs 7.8 ms/token at any capacity, the graph 8.3 /
     // 14.8 / 37.7 ms/token at a 160 / 1024 / 4096-token cache.
-    if (bt::default_device() == bt::Device::HIP) {
-        static const bool hip_opt_in = [] {
-            const char* v = std::getenv("BROLM_HIP_GRAPH");
-            return v != nullptr && v[0] == '1';
+    // Vulkan replays it too (greedy ids identical to eager), and gains
+    // nothing either: its eager path already records into a command buffer
+    // and submits in batches (brotensor's BROTENSOR_VK_BATCH), so the graph
+    // only skips the host-side recording. Qwen3-0.6B Q8_0 on the same GPU:
+    // 5.02 vs 5.07 ms/token (64-token prompt), 5.93 vs 6.00 (2048), 5.12 vs
+    // 4.92 (16) — noise. Both stay eager unless BROLM_DECODE_GRAPH=1
+    // (BROLM_HIP_GRAPH=1, the older name, still works).
+    if (bt::default_device().type != bt::DeviceType::CUDA) {
+        static const bool opt_in = [] {
+            for (const char* name : {"BROLM_DECODE_GRAPH", "BROLM_HIP_GRAPH"}) {
+                const char* v = std::getenv(name);
+                if (v != nullptr && v[0] == '1') return true;
+            }
+            return false;
         }();
-        if (!hip_opt_in) return false;
+        if (!opt_in) return false;
     }
     // BROLM_PROFILE brackets every op in sync pairs — capturing those scopes
     // is illegal and pointless (profiling wants per-stage attribution, which
@@ -587,7 +587,6 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
     cache_len_ += 1;
     s.mask_len = pos + 1;
     return true;
-#endif
 }
 
 void DenseDecoder::run_layers_(int L, bt::Tensor& logits_out,

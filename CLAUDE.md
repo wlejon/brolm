@@ -11,7 +11,9 @@ and KV-cache, and the trainable alignment adapter that retargets LLM hidden
 states into diffusion conditioning.
 
 CPU-by-default (FP32 scalar backend); a GPU backend (FP16) is enabled by
-forwarding `BROTENSOR_WITH_CUDA=ON` or `BROTENSOR_WITH_METAL=ON` to brotensor.
+forwarding `BROTENSOR_WITH_CUDA=ON`, `BROTENSOR_WITH_METAL=ON`, or on AMD
+`BROTENSOR_WITH_HIP=ON` plus `BROTENSOR_WITH_VULKAN=ON` (`build_vk`; Vulkan is
+then the default device, `BROTENSOR_PREFER_HIP=1` gives HIP) to brotensor.
 brolm itself ships **no GPU kernels** — it composes brotensor ops.
 
 ## Sibling dependencies

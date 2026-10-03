@@ -28,6 +28,20 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
+// GPUs of the default device's backend (one replica each); 0 on the CPU and
+// Metal, which run one replica.
+int gpu_count() {
+    switch (bt::default_device().type) {
+        case bt::DeviceType::CUDA:   return bt::cuda_device_count();
+        case bt::DeviceType::HIP:    return bt::hip_device_count();
+        case bt::DeviceType::VULKAN: return bt::vulkan_device_count();
+        default:                     return 0;
+    }
+}
+
+// Device `i` of the default device's backend.
+bt::Device gpu(int i) { return bt::Device(bt::default_device().type, i); }
+
 double ms_between(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
@@ -136,7 +150,7 @@ struct Scheduler::Impl {
 
 std::vector<int> Scheduler::all_devices() {
     bt::init();
-    const int n = bt::default_device().type == bt::DeviceType::CUDA ? bt::cuda_device_count() : 0;
+    const int n = gpu_count();
     std::vector<int> out;
     for (int i = 0; i < n; ++i) out.push_back(i);
     if (out.empty()) out.push_back(bt::default_device().index);
@@ -154,11 +168,12 @@ Scheduler::Scheduler(std::function<void(DecisionModel&)> init, SchedulerOptions 
     if (devs.empty()) devs.push_back(bt::default_device().index);
     std::sort(devs.begin(), devs.end());
     devs.erase(std::unique(devs.begin(), devs.end()), devs.end());
-    if (bt::default_device().type == bt::DeviceType::CUDA) {
+    if (gpu_count() > 0) {
         for (int d : devs) {
-            if (d < 0 || d >= bt::cuda_device_count()) {
-                throw std::invalid_argument("laya::Scheduler: no CUDA device " + std::to_string(d) + " (" +
-                                            std::to_string(bt::cuda_device_count()) + " present)");
+            if (d < 0 || d >= gpu_count()) {
+                throw std::invalid_argument(std::string("laya::Scheduler: no ") + bt::device_name(gpu(0)) +
+                                            " device " + std::to_string(d) + " (" +
+                                            std::to_string(gpu_count()) + " present)");
             }
         }
     } else if (devs.size() > 1) {
@@ -208,9 +223,7 @@ void Scheduler::Impl::finish_load() {
 void Scheduler::Impl::run(Worker& w) {
     try {
         std::unique_ptr<bt::DeviceScope> scope;
-        if (bt::default_device().type == bt::DeviceType::CUDA) {
-            scope = std::make_unique<bt::DeviceScope>(bt::Device::cuda(w.device));
-        }
+        if (gpu_count() > 0) scope = std::make_unique<bt::DeviceScope>(gpu(w.device));
         w.name = bt::device_product_name(bt::default_device());
         init(w.model);
         if (opts.max_len > 0) w.model.mutable_config().max_len = opts.max_len;

@@ -44,6 +44,9 @@ endif()
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
 option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
+# Vulkan compute backend (brotensor's docs/vulkan.md). Additive: it coexists
+# with HIP, and brolm needs no GLSL of its own, so this only forwards it.
+option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 
 # --- Siblings: bromath (header-only) + brotensor (tensor + ops) ---
 #

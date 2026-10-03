@@ -217,6 +217,14 @@ private:
     brotensor::Tensor attn_;     // attention sub-layer output
     brotensor::Tensor g_, l_;    // FFN gate / linear branches
     brotensor::Tensor ffn_out_;  // FFN sub-layer output
+
+    // FP32-activation forward (Vulkan): the residual stream, the norms and
+    // the FFN run in FP32 against the 16-bit weights; only the attention
+    // input is cast back to the weight dtype. See load_weights_impl_.
+    bool f32_stream_ = false;
+    brotensor::Tensor n16_;      // n_ at the weight dtype, attention input
+    brotensor::Tensor attn32_;   // attention output widened to FP32
+    brotensor::Tensor out32_;    // final norm before the cast to `out`
 };
 
 }  // namespace brolm::t5
