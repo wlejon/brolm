@@ -17,6 +17,19 @@ the safetensors / Hugging Face weight loaders. brodiffusion depends on brolm for
 its default text encoders. Host-side image decoding and resampling for
 multimodal models go through [broimage](https://github.com/wlejon/broimage).
 
+brolm is one of the engine libraries of the
+[bro ecosystem](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md):
+[bro](https://github.com/wlejon/bro) links it under `BRO_WITH_LM` and exposes it
+to apps as `bro.lm` through the JavaScript binding in `src/api/` (`brolm_api`),
+which needs [bronze](https://github.com/wlejon/bronze) and
+[brass](https://github.com/wlejon/brass); brodiffusion and brosoundml build on it.
+
+**Platforms and backends.** The library builds and its self-contained tests pass
+on Windows (MSVC), Linux (GCC and Clang) and macOS (arm64). Models run on any
+brotensor backend: CPU (FP32), CUDA, Metal or Vulkan (FP16/BF16). Quantised GGUF
+weights need a GPU backend (see GGUF below). CI covers the CPU build only; GPU
+inference is checked on hardware that has the weights.
+
 ## Scope
 
 - **Tokenizers** — BPE (CLIP), Unigram/SentencePiece (T5), behind one interface.
@@ -48,7 +61,16 @@ multimodal models go through [broimage](https://github.com/wlejon/broimage).
 | `brolm/qwen35_vision.h` | Qwen3.5-VL ViT vision tower (12 blocks + patch merger) |
 | `brolm/qwen35_text.h` | Qwen3.5-VL hybrid text backbone — full-attention layers with attn-output-gate + M-RoPE interleaved with Gated DeltaNet linear-attention layers |
 | `brolm/qwen35_vl.h` | Top-level VLM driver: tokenize → vision tower → embed splice → text prefill → sample |
+| `brolm/qwen3vl_*.h` | Qwen3-VL (2B–32B dense): config, tokenizer, image preprocessor, vision tower, text decoder, prompt assembly and the top-level `qwen3vl_vl.h` driver |
+| `brolm/mistral3_*.h`, `brolm/mistral_tokenizer.h` | Mistral 3.1 (Small 3.1, Pixtral): Tekken tokenizer, Pixtral preprocessor and vision tower, multimodal projector, text decoder, generation, and the `mistral3_vl.h` driver |
+| `brolm/gemma2.h`, `gemma2_config.h`, `gemma_tokenizer.h` | Gemma-2 decoder LLM and its SentencePiece-BPE tokenizer |
+| `brolm/llama3_tokenizer.h`, `brolm/llm2vec.h` | Llama-3 tokenizer; LLM2Vec, a LLaMA-family decoder used as a bidirectional text encoder |
+| `brolm/nllb.h`, `nllb_config.h`, `tokenizer_nllb.h` | NLLB-200 encoder-decoder translation |
+| `brolm/modernbert.h`, `modernbert_config.h` | ModernBERT encoder |
+| `brolm/laya*.h` | Laya decision model on ModernBERT: choice / score / yes-no questions, a request scheduler packing concurrent callers into one forward per device, and soft-token gradients |
+| `brolm/sampler.h`, `brolm/grammar.h`, `brolm/grammar_jit.h` | Samplers and penalties (min-p, DRY, repetition); regex/grammar-constrained decoding with DFA logit masks, JIT-compiled through brass |
 | `brolm/alignment_adapter.h` | Trainable adapter: LLM hidden states → diffusion-conditioning tensors |
+| `brolm/api.h` | The bronze JavaScript binding (`bro.lm`) |
 
 The CLIP, Qwen3, Qwen3.5-VL, and Whisper tokenizers share a single byte-level
 BPE core in `brolm::detail::bpe` (`include/brolm/detail/byte_level_bpe.h`) —
@@ -63,14 +85,19 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-bromath, brotensor, and broimage are resolved as standalone sibling repos at
-`../bromath`, `../brotensor`, and `../broimage`, with a `third_party/` submodule
-fallback. See
-[bro/docs/multi-repo-workflow.md](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
+bromath, brotensor, and broimage resolve the way every repo in the ecosystem
+resolves a sibling: an existing target wins (bro adds them first), then a
+checkout beside this one (`../bromath`, `../brotensor`, `../broimage`), then the
+`third_party/` submodules, which carry all three, so `git clone --recursive` is
+enough for them. See bro's
+[multi-repo workflow](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
 for the layout. Override any of them with `-DBROMATH_DIR=...`,
-`-DBROTENSOR_DIR=...`, `-DBROIMAGE_DIR=...`. Pass `-DBROTENSOR_WITH_CUDA=ON`,
-`-DBROTENSOR_WITH_METAL=ON` or, on AMD, `-DBROTENSOR_WITH_VULKAN=ON` to forward
-the GPU backend selection to brotensor.
+`-DBROTENSOR_DIR=...`, `-DBROIMAGE_DIR=...`. bronze and brass must sit beside
+this repository in either layout (or pass `-DBRONZE_DIR=<path>`): they have no
+submodule, because the binding has to be compiled against the same bronze as the
+program that loads it. Pass `-DBROTENSOR_WITH_CUDA=ON`,
+`-DBROTENSOR_WITH_METAL=ON` or `-DBROTENSOR_WITH_VULKAN=ON` (the AMD path) to
+forward the GPU backend selection to brotensor.
 
 CMake options:
 
@@ -98,8 +125,8 @@ model.load_weights(f);
 GGUF covers Qwen3 (model + tokenizer + config), T5 (model + tokenizer + config)
 and Whisper (tokenizer). BF16 weights load on every backend. On-disk quants
 (Q4_K / Q6_K / Q8_0) are kept in their original dtype and dispatched through
-brotensor's quant-carrier kernels, which exist on the CUDA backend only — a CPU
-build cannot run a quantised GGUF. Dense tensors whose downstream op is
+brotensor's quant-carrier kernels, which exist on the GPU backends (CUDA, Metal
+and Vulkan) — the CPU backend is FP32-only and cannot run a quantised GGUF. Dense tensors whose downstream op is
 dense-only (embedding lookup, RMSNorm gamma) are dequantised to the compute dtype
 on load.
 
@@ -131,7 +158,9 @@ std::string out = vlm.generate(prompt, { img });
 Builds and tests on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64. Each job
 checks out bromath, brotensor and broimage alongside this repo and builds the whole
 stack from source, so a breaking change in a sibling fails here rather than in
-whoever next builds brolm by hand.
+whoever next builds brolm by hand. A separate job builds from a recursive clone
+with no sibling checkouts, so the `third_party/` submodule fallback stays
+buildable.
 
 What a green run does and does not mean: `weights/` is 86 GB and gitignored, so a
 runner never has it. The model tests gate on the checkpoint being present and skip
@@ -151,8 +180,8 @@ findings stay in their own repos.
 
 ## Versioning
 
-Pre-1.0. Siblings vendor this repo via `add_subdirectory` and build from source,
-so a tag is a pin point rather than a compatibility promise.
+Pre-1.0. Consumers build this repo from source (a sibling checkout or a
+submodule), so a tag is a pin point rather than a compatibility promise.
 
 ## License
 

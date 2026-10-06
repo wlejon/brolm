@@ -114,6 +114,51 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+  # ── Submodule fallback ────────────────────────────────────────────────────
+  #
+  # No sibling checkouts: bromath, brotensor and broimage come from the flat
+  # third_party/ submodules at the commits this repo pins, as they do for a
+  # fresh `git clone --recursive`. bronze and brass are the documented
+  # exception (no submodule; the api has to compile against the bronze of the
+  # program that loads it) and are laid out beside the repo as in the other
+  # jobs. The configure step checks each sibling really took the submodule
+  # path.
+  submodule:
+    name: Submodule fallback · ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brolm
+          submodules: recursive
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: brolm-submodule
+          max-size: 500M
+
+      - name: Configure
+        shell: bash
+        run: |
+          test ! -e bromath && test ! -e brotensor && test ! -e broimage
+          cmake -S brolm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache | tee configure.log
+          for s in bromath brotensor broimage; do
+            grep -q "brolm: $s from .*third_party/$s (submodule)" configure.log
+          done
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Scoped to brolm's own src/ and include/. The siblings are measured by their
