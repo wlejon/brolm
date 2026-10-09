@@ -85,17 +85,17 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-bromath, brotensor, and broimage resolve the way every repo in the ecosystem
-resolves a sibling: an existing target wins (bro adds them first), then a
-checkout beside this one (`../bromath`, `../brotensor`, `../broimage`), then the
-`third_party/` submodules, which carry all three, so `git clone --recursive` is
-enough for them. See bro's
+A plain clone is all it takes. Every dependency — bromath, brotensor, broimage,
+and bronze with brass — is pinned to a commit in `CMakeLists.txt`
+(`bro_dependency()`, `cmake/bro_deps.cmake`) and resolves the way every repo in
+the ecosystem resolves one: an existing target wins (bro adds them first), then
+a working tree beside this one (`../bromath`, `../brotensor`, `../broimage`,
+`../bronze`, ...), then the pinned commit, fetched at configure. See bro's
 [multi-repo workflow](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
-for the layout. Override any of them with `-DBROMATH_DIR=...`,
-`-DBROTENSOR_DIR=...`, `-DBROIMAGE_DIR=...`. bronze and brass must sit beside
-this repository in either layout (or pass `-DBRONZE_DIR=<path>`): they have no
-submodule, because the binding has to be compiled against the same bronze as the
-program that loads it. Pass `-DBROTENSOR_WITH_CUDA=ON`,
+for the layout. `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>` points one dependency
+anywhere else. bronze and brass compile inside this build tree, because the
+binding has to be compiled against the same bronze as the program that loads
+it. Pass `-DBROTENSOR_WITH_CUDA=ON`,
 `-DBROTENSOR_WITH_METAL=ON` or `-DBROTENSOR_WITH_VULKAN=ON` (the AMD path) to
 forward the GPU backend selection to brotensor.
 
@@ -155,12 +155,9 @@ std::string out = vlm.generate(prompt, { img });
 
 ## CI
 
-Builds and tests on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64. Each job
-checks out bromath, brotensor and broimage alongside this repo and builds the whole
-stack from source, so a breaking change in a sibling fails here rather than in
-whoever next builds brolm by hand. A separate job builds from a recursive clone
-with no sibling checkouts, so the `third_party/` submodule fallback stays
-buildable.
+Builds and tests a plain clone on Linux (GCC + Clang), Windows (MSVC) and
+macOS/arm64, building the whole stack from source at the pinned dependency
+commits.
 
 What a green run does and does not mean: `weights/` is 86 GB and gitignored, so a
 runner never has it. The model tests gate on the checkpoint being present and skip
@@ -175,13 +172,13 @@ generation paths for the same reason. [CodeQL](.github/workflows/codeql.yml) run
 weekly and on every push: brolm parses safetensors and GGUF checkpoints, tokenizer
 vocab/merges, and model config JSON, and indexes buffers using shapes and offsets
 those files declare — all of it attacker-shaped input if a user loads a model
-someone else built. The siblings are built ahead of the traced build so their
+someone else built. The dependencies are built ahead of the traced build so their
 findings stay in their own repos.
 
 ## Versioning
 
-Pre-1.0. Consumers build this repo from source (a sibling checkout or a
-submodule), so a tag is a pin point rather than a compatibility promise.
+Pre-1.0. Consumers build this repo from source (a working tree beside them or
+a pinned commit), so a tag is a pin point rather than a compatibility promise.
 
 ## License
 

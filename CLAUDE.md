@@ -17,8 +17,10 @@ brolm itself ships **no GPU kernels** — it composes brotensor ops.
 
 ## Sibling dependencies
 
-Three sibling repos, resolved at `../<name>` with a `third_party/<name>`
-fallback (the `bro/docs/multi-repo-workflow.md` pattern):
+Three sibling repos (plus bronze/brass for the binding), each pinned by
+`bro_dependency()` in `CMakeLists.txt` (`cmake/bro_deps.cmake`): a working tree
+at `../<name>` wins, else the pinned commit is fetched at configure (the
+`bro/docs/multi-repo-workflow.md` pattern):
 
 - **bromath** — header-only scalar / RNG helpers.
 - **brotensor** — tensors + compute kernels (CPU + optional GPU backend).
@@ -28,8 +30,8 @@ fallback (the `bro/docs/multi-repo-workflow.md` pattern):
   (smart-resize → patches → M-RoPE) lives in `qwen35_preprocessor.h` and is
   brolm's, not broimage's.
 
-Override paths with `-DBROMATH_DIR=...`, `-DBROTENSOR_DIR=...`,
-`-DBROIMAGE_DIR=...`.
+Override a path with `-DFETCHCONTENT_SOURCE_DIR_<NAME>=...` (e.g.
+`-DFETCHCONTENT_SOURCE_DIR_BROTENSOR=...`).
 
 ## Build & test
 

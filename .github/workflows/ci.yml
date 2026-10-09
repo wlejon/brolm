@@ -10,34 +10,21 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# brolm resolves its siblings from ../<name>, so every job reconstructs that
-# layout in the runner workspace before configuring:
+# Every job builds a plain clone, checked out under brolm/ with the build tree
+# beside it. Its dependencies — bromath, brotensor, broimage, and bronze (the
+# JavaScript runtime brolm_api binds, with brass, its code generator) — come
+# from the commits CMakeLists.txt pins (cmake/bro_deps.cmake), fetched at
+# configure. There are no submodules and no sibling checkouts.
 #
-#     $GITHUB_WORKSPACE/
-#       brolm/      <- this repo, in a named path, not the workspace root
-#       bromath/
-#       brotensor/
-#       broimage/
-#       bronze/     <- the JavaScript runtime brolm_api binds
-#       brass/      <- bronze's code generator
-#
-# bronze and brass are laid out by bronze's checkout-toolchain action and
-# compiled inside this build tree (bronze add_subdirectory()s brass), with the
-# job's own compiler and CRT — the api is bound across bronze's C++ embed
-# boundary, so a prebuilt bronze would be an unverifiable ABI hazard. That is
-# what makes brolm_test_api the check that the library works the way bro uses
-# it.
-#
-# Hence `path:` on every checkout and `cmake -S brolm`. A default checkout puts
-# ../bromath outside the workspace and the configure dies on the FATAL_ERROR in
-# CMakeLists. Siblings track main, which is how the stack is developed — so a
-# breaking change landing in brotensor or broimage fails here, rather than in
-# whoever next builds brolm by hand.
+# bronze and brass compile inside this build tree with the job's own compiler
+# and CRT — the api is bound across bronze's C++ embed boundary, so a prebuilt
+# bronze would be an unverifiable ABI hazard. That is what makes brolm_test_api
+# the check that the library works the way bro uses it.
 #
 # The build is the whole stack below brolm (brotensor's CPU backend, broimage,
 # stb) plus brolm itself, its 45 test binaries and its tool drivers. That is
-# what ccache is for on the Linux and macOS jobs: a push that does not touch a
-# sibling gets those TUs back for free.
+# what ccache is for on the Linux and macOS jobs: a push that does not move a
+# dependency pin gets those TUs back for free.
 #
 # What ctest actually covers here: weights/ is 86 GB and gitignored, so a runner
 # never has it. The model tests gate on getenv/fs::exists and print [skip]; the
@@ -61,23 +48,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brolm
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/bromath
-          path: bromath
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/brotensor
-          path: brotensor
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/broimage
-          path: broimage
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -114,54 +84,9 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
-  # ── Submodule fallback ────────────────────────────────────────────────────
-  #
-  # No sibling checkouts: bromath, brotensor and broimage come from the flat
-  # third_party/ submodules at the commits this repo pins, as they do for a
-  # fresh `git clone --recursive`. bronze and brass are the documented
-  # exception (no submodule; the api has to compile against the bronze of the
-  # program that loads it) and are laid out beside the repo as in the other
-  # jobs. The configure step checks each sibling really took the submodule
-  # path.
-  submodule:
-    name: Submodule fallback · ubuntu-24.04
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: brolm
-          submodules: recursive
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
-
-      - name: Install Ninja
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: brolm-submodule
-          max-size: 500M
-
-      - name: Configure
-        shell: bash
-        run: |
-          test ! -e bromath && test ! -e brotensor && test ! -e broimage
-          cmake -S brolm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache | tee configure.log
-          for s in bromath brotensor broimage; do
-            grep -q "brolm: $s from .*third_party/$s (submodule)" configure.log
-          done
-
-      - name: Build
-        run: cmake --build build --parallel 4
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
-
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
-  # Scoped to brolm's own src/ and include/. The siblings are measured by their
+  # Scoped to brolm's own src/ and include/. The dependencies are measured by their
   # own coverage jobs; counting them here would report brolm's number against
   # code brolm's tests were never meant to cover.
   #
@@ -174,23 +99,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brolm
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/bromath
-          path: bromath
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/brotensor
-          path: brotensor
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/broimage
-          path: broimage
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build

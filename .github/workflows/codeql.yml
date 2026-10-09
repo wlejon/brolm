@@ -32,24 +32,9 @@ jobs:
         with:
           path: brolm
 
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/bromath
-          path: bromath
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/brotensor
-          path: brotensor
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/broimage
-          path: broimage
-
-      # bronze (and through it brass) for the api. Pre-built with the other
-      # siblings below, ahead of the trace.
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+      # The dependencies — bromath, brotensor, broimage, and bronze (with brass)
+      # for the api — are fetched at configure from the pinned commits, and
+      # pre-built below, ahead of the trace.
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
@@ -57,7 +42,7 @@ jobs:
       - name: Configure
         run: cmake -S brolm -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
-      # The sibling code CMake compiles into this build is built here, ahead of
+      # The dependency code CMake compiles into this build is built here, ahead of
       # `init`, and that is what keeps it out of the analysis.
       #
       # For a compiled language CodeQL analyses what it observes the compiler
@@ -71,7 +56,7 @@ jobs:
       # its findings belong. stb_image comes in via broimage and is excluded
       # there for the same reason. bromath needs no entry: header-only, no TUs of
       # its own, so its headers are analysed where brolm includes them.
-      - name: Pre-build sibling code (outside the traced build)
+      - name: Pre-build dependency code (outside the traced build)
         run: |
           cmake --build build --parallel 4 \
             --target stb_image broimage brotensor_core brotensor_cpu bronze_runtime_shared
@@ -84,7 +69,7 @@ jobs:
           languages: c-cpp
           build-mode: manual
           # Relative to the workspace root, and this repo is checked out into
-          # brolm/ (not the root) so the siblings can sit beside it.
+          # brolm/ (not the root), with the build tree beside it.
           config-file: brolm/.github/codeql/codeql-config.yml
 
       # Only brolm's own TUs are left to compile, so only they are traced.
