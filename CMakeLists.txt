@@ -51,8 +51,8 @@ option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 #
 # Each resolves through cmake/bro_deps.cmake, like every repo in the bro
 # ecosystem: an existing target (a superbuild such as bro already added it, and
-# its pins win) first; otherwise the ../<name> working tree beside the top-level
-# project; otherwise the commit pinned here, fetched at configure. Leaves first,
+# its choice wins) first; otherwise the ../<name> working tree beside the top-level
+# project; otherwise the head of its main, fetched at configure. Leaves first,
 # so broimage finds bromath, brass and brotensor already there.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 

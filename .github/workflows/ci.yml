@@ -13,7 +13,7 @@ concurrency:
 # Every job builds a plain clone, checked out under brolm/ with the build tree
 # beside it. Its dependencies — bromath, brotensor, broimage, and bronze (the
 # JavaScript runtime brolm_api binds, with brass, its code generator) — come
-# from the commits CMakeLists.txt pins (cmake/bro_deps.cmake), fetched at
+# from the heads of their main branches (cmake/bro_deps.cmake), fetched at
 # configure. There are no submodules and no sibling checkouts.
 #
 # bronze and brass compile inside this build tree with the job's own compiler

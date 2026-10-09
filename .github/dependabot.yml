@@ -1,7 +1,7 @@
 version: 2
 
 # No package manifest to watch: the dependencies (bromath, brotensor, broimage,
-# bronze) are pinned to commits with bro_dependency() in CMakeLists.txt, and
+# bronze) track their main through bro_dependency() in CMakeLists.txt, and
 # there are no third-party libraries. That
 # leaves the pinned actions in .github/workflows/.
 updates:

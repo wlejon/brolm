@@ -90,7 +90,7 @@ and bronze with brass — is pinned to a commit in `CMakeLists.txt`
 (`bro_dependency()`, `cmake/bro_deps.cmake`) and resolves the way every repo in
 the ecosystem resolves one: an existing target wins (bro adds them first), then
 a working tree beside this one (`../bromath`, `../brotensor`, `../broimage`,
-`../bronze`, ...), then the pinned commit, fetched at configure. See bro's
+`../bronze`, ...), then the head of its main branch, fetched at configure. See bro's
 [multi-repo workflow](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
 for the layout. `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>` points one dependency
 anywhere else. bronze and brass compile inside this build tree, because the

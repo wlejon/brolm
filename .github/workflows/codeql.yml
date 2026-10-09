@@ -33,7 +33,7 @@ jobs:
           path: brolm
 
       # The dependencies — bromath, brotensor, broimage, and bronze (with brass)
-      # for the api — are fetched at configure from the pinned commits, and
+      # for the api — are fetched at configure from the heads of their main branches, and
       # pre-built below, ahead of the trace.
 
       - name: Install Ninja
