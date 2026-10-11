@@ -13,7 +13,7 @@
 //   pre_layernorm
 //   24 layers:
 //     ln1 -> self-attn (biased q/k/v/out, non-causal) -> +
-//     ln2 -> fc1 (4096) -> QuickGELU -> fc2 (1024)    -> +
+//     ln2 -> fc1 (4096) -> QuickGELU -> fc2 (1024)    -> +   (activation per cfg)
 //   post_layernorm
 //
 // The final (1, 1024) embedding is the post-LN CLS token (row 0). Caller
@@ -25,6 +25,7 @@
 // clip_score.h owns the host-side resize + normalisation that gets you from
 // a [-1, 1] SD output to that input.
 
+#include "brolm/clip.h"
 #include "brotensor/tensor.h"
 
 #include <string>
@@ -43,6 +44,9 @@ struct ImageEncoderConfig {
     int num_layers      = 24;
     int intermediate_dim = 4096;    // FFN inner width
     float layer_norm_eps = 1.0e-5f;
+    // MLP activation; QuickGELU for OpenAI CLIP, exact GELU for open_clip
+    // ViTs such as BioCLIP (clip::Activation).
+    clip::Activation activation = clip::Activation::QuickGelu;
 };
 
 // Number of tokens fed to the transformer = 1 (CLS) + (image/patch)^2.

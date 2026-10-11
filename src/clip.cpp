@@ -41,6 +41,24 @@ bt::Tensor make_idx_device(const int32_t* host, int n) {
 
 }  // namespace
 
+// ─── activation ────────────────────────────────────────────────────────────
+
+Activation activation_from_name(std::string_view name) {
+    if (name == "quick_gelu") return Activation::QuickGelu;
+    if (name == "gelu") return Activation::Gelu;
+    if (name == "gelu_new" || name == "gelu_pytorch_tanh" || name == "gelu_tanh")
+        return Activation::GeluTanh;
+    throw std::runtime_error("clip: unsupported hidden_act '" + std::string(name) + "'");
+}
+
+void activation_forward(Activation act, const bt::Tensor& x, bt::Tensor& y) {
+    switch (act) {
+        case Activation::QuickGelu: bt::quick_gelu_forward(x, y); return;
+        case Activation::Gelu:      bt::gelu_exact_forward(x, y); return;
+        case Activation::GeluTanh:  bt::gelu_forward(x, y); return;
+    }
+}
+
 // ─── ctor / dtor ───────────────────────────────────────────────────────────
 
 TextEncoder::TextEncoder(const TextEncoderConfig& cfg) : cfg_(cfg) {
@@ -165,7 +183,7 @@ void TextEncoder::forward(const int32_t* ids, bt::Tensor& out,
             x_, layer.ln2_gamma, layer.ln2_beta, ln_out_, cfg_.layer_norm_eps);
 
         detail::linear_batched(layer.fc1_W, &layer.fc1_b, ln_out_, ffn_mid_);
-        bt::quick_gelu_forward(ffn_mid_, ffn_act_);
+        activation_forward(cfg_.activation, ffn_mid_, ffn_act_);
         detail::linear_batched(layer.fc2_W, &layer.fc2_b, ffn_act_, ffn_out_);
 
         bt::add_inplace(x_, ffn_out_);

@@ -10,7 +10,7 @@
 //   a = causal_self_attention(q, k, v)
 //   x = x + a @ Wo + bo
 //   x = LN2(x)
-//   m = QuickGELU(x @ Wfc1 + bfc1)
+//   m = act(x @ Wfc1 + bfc1)          (QuickGELU by default; see Activation)
 //   x = x + m @ Wfc2 + bfc2
 // Repeated num_layers times, then a final LayerNorm. Output is the last
 // hidden state (L, hidden_dim) — SD1.5 takes this directly as cross-attention
@@ -24,11 +24,27 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brotensor::safetensors { class File; struct TensorView; }
 
 namespace brolm::clip {
+
+// The MLP activation of a CLIP tower. OpenAI's CLIP (and every HF
+// openai/clip-* export) uses QuickGELU; open_clip builds exact GELU unless a
+// model config says quick_gelu, which is what LAION's ViTs and the BioCLIP
+// models run with. A Hugging Face config.json names it `hidden_act`.
+enum class Activation { QuickGelu, Gelu, GeluTanh };
+
+// `hidden_act` name -> Activation: "quick_gelu"; "gelu" (exact, erf);
+// "gelu_new" / "gelu_pytorch_tanh" / "gelu_tanh" (the tanh approximation).
+// Throws std::runtime_error on anything else rather than guess.
+Activation activation_from_name(std::string_view name);
+
+// y = act(x), FP32 or FP16 per x's dtype.
+void activation_forward(Activation act, const brotensor::Tensor& x,
+                        brotensor::Tensor& y);
 
 struct TextEncoderConfig {
     int   vocab_size       = 49408;
@@ -42,6 +58,7 @@ struct TextEncoderConfig {
     // The pooled output (when requested) is the final hidden state at this
     // token's first position in the sequence.
     int eos_token_id = 49407;
+    Activation activation = Activation::QuickGelu;
 };
 
 class TextEncoder {

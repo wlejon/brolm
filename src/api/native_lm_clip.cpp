@@ -369,6 +369,11 @@ static void parseTextConfigJson(const json::Value& tc, brolm::clip::TextEncoderC
 
     if (tc.contains("eos_token_id")) cfg.eos_token_id = tc.get_int("eos_token_id", cfg.eos_token_id);
     else if (tc.contains("eosTokenId")) cfg.eos_token_id = tc.get_int("eosTokenId", cfg.eos_token_id);
+
+    // QuickGELU when absent: an HF openai/clip-* config always names it, and
+    // the older hand-written configs this loader accepted predate the key.
+    if (tc.contains("hidden_act"))
+        cfg.activation = brolm::clip::activation_from_name(tc.get_string("hidden_act", "quick_gelu"));
 }
 
 static void parseVisionConfigJson(const json::Value& vc, brolm::clip_image::ImageEncoderConfig& cfg) {
@@ -401,6 +406,9 @@ static void parseVisionConfigJson(const json::Value& vc, brolm::clip_image::Imag
 
     if (vc.contains("layer_norm_eps")) cfg.layer_norm_eps = vc.get_float("layer_norm_eps", cfg.layer_norm_eps);
     else if (vc.contains("layerNormEps")) cfg.layer_norm_eps = vc.get_float("layerNormEps", cfg.layer_norm_eps);
+
+    if (vc.contains("hidden_act"))
+        cfg.activation = brolm::clip::activation_from_name(vc.get_string("hidden_act", "quick_gelu"));
 }
 
 static void parseClipConfigJson(const json::Value& root,
@@ -443,6 +451,9 @@ static void parseTextConfigJs(Value tc, brolm::clip::TextEncoderConfig& cfg) {
     if (numAny(o.get(), {"intermediateDim", "intermediate_dim", "intermediate_size"}, d)) cfg.intermediate_dim = static_cast<int>(d);
     if (numAny(o.get(), {"layerNormEps", "layer_norm_eps"}, d)) cfg.layer_norm_eps = static_cast<float>(d);
     if (numAny(o.get(), {"eosTokenId", "eos_token_id"}, d)) cfg.eos_token_id = static_cast<int>(d);
+    std::string act;
+    if (propString(o.get(), "hiddenAct", act) || propString(o.get(), "hidden_act", act))
+        cfg.activation = brolm::clip::activation_from_name(act);
 }
 
 static void parseVisionConfigJs(Value vc, brolm::clip_image::ImageEncoderConfig& cfg) {
@@ -457,6 +468,9 @@ static void parseVisionConfigJs(Value vc, brolm::clip_image::ImageEncoderConfig&
     if (numAny(o.get(), {"numLayers", "num_layers", "num_hidden_layers"}, d)) cfg.num_layers = static_cast<int>(d);
     if (numAny(o.get(), {"intermediateDim", "intermediate_dim", "intermediate_size"}, d)) cfg.intermediate_dim = static_cast<int>(d);
     if (numAny(o.get(), {"layerNormEps", "layer_norm_eps"}, d)) cfg.layer_norm_eps = static_cast<float>(d);
+    std::string act;
+    if (propString(o.get(), "hiddenAct", act) || propString(o.get(), "hidden_act", act))
+        cfg.activation = brolm::clip::activation_from_name(act);
 }
 
 // The first of `keys` present as an object on `root`, or undefined.
@@ -542,18 +556,23 @@ Value js_loadClip(Value, std::span<const Value> a) {
         }
     }
 
-    if (!configPath.empty() && std::filesystem::exists(configPath)) {
-        std::ifstream ifs(configPath);
-        if (ifs.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-            auto rootJson = brolm::detail::json::parse(content);
-            parseClipConfigJson(rootJson, textCfg, visionCfg, scoreCfg);
+    // An unknown hidden_act throws from the parsers; report it as a load error.
+    try {
+        if (!configPath.empty() && std::filesystem::exists(configPath)) {
+            std::ifstream ifs(configPath);
+            if (ifs.is_open()) {
+                std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                auto rootJson = brolm::detail::json::parse(content);
+                parseClipConfigJson(rootJson, textCfg, visionCfg, scoreCfg);
+            }
         }
-    }
 
-    Value cVal = ev::getProperty(opts, "config");
-    if (ev::isObject(cVal)) {
-        parseClipConfigJs(cVal, textCfg, visionCfg, scoreCfg);
+        Value cVal = ev::getProperty(opts, "config");
+        if (ev::isObject(cVal)) {
+            parseClipConfigJs(cVal, textCfg, visionCfg, scoreCfg);
+        }
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("loadClip: ") + e.what());
     }
 
     Value pdVal = ev::getProperty(opts, "projectionDim");

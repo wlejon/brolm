@@ -47,8 +47,8 @@ inference is checked on hardware that has the weights.
 |---|---|
 | `brolm/tokenizer.h` | CLIP BPE tokenizer (`vocab.json` + `merges.txt`) |
 | `brolm/tokenizer_t5.h` | T5 SentencePiece Unigram tokenizer (`tokenizer.json`) |
-| `brolm/clip.h` | CLIP ViT-L/14 text encoder |
-| `brolm/clip_image.h` | CLIP ViT-L/14 vision encoder |
+| `brolm/clip.h` | CLIP text encoder (ViT-L/14 by default; QuickGELU or GELU per `hidden_act`) |
+| `brolm/clip_image.h` | CLIP ViT vision encoder (ViT-L/14 by default; BioCLIP's ViT-B/16 and BioCLIP 2 via `scripts/convert-openclip.py`) |
 | `brolm/clip_score.h` | CLIP image/text similarity scoring |
 | `brolm/t5.h` | T5-XXL encoder (encoder-only) |
 | `brolm/qwen_tokenizer.h` | Qwen3 byte-level BPE tokenizer + `apply_chat_template` |

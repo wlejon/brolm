@@ -46,6 +46,14 @@ brolm_add_test(brolm_test_quantize_t5    test_quantize_t5.cpp)
 brolm_add_test(brolm_test_clip_image     test_clip_image.cpp)
 brolm_add_test(brolm_test_clip_score     test_clip_score.cpp)
 brolm_add_test(brolm_test_bioclip_gpu     test_bioclip_gpu.cpp)
+# BioCLIP / BioCLIP 2 numeric parity against open_clip (tests/ref/
+# gen_bioclip_fixture.py writes the gitignored fixtures); converted weights
+# from BROLM_BIOCLIP_DIR / BROLM_BIOCLIP2_DIR or ../brovisionml-data. Skips
+# without them.
+brolm_add_test(brolm_test_bioclip_parity test_bioclip_parity.cpp)
+target_compile_definitions(brolm_test_bioclip_parity PRIVATE
+    BROLM_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+    BROLM_SIBLING_DIR="${PROJECT_SOURCE_DIR}/..")
 brolm_add_test(brolm_test_qwen           test_qwen.cpp)
 brolm_add_test(brolm_test_qwen_generate  test_qwen_generate.cpp)
 brolm_add_test(brolm_test_qwen_gguf      test_qwen_gguf.cpp)

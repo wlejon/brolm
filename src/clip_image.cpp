@@ -153,7 +153,7 @@ void ImageEncoder::forward(const bt::Tensor& pixels, bt::Tensor& cls_out) {
         seq_, pre_g_, pre_b_, ln_out_, eps);
     seq_ = ln_out_.clone();
 
-    // ── 24 transformer layers (non-causal, biased Q/K/V/O, QuickGELU MLP) ──
+    // ── transformer layers (non-causal, biased Q/K/V/O, cfg_.activation MLP) ─
     for (auto& L : layers_) {
         detail::layernorm_batched(
             seq_, L.ln1_g, L.ln1_b, ln_out_, eps);
@@ -168,7 +168,7 @@ void ImageEncoder::forward(const bt::Tensor& pixels, bt::Tensor& cls_out) {
         detail::layernorm_batched(
             seq_, L.ln2_g, L.ln2_b, ln_out_, eps);
         detail::linear_batched(L.fc1_W, &L.fc1_b, ln_out_, ffn_mid_);
-        bt::quick_gelu_forward(ffn_mid_, ffn_act_);
+        clip::activation_forward(cfg_.activation, ffn_mid_, ffn_act_);
         detail::linear_batched(L.fc2_W, &L.fc2_b, ffn_act_, ffn_out_);
         bt::add_inplace(seq_, ffn_out_);
     }
