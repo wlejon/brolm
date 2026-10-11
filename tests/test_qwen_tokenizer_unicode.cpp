@@ -19,7 +19,7 @@
 // tests. The synthetic tokenizer.json check at the end always runs.
 
 #include "brolm/qwen_tokenizer.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 #include "brolm/detail/unicode.h"
 
 #include <cstdint>
@@ -33,7 +33,7 @@
 #include <vector>
 
 namespace qwen = brolm::qwen;
-namespace json = brolm::detail::json;
+namespace json = brotensor::json;
 namespace uni = brolm::detail::unicode;
 namespace fs = std::filesystem;
 

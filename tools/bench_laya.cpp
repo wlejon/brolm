@@ -30,7 +30,7 @@
 
 #include "brolm/laya.h"
 #include "brolm/laya_scheduler.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
@@ -48,7 +48,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 using Clock = std::chrono::steady_clock;
 
 namespace {

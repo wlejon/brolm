@@ -1,6 +1,6 @@
 #include "brolm/grammar.h"
 #include "brolm/grammar_jit.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 #include "grammar/dfa_compiler.h"
 #include "grammar/grammar_types.h"
 #include "grammar/regex_compiler.h"
@@ -305,7 +305,7 @@ Grammar Grammar::exact(const std::string& str) {
 
 namespace {
 
-std::string json_schema_node_to_bnf(const detail::json::Value& schema,
+std::string json_schema_node_to_bnf(const brotensor::json::Value& schema,
                                     std::ostringstream& bnf_out,
                                     int& rule_counter) {
     int rule_num = rule_counter++;
@@ -391,7 +391,7 @@ std::string json_schema_node_to_bnf(const detail::json::Value& schema,
 
 Grammar Grammar::json_schema(const std::string& schema_json) {
     try {
-        detail::json::Value schema = detail::json::parse(schema_json);
+        brotensor::json::Value schema = brotensor::json::parse(schema_json);
         std::ostringstream bnf;
         int rule_counter = 0;
 

@@ -1,6 +1,6 @@
 #include "brolm/gemma2_config.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include "brotensor/gguf.h"
 
@@ -12,7 +12,7 @@
 
 namespace brolm::gemma {
 
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

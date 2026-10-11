@@ -1,7 +1,7 @@
 #include "brolm/qwen35_config.h"
 
 #include "brotensor/gguf.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <algorithm>
 #include <fstream>
@@ -13,7 +13,7 @@
 namespace brolm::qwen35 {
 
 namespace bt = ::brotensor;
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

@@ -107,7 +107,7 @@ void build_byte_unicode_maps(
 // ─── Vocab + merges loaders ────────────────────────────────────────────────
 //
 // Tiny inline JSON reader — vocab.json is a flat {"token": id, ...} object,
-// so the general-purpose brolm::detail::json parser is overkill (and slower
+// so the general-purpose brotensor::json parser is overkill (and slower
 // at million-entry vocab sizes). Strings handle the standard JSON escapes.
 
 namespace {

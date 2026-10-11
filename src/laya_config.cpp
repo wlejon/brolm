@@ -1,6 +1,6 @@
 #include "brolm/laya_config.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cctype>
 #include <filesystem>
@@ -10,7 +10,7 @@
 
 namespace brolm::laya {
 
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

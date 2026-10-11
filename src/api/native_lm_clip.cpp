@@ -1,5 +1,5 @@
 #include "host_lm_internal.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 #include <fstream>
 
 namespace brolm::api {
@@ -337,7 +337,7 @@ void registerLMClipClasses() {
     g_t5ModelClass.install("T5Model", 0, nullptr, decorateT5Model);
 }
 
-namespace json = brolm::detail::json;
+namespace json = brotensor::json;
 
 static void parseTextConfigJson(const json::Value& tc, brolm::clip::TextEncoderConfig& cfg) {
     if (!tc.is_object()) return;
@@ -562,7 +562,7 @@ Value js_loadClip(Value, std::span<const Value> a) {
             std::ifstream ifs(configPath);
             if (ifs.is_open()) {
                 std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-                auto rootJson = brolm::detail::json::parse(content);
+                auto rootJson = brotensor::json::parse(content);
                 parseClipConfigJson(rootJson, textCfg, visionCfg, scoreCfg);
             }
         }

@@ -1,6 +1,6 @@
 #include "brolm/nllb_config.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <fstream>
 #include <sstream>
@@ -9,7 +9,7 @@
 
 namespace brolm::nllb {
 
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

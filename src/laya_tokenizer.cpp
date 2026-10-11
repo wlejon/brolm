@@ -6,7 +6,7 @@
 
 #include "brolm/detail/byte_level_bpe.h"
 #include "brolm/detail/hf_bpe.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 #include "brolm/detail/unicode.h"
 
 #include <filesystem>
@@ -20,7 +20,7 @@
 namespace brolm::laya {
 
 namespace bpe = brolm::detail::bpe;
-namespace j   = brolm::detail::json;
+namespace j   = brotensor::json;
 namespace uni = brolm::detail::unicode;
 
 namespace {

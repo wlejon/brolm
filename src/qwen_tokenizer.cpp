@@ -1,7 +1,7 @@
 #include "brolm/qwen_tokenizer.h"
 
 #include "brolm/detail/byte_level_bpe.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 #include "brolm/detail/unicode.h"
 #include "brotensor/gguf.h"
 
@@ -16,7 +16,7 @@
 namespace brolm::qwen {
 
 namespace bpe = brolm::detail::bpe;
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 // ─── BPE delegation ────────────────────────────────────────────────────────
 

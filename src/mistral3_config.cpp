@@ -1,6 +1,6 @@
 #include "brolm/mistral3_config.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include "brotensor/gguf.h"
 
@@ -11,7 +11,7 @@
 
 namespace brolm::mistral3 {
 
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

@@ -1,6 +1,6 @@
 #include "brolm/tokenizer_t5.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cstdint>
 #include <fstream>
@@ -11,7 +11,7 @@
 
 namespace brolm::t5 {
 
-namespace json = ::brolm::detail::json;
+namespace json = ::brotensor::json;
 
 // ─── load ──────────────────────────────────────────────────────────────────
 

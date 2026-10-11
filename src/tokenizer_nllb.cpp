@@ -1,7 +1,7 @@
 #include "brolm/tokenizer_nllb.h"
 
 #include "brolm/detail/byte_level_bpe.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cstdint>
 #include <fstream>
@@ -12,7 +12,7 @@
 
 namespace brolm::nllb {
 
-namespace json = ::brolm::detail::json;
+namespace json = ::brotensor::json;
 namespace bpe = ::brolm::detail::bpe;
 
 namespace {

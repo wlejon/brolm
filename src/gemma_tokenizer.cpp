@@ -1,6 +1,6 @@
 #include "brolm/gemma_tokenizer.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cstdint>
 #include <fstream>
@@ -11,7 +11,7 @@
 
 namespace brolm::gemma {
 
-namespace json = ::brolm::detail::json;
+namespace json = ::brotensor::json;
 namespace bpe = ::brolm::detail::bpe;
 
 // ─── load ──────────────────────────────────────────────────────────────────

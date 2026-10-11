@@ -14,7 +14,7 @@
 // the vocabulary's own character space (GPT-2 byte-level unicode for a
 // ByteLevel tokenizer, raw UTF-8 with U+2581 metaspaces for a Metaspace one).
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cstdint>
 #include <string>
@@ -35,7 +35,7 @@ public:
     // From tokenizer.json's "model" object. Throws std::runtime_error on a
     // non-BPE model, an unsupported option, or a merge whose parts or result
     // are missing from the vocab (as tokenizers does).
-    void load(const json::Value& model);
+    void load(const brotensor::json::Value& model);
 
     // Append the ids of one pre-tokenized word.
     void encode_word(std::string_view word, std::vector<int32_t>& out) const;

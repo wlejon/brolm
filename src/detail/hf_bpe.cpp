@@ -7,7 +7,7 @@
 
 namespace brolm::detail::hfbpe {
 
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

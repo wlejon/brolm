@@ -3,7 +3,7 @@
 
 #include "brolm/laya.h"
 
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 
 #include <charconv>
 #include <cmath>
@@ -12,7 +12,7 @@
 
 namespace brolm::laya {
 
-namespace j = brolm::detail::json;
+namespace j = brotensor::json;
 
 namespace {
 

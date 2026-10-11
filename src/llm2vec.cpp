@@ -1,7 +1,7 @@
 #include "brolm/llm2vec.h"
 
 #include "brolm/detail/dense_decoder.h"
-#include "brolm/detail/json.h"
+#include "brotensor/json.h"
 #include "brolm/detail/weights.h"
 
 #include "brotensor/ops.h"
@@ -18,7 +18,7 @@ namespace brolm::llm2vec {
 
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
-namespace j  = brolm::detail::json;
+namespace j  = brotensor::json;
 
 namespace {
 
