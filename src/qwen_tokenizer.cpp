@@ -512,8 +512,67 @@ void Tokenizer::register_special_token(const std::string& token, int32_t id) {
 
 void Tokenizer::encode_piece_(std::string_view piece,
                               std::vector<int32_t>& out) const {
+    if (raw_bytes_) {
+        // A whole pre-token that is itself a token skips the merge loop.
+        auto it = vocab_.find(std::string(piece));
+        if (it != vocab_.end()) {
+            out.push_back(it->second);
+            return;
+        }
+        bpe::tiktoken_encode_piece(piece, vocab_, out);
+        return;
+    }
     bpe::encode_piece(piece, byte_to_unicode_, vocab_, merge_ranks_,
                       /*append_end_of_word=*/false, out);
+}
+
+void Tokenizer::encode_span_(std::string_view span,
+                             std::vector<int32_t>& out) const {
+    std::string normalized;
+    if (normalize_nfc_ && !uni::is_nfc(span)) {
+        normalized = uni::nfc(span);
+        span = normalized;
+    }
+    for (const auto p : pre_tokenize(span, digit_run_max_)) {
+        encode_piece_(p, out);
+    }
+}
+
+Tokenizer Tokenizer::from_tiktoken(const std::string& path,
+                                   const std::vector<std::string>& specials) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("brolm: qwen::Tokenizer::from_tiktoken: cannot open " + path);
+    Tokenizer t;
+    t.raw_bytes_ = true;
+    std::string line;
+    int32_t max_rank = -1;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        const auto sp = line.find(' ');
+        if (sp == std::string::npos)
+            throw std::runtime_error("brolm: qwen::Tokenizer::from_tiktoken: malformed line in " + path);
+        std::string bytes = bpe::base64_decode(std::string_view(line).substr(0, sp));
+        const int32_t rank = static_cast<int32_t>(std::stol(line.substr(sp + 1)));
+        t.id_to_token_.emplace(rank, bytes);
+        t.vocab_.emplace(std::move(bytes), rank);
+        if (rank > max_rank) max_rank = rank;
+    }
+    if (t.vocab_.empty())
+        throw std::runtime_error("brolm: qwen::Tokenizer::from_tiktoken: no ranks in " + path);
+    const int32_t base = static_cast<int32_t>(t.vocab_.size());
+    for (std::size_t i = 0; i < specials.size(); ++i) {
+        if (!specials[i].empty())
+            t.register_special_token(specials[i], base + static_cast<int32_t>(i));
+    }
+    return t;
+}
+
+std::vector<int32_t> Tokenizer::encode_ordinary(std::string_view text) const {
+    std::vector<int32_t> ids;
+    ids.reserve(text.size());
+    encode_span_(text, ids);
+    return ids;
 }
 
 std::vector<int32_t> Tokenizer::encode(std::string_view text,
@@ -528,14 +587,7 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text,
     bpe::encode_with_specials(
         text, specials_,
         [this](std::string_view span, std::vector<int32_t>& out) {
-            std::string normalized;
-            if (normalize_nfc_ && !uni::is_nfc(span)) {
-                normalized = uni::nfc(span);
-                span = normalized;
-            }
-            for (const auto p : pre_tokenize(span, digit_run_max_)) {
-                encode_piece_(p, out);
-            }
+            encode_span_(span, out);
         },
         ids);
 
@@ -569,7 +621,8 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
         }
         auto it = id_to_token_.find(id);
         if (it != id_to_token_.end()) {
-            encoded += it->second;
+            if (raw_bytes_) out += it->second;
+            else encoded += it->second;
         }
     }
     flush_encoded();

@@ -100,6 +100,20 @@ public:
     // When false (default) nothing is appended.
     std::vector<int32_t> encode(std::string_view text, bool add_special = false) const;
 
+    // Build a tokenizer from a tiktoken rank file (Qwen's `qwen.tiktoken`:
+    // one "<base64 token bytes> <rank>" line per ordinary token, rank = id).
+    // The same Qwen2 pre-tokenizer + NFC as the other loaders; BPE runs over
+    // raw bytes with the merge order implied by the ranks (tiktoken's rule).
+    // `specials` are numbered from the ordinary-token count in order (the
+    // tiktoken Encoding's special_tokens convention); an empty string keeps
+    // its id reserved. Throws std::runtime_error on I/O or parse failure.
+    static Tokenizer from_tiktoken(const std::string& path,
+                                   const std::vector<std::string>& specials = {});
+
+    // encode() without special-token matching: every byte of `text` goes
+    // through NFC + pre-tokenization + BPE (tiktoken's encode_ordinary).
+    std::vector<int32_t> encode_ordinary(std::string_view text) const;
+
     // Inverse of encode: ids -> vocab pieces -> byte-decode -> UTF-8 string.
     // Special-token ids decode to their literal string form. Unknown ids are
     // skipped. decode(encode(s)) == s for any byte string that is already
@@ -185,6 +199,12 @@ private:
     // Qwen2 defaults; from_tokenizer_json overrides from the file.
     bool normalize_nfc_ = true;
     int digit_run_max_  = 1;
+
+    // from_tiktoken: vocab_ / id_to_token_ hold RAW token bytes and pieces
+    // merge by rank (bpe::tiktoken_encode_piece) instead of through merges.
+    bool raw_bytes_ = false;
+
+    void encode_span_(std::string_view span, std::vector<int32_t>& out) const;
 };
 
 }  // namespace brolm::qwen
