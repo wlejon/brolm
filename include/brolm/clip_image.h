@@ -19,9 +19,9 @@
 // The final (1, 1024) embedding is the post-LN CLS token (row 0). Caller
 // applies the cross-modal projection (clip_score does this).
 //
-// Inference-only, batch size N = 1. Runs at the pipeline compute dtype —
-// FP32 on CPU, FP16 on a GPU backend. Input is a preprocessed activation:
-// (1, 3 * 224 * 224) NCHW, already mean/std normalised in CLIP space.
+// Inference-only, a batch of N >= 1 images. Runs at the pipeline compute
+// dtype — FP32 on CPU, FP16 on a GPU backend. Input is a preprocessed
+// activation: (N, 3 * 224 * 224) NCHW, already mean/std normalised in CLIP space.
 // clip_score.h owns the host-side resize + normalisation that gets you from
 // a [-1, 1] SD output to that input.
 
@@ -84,13 +84,20 @@ public:
                       const std::string& prefix = "vision_model.",
                       bool pre_layrnorm_alt = true);
 
-    // Forward pass.
-    //   pixels: (1, 3 * 224 * 224) Tensor at the compute dtype, mean/std-
-    //           normalised in CLIP space (see clip_score::preprocess for the
-    //           host-side pipeline that produces this).
-    //   cls_out: (1, hidden_dim), *post_layernorm(CLS token)*.
+    // Forward pass over a batch of N >= 1 images.
+    //   pixels: (N, 3 * 224 * 224) Tensor at the compute dtype, one image a
+    //           row, mean/std-normalised in CLIP space (see
+    //           clip_score::preprocess for the host-side pipeline that
+    //           produces this).
+    //   cls_out: (N, hidden_dim), *post_layernorm(CLS token)* of each image.
     //            Resized as needed. This is the input to the visual
     //            projection that produces the final cross-modal embedding.
+    // The linear layers, layer norms and MLP run over all N * T token rows
+    // at once (bigger matmuls, one dispatch each); the patch conv and the
+    // attention core run image by image, so no image sees another's tokens.
+    // Row n of a batch is what image n gives alone: bit-identical on the CPU;
+    // on a GPU to FP16 rounding, since a GEMM there may round a row by where
+    // it falls in its tile (Vulkan: ~3e-4 on BioCLIP 2's normalised embedding).
     void forward(const brotensor::Tensor& pixels,
                  brotensor::Tensor& cls_out);
 
@@ -114,9 +121,12 @@ private:
     brotensor::Tensor post_g_, post_b_;
 
     // Scratch buffers reused across calls.
-    brotensor::Tensor patch_nchw_;    // (1, D * G * G)
-    brotensor::Tensor seq_;           // (T, D) residual stream
+    brotensor::Tensor patch_one_;     // (1, D * G * G) one image's conv
+    brotensor::Tensor patch_nchw_;    // (N, D * G * G)
+    brotensor::Tensor seq_;           // (N * T, D) residual stream
     brotensor::Tensor ln_out_;
+    brotensor::Tensor q_, k_, v_;     // (N * T, D) projected Q / K / V
+    brotensor::Tensor attn_;          // (N * T, D) attention core output
     brotensor::Tensor proj_out_;
     brotensor::Tensor ffn_mid_, ffn_act_, ffn_out_;
     brotensor::Tensor post_;          // (T, D)

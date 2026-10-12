@@ -28,6 +28,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -371,6 +372,35 @@ int main() {
         // on the same image must reproduce the same value (deterministic).
         const float s2 = scorer.score(image, H, W);
         CHECK(s == s2);
+
+        // encode_images over more images than one forward takes (kMaxBatch),
+        // of mixed sizes: element i is encode_image of image i (exactly on
+        // the CPU), in order.
+        const int count = clip_score::CLIPScorer::kMaxBatch + 3;
+        std::vector<std::vector<float>> ims(static_cast<std::size_t>(count));
+        std::vector<clip_score::CLIPScorer::ImageRef> refs;
+        for (int k = 0; k < count; ++k) {
+            const int h = 8 + (k % 3) * 4, w = 8 + (k % 2) * 6;
+            auto& im = ims[static_cast<std::size_t>(k)];
+            im.resize(static_cast<std::size_t>(3) * h * w);
+            for (std::size_t i = 0; i < im.size(); ++i)
+                im[i] = static_cast<float>((i * (k + 2) + k) % 37) / 18.0f - 1.0f;
+            refs.push_back({im.data(), h, w});
+        }
+        const auto batch = scorer.encode_images(refs);
+        CHECK(batch.size() == static_cast<std::size_t>(count));
+        float maxd = 0.0f;
+        for (int k = 0; k < count && batch.size() == static_cast<std::size_t>(count); ++k) {
+            const auto& r = refs[static_cast<std::size_t>(k)];
+            const auto one = scorer.encode_image(ims[static_cast<std::size_t>(k)], r.H, r.W);
+            CHECK(one.size() == batch[static_cast<std::size_t>(k)].size());
+            for (std::size_t i = 0; i < one.size() && i < batch[static_cast<std::size_t>(k)].size(); ++i)
+                maxd = std::max(maxd, std::abs(one[i] - batch[static_cast<std::size_t>(k)][i]));
+        }
+        std::printf("clip_score: encode_images of %d vs encode_image, max |diff| %g\n", count, maxd);
+        if (brolm::compute_dtype() == bt::Dtype::FP32) CHECK(maxd == 0.0f);
+        else CHECK(maxd < 2e-2f);
+        CHECK(scorer.encode_images({}).empty());
     }
 
     std::error_code ec;

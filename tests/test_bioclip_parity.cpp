@@ -245,6 +245,44 @@ void run_device(const fs::path& dir, const Fixture& fx, bt::Device dev, const To
     const std::vector<float> img = scorer.encode_image(chw, S, S);
     report("image embedding (max abs)", max_abs(img, need(fx, "image/embed").f), tol.embed);
 
+    // encode_images: a batch of crops (the fixture image, mirrored, a
+    // non-square crop of it, a smooth ramp) against encode_image of each.
+    // The batch runs the same arithmetic a row at a time, so the CPU is held
+    // to bit-identical. A GPU is held to the embedding tolerance: Vulkan's
+    // cooperative-matrix GEMM rounds a row by where it sits in its tile (a row
+    // at offset 257 instead of 0 differs by an FP16 ulp in a few elements),
+    // and halo measured 2.4e-4 (BioCLIP 2) / 1.2e-3 (BioCLIP) here.
+    {
+        std::vector<std::vector<float>> ims(4);
+        std::vector<std::pair<int, int>> hw = {{S, S}, {S, S}, {S / 2, S}, {S, S}};
+        ims[0] = chw;
+        ims[1].resize(chw.size());
+        for (int c = 0; c < 3; ++c)
+            for (int y = 0; y < S; ++y)
+                for (int x = 0; x < S; ++x)
+                    ims[1][(static_cast<std::size_t>(c) * S + y) * S + x] =
+                        chw[(static_cast<std::size_t>(c) * S + y) * S + (S - 1 - x)];
+        for (int c = 0; c < 3; ++c)   // the top half: (S/2) x S
+            ims[2].insert(ims[2].end(), chw.begin() + static_cast<std::ptrdiff_t>(c) * S * S,
+                          chw.begin() + static_cast<std::ptrdiff_t>(c) * S * S + (S / 2) * S);
+        ims[3].resize(chw.size());
+        for (std::size_t i = 0; i < ims[3].size(); ++i)
+            ims[3][i] = static_cast<float>(i % (S * 3)) / (S * 1.5f) - 1.0f;
+        std::vector<brolm::clip_score::CLIPScorer::ImageRef> refs;
+        for (std::size_t i = 0; i < ims.size(); ++i) refs.push_back({ims[i].data(), hw[i].first, hw[i].second});
+        const auto batch = scorer.encode_images(refs);
+        double d = 0;
+        bool sizes = batch.size() == ims.size();
+        for (std::size_t i = 0; i < ims.size() && sizes; ++i) {
+            const auto one = scorer.encode_image(ims[i], hw[i].first, hw[i].second);
+            sizes = sizes && one.size() == batch[i].size();
+            if (sizes) d = std::max(d, max_abs(batch[i], one));
+        }
+        const double btol = dev.type == bt::DeviceType::CPU ? 0.0 : tol.embed;
+        report("encode_images batch of 4 vs one at a time", sizes ? d : 1e9, btol);
+        if (sizes) report("batch: image 0 vs encode_image (max abs)", max_abs(batch[0], img), btol);
+    }
+
     double d_text = 0, d_sim = 0, d_prob = 0;
     std::vector<double> logits;
     const double scale = need(fx, "logit_scale").f[0];

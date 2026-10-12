@@ -112,6 +112,42 @@ static void decorateClipModel(ObjectBuilder& b) {
         }
     });
 
+    // encodeImages([img, ...]) -> [Float32Array, ...]: encodeImage over many
+    // images in one batched vision-tower forward (up to CLIPScorer::kMaxBatch
+    // a pass); element i equals encodeImage(images[i]).
+    b.def("encodeImages", 1, [](Value self, std::span<const Value> a) -> Value {
+        auto* w = hostClipModelOf(self);
+        if (!w || !w->scorer) return ev::throwTypeError("encodeImages: not a ClipModel");
+        if (a.empty() || !ev::isObject(a[0]))
+            return ev::throwTypeError("encodeImages(images): an array of images required");
+        Value lenVal = ev::getProperty(a[0], "length");
+        if (!ev::isNumber(lenVal))
+            return ev::throwTypeError("encodeImages(images): an array of images required");
+        const uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+
+        std::vector<std::vector<float>> nchw(len);
+        std::vector<brolm::clip_score::CLIPScorer::ImageRef> refs(len);
+        for (uint32_t i = 0; i < len; ++i) {
+            std::vector<uint8_t> rgba;
+            int width = 0, height = 0;
+            std::string err;
+            if (!readImageArg(ev::getElement(a[0], i), rgba, width, height, err))
+                return ev::throwTypeError("encodeImages: image " + std::to_string(i) + ": " + err);
+            nchw[i] = rgbaToNchwSigned(rgba, width, height);
+            refs[i] = { nchw[i].data(), height, width };
+        }
+
+        try {
+            brotensor::DeviceScope scope(w->device);
+            std::vector<std::vector<float>> feats = w->scorer->encode_images(refs);
+            return hostArrayOf(feats.size(), [&](size_t i) {
+                return makeFloat32Array(feats[i].data(), feats[i].size());
+            });
+        } catch (const std::exception& e) {
+            return ev::throwError(std::string("encodeImages: ") + e.what());
+        }
+    });
+
     auto scoreFn = [](Value self, std::span<const Value> a) -> Value {
         auto* w = hostClipModelOf(self);
         if (!w || !w->scorer) return ev::throwTypeError("score: not a ClipModel");

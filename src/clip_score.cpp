@@ -121,21 +121,63 @@ void CLIPScorer::set_prompt(std::string_view prompt) {
 
 std::vector<float> CLIPScorer::encode_image(const std::vector<float>& image,
                                             int H, int W) {
-    auto pixel_vals = preprocess_(image, H, W);
+    const int C = image_enc_.config().in_channels;
+    if (static_cast<long long>(image.size()) != static_cast<long long>(C) * H * W) {
+        fail("preprocess: image size mismatch (expected " +
+             std::to_string(C * H * W) + ", got " +
+             std::to_string(image.size()) + ")");
+    }
+    auto feats = encode_images({ImageRef{image.data(), H, W}});
+    return std::move(feats[0]);
+}
+
+std::vector<std::vector<float>> CLIPScorer::encode_images(
+    const std::vector<ImageRef>& images) {
+    std::vector<std::vector<float>> out;
+    out.reserve(images.size());
     const int S  = image_enc_.config().image_size;
     const int C  = image_enc_.config().in_channels;
+    const int P  = cfg_.projection_dim;
+    const std::size_t px = static_cast<std::size_t>(C) * S * S;
 
-    pixels_dev_ = detail::upload_host(pixel_vals.data(), 1, C * S * S);
-    image_enc_.forward(pixels_dev_, img_cls_);
+    for (std::size_t b0 = 0; b0 < images.size(); b0 += kMaxBatch) {
+        const int N = static_cast<int>(std::min<std::size_t>(kMaxBatch, images.size() - b0));
+        std::vector<float> pixel_vals(px * static_cast<std::size_t>(N));
+        for (int n = 0; n < N; ++n) {
+            const ImageRef& im = images[b0 + static_cast<std::size_t>(n)];
+            if (!im.data || im.H <= 0 || im.W <= 0) fail("encode_images: empty image");
+            const auto one = preprocess_(im.data, im.H, im.W);
+            std::copy(one.begin(), one.end(), pixel_vals.begin() + static_cast<std::ptrdiff_t>(px * n));
+        }
 
-    // (1, P) = img_cls_ @ visual_proj_W_.T
-    detail::linear_batched(visual_proj_W_, /*bias=*/nullptr,
-                           img_cls_, img_proj_);
+        pixels_dev_ = detail::upload_host(pixel_vals.data(), N, static_cast<int>(px));
+        image_enc_.forward(pixels_dev_, img_cls_);   // (N, vision_D)
 
-    bt::sync_all();
-    std::vector<float> img_feat = download_compute(img_proj_);
-    l2_normalise_in_place(img_feat);
-    return img_feat;
+        // (1, P) = cls_n @ visual_proj_W_.T, a row at a time: the GEMV a
+        // single image takes, so row n is what image n gives alone.
+        const int Dv = img_cls_.cols;
+        const std::size_t esz = static_cast<std::size_t>(bt::dtype_size_bytes(img_cls_.dtype));
+        detail::resize_like(img_proj_, N, P, compute_dtype(), img_cls_.device);
+        for (int n = 0; n < N; ++n) {
+            bt::Tensor cls = bt::Tensor::view(img_cls_.device,
+                static_cast<char*>(img_cls_.data) + static_cast<std::size_t>(n) * Dv * esz,
+                1, Dv, img_cls_.dtype);
+            bt::Tensor proj = bt::Tensor::view(img_proj_.device,
+                static_cast<char*>(img_proj_.data) + static_cast<std::size_t>(n) * P * esz,
+                1, P, img_proj_.dtype);
+            detail::linear_batched(visual_proj_W_, /*bias=*/nullptr, cls, proj);
+        }
+
+        bt::sync_all();
+        const std::vector<float> all = download_compute(img_proj_);
+        for (int n = 0; n < N; ++n) {
+            std::vector<float> f(all.begin() + static_cast<std::ptrdiff_t>(n) * P,
+                                 all.begin() + static_cast<std::ptrdiff_t>(n + 1) * P);
+            l2_normalise_in_place(f);
+            out.push_back(std::move(f));
+        }
+    }
+    return out;
 }
 
 float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
@@ -155,15 +197,10 @@ float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
 }
 
 std::vector<float> CLIPScorer::preprocess_(
-    const std::vector<float>& image, int H, int W) const {
+    const float* image, int H, int W) const {
 
     const int S = image_enc_.config().image_size;       // 224
     const int C = image_enc_.config().in_channels;      // 3
-    if (static_cast<int>(image.size()) != C * H * W) {
-        fail("preprocess: image size mismatch (expected " +
-             std::to_string(C * H * W) + ", got " +
-             std::to_string(image.size()) + ")");
-    }
 
     // Resize per channel (bilinear, align_corners=False) then CLIP-normalise.
     // Input is in [-1, 1] (the SD pipeline output); fold the [-1,1] -> [0,1]
@@ -173,7 +210,7 @@ std::vector<float> CLIPScorer::preprocess_(
     // so image_normalize_nchw_f32 with adjusted stats produces the same result.
     std::vector<float> out(static_cast<std::size_t>(C) *
                            static_cast<std::size_t>(S) * S);
-    broimage::resize_chw_f32(image.data(), W, H, C,
+    broimage::resize_chw_f32(image, W, H, C,
                              out.data(),   S, S,
                              broimage::Filter::Bilinear);
 

@@ -5,7 +5,9 @@
 // intermediate_dim=32), synthesizes a safetensors fixture with the HF
 // "vision_model." tensor names, loads it, and runs forward on a synthetic
 // pixel tensor. Verifies output shape/dtype, that all outputs are finite
-// (no NaN/Inf), and that two consecutive forwards produce identical results.
+// (no NaN/Inf), that two consecutive forwards produce identical results, and
+// that a batch of 3 images gives each image's single forward (bit-identical
+// on the CPU), with a malformed pixel tensor refused.
 //
 // Numerical accuracy against a reference is intentionally not checked here —
 // that needs real CLIP weights and lives in a future integration test.
@@ -218,6 +220,50 @@ int main() {
         bt::sync_all();
         out_vals2 = bdtest::bd_download(cls_out);
         CHECK(out_vals1 == out_vals2);
+
+        // A batch of N images: row n is image n's forward alone.
+        // Bit-identical on the CPU; a GPU's GEMM may round a row by where it
+        // sits in the matrix, so there it allows FP16 rounding
+        // (test_bioclip_parity checks the real models' diff).
+        const int N = 3;
+        std::vector<float> batch(static_cast<std::size_t>(N) * C * S * S);
+        std::vector<float> singles;
+        for (int n = 0; n < N; ++n) {
+            std::vector<float> one(static_cast<std::size_t>(C) * S * S);
+            for (std::size_t i = 0; i < one.size(); ++i) {
+                one[i] = 0.013f * (static_cast<float>((i * (n + 3) + 5 * n) % 23) - 11.0f);
+            }
+            std::copy(one.begin(), one.end(), batch.begin() + static_cast<std::ptrdiff_t>(n * one.size()));
+            bt::Tensor dev = brolm::detail::upload_host(one.data(), 1, C * S * S);
+            enc.forward(dev, cls_out);
+            bt::sync_all();
+            const std::vector<float> v = bdtest::bd_download(cls_out);
+            singles.insert(singles.end(), v.begin(), v.end());
+        }
+        bt::Tensor batch_dev = brolm::detail::upload_host(batch.data(), N, C * S * S);
+        enc.forward(batch_dev, cls_out);
+        bt::sync_all();
+        CHECK(cls_out.rows == N);
+        CHECK(cls_out.cols == D);
+        const std::vector<float> got = bdtest::bd_download(cls_out);
+        CHECK(got.size() == singles.size());
+        float maxd = 0.0f;
+        for (std::size_t i = 0; i < got.size() && i < singles.size(); ++i) {
+            maxd = std::max(maxd, std::abs(got[i] - singles[i]));
+        }
+        std::printf("clip_image: batch of %d vs single, max |diff| %g\n", N, maxd);
+        if (brolm::compute_dtype() == bt::Dtype::FP32) CHECK(got == singles);
+        else CHECK(maxd < 2e-2f);
+        // The images differ, so the rows do: no row was another's copy.
+        CHECK(!std::equal(got.begin(), got.begin() + D, got.begin() + D));
+
+        // Bad shapes are refused.
+        bool threw = false;
+        try {
+            bt::Tensor bad = brolm::detail::upload_host(batch.data(), 1, C * S * S - 1);
+            enc.forward(bad, cls_out);
+        } catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
     }
 
     std::error_code ec;

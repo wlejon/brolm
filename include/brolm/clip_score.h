@@ -81,6 +81,21 @@ public:
     //   H, W:  pixel dimensions of the image.
     std::vector<float> encode_image(const std::vector<float>& image, int H, int W);
 
+    // One image of a batch: (3 * H * W) FP32 NCHW planar in [-1, 1], as
+    // encode_image takes it. Not owned; `data` must outlive the call.
+    struct ImageRef {
+        const float* data = nullptr;
+        int H = 0, W = 0;
+    };
+
+    // encode_image over many images at once: one vision-tower forward per
+    // up to kMaxBatch images (ImageEncoder::forward's batch), so a call with
+    // several crops costs much less than a call per crop on a GPU. Element i
+    // is encode_image(images[i]): bit-identical on the CPU, to FP16 rounding
+    // on a GPU (see ImageEncoder::forward). Empty in, empty out.
+    static constexpr int kMaxBatch = 16;
+    std::vector<std::vector<float>> encode_images(const std::vector<ImageRef>& images);
+
     // Score a VAE-decoded image against the cached prompt (set_prompt). The
     // cosine similarity in [-1, 1] — i.e. dot(encode_image(...), text_feature()).
     float score(const std::vector<float>& image, int H, int W);
@@ -96,8 +111,7 @@ private:
     // Host-side: resize input image to 224x224 (bilinear, per-channel) and
     // CLIP-normalise. Output is interleaved planar NCHW FP32 values, length
     // 3 * 224 * 224, ready for upload at the compute dtype.
-    std::vector<float> preprocess_(const std::vector<float>& image,
-                                   int H, int W) const;
+    std::vector<float> preprocess_(const float* image, int H, int W) const;
 
     const clip::Tokenizer&     tok_;
     clip::TextEncoder&         text_enc_;
@@ -110,9 +124,9 @@ private:
     brotensor::Tensor text_proj_W_;     // (P, text_D)
 
     // Scratch.
-    brotensor::Tensor pixels_dev_;      // (1, 3*224*224) at compute dtype
-    brotensor::Tensor img_cls_;         // (1, vision_D)
-    brotensor::Tensor img_proj_;        // (1, P)
+    brotensor::Tensor pixels_dev_;      // (N, 3*224*224) at compute dtype
+    brotensor::Tensor img_cls_;         // (N, vision_D)
+    brotensor::Tensor img_proj_;        // (N, P)
     brotensor::Tensor text_hidden_;     // (L, text_D) — TextEncoder output
     brotensor::Tensor text_pooled_;     // (1, text_D)
     brotensor::Tensor text_proj_;       // (1, P)
