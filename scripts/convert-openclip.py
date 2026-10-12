@@ -5,7 +5,9 @@ brolm's CLIP (src/clip.cpp, src/clip_image.cpp, src/clip_score.cpp) loads
 weights under Hugging Face `transformers` CLIPModel names, and the JS binding
 (src/api/native_lm_clip.cpp) reads the architecture from a config.json beside
 them (text_config / vision_config / projection_dim). open_clip checkpoints such
-as imageomics/bioclip (ViT-B/16) and imageomics/bioclip-2 (ViT-L/14) ship
+as imageomics/bioclip (ViT-B/16), imageomics/bioclip-2 (ViT-L/14) and
+imageomics/bioclip-2.5-vith14 (ViT-H/14: 32 x 1280 vision with 80-wide heads,
+read from open_clip_config.json's head_width; 24 x 1024 text) ship
 neither: they carry open_clip's own state dict plus an open_clip_config.json.
 This script rewrites one into the other; the tensors themselves are copied
 bit for bit except where the two layouts differ:
@@ -25,7 +27,7 @@ bit for bit except where the two layouts differ:
     config says `quick_gelu: true`; OpenAI's original CLIP and HF's
     openai/clip-* use QuickGELU. The choice is written as `hidden_act`
     ("gelu" or "quick_gelu") in both sub-configs, which brolm honours.
-    Neither BioCLIP config sets quick_gelu, so open_clip (and therefore every
+    No BioCLIP config (1, 2 or 2.5) sets quick_gelu, so open_clip (and therefore every
     published BioCLIP result computed through it) runs them with exact GELU;
     `--act` overrides that for experiments.
   * logit_scale is kept as the raw (log-space) parameter, as in HF.

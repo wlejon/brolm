@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the BioCLIP / BioCLIP 2 parity fixtures.
+"""Regenerate the BioCLIP / BioCLIP 2 / BioCLIP 2.5 Huge parity fixtures.
 
 Validates brolm's CLIP towers (src/clip.cpp, src/clip_image.cpp,
 src/clip_score.cpp) on open_clip checkpoints converted by
@@ -31,8 +31,10 @@ checks in tests/test_bioclip_parity.cpp (it skips when they are absent).
 Requirements: torch, open_clip_torch, numpy (CPU). The open_clip repos:
     hf download imageomics/bioclip   --local-dir ~/models/bioclip
     hf download imageomics/bioclip-2 --local-dir ~/models/bioclip-2
+    hf download imageomics/bioclip-2.5-vith14 --local-dir ~/models/bioclip-2.5
 
 Usage: tests/ref/gen_bioclip_fixture.py [--bioclip DIR] [--bioclip2 DIR]
+                                        [--bioclip25 DIR]
 
 Fixture layout (little-endian, the CLAP fixtures' format): the magic
 "BIOCFIX1", int32 record count, then per record: int32 name length, the name
@@ -228,8 +230,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bioclip", default="~/models/bioclip")
     ap.add_argument("--bioclip2", default="~/models/bioclip-2")
+    ap.add_argument("--bioclip25", default="~/models/bioclip-2.5")
     args = ap.parse_args()
-    for src, name in ((args.bioclip, "bioclip"), (args.bioclip2, "bioclip-2")):
+    for src, name in ((args.bioclip, "bioclip"), (args.bioclip2, "bioclip-2"),
+                      (args.bioclip25, "bioclip-2.5")):
         src = os.path.expanduser(src)
         if os.path.exists(os.path.join(src, "open_clip_config.json")):
             generate(src, name)

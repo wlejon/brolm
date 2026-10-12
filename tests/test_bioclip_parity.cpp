@@ -1,10 +1,12 @@
-// BioCLIP (ViT-B/16) and BioCLIP 2 (ViT-L/14) parity against open_clip
-// (tests/ref/gen_bioclip_fixture.py -> tests/fixtures/bioclip{,-2}.bin) on the
-// CPU and on the default GPU when there is one.
+// BioCLIP (ViT-B/16), BioCLIP 2 (ViT-L/14) and BioCLIP 2.5 Huge (ViT-H/14)
+// parity against open_clip (tests/ref/gen_bioclip_fixture.py ->
+// tests/fixtures/bioclip{,-2,-2.5}.bin) on the CPU and on the default GPU when
+// there is one.
 //
 // Weights are the open_clip releases converted by scripts/convert-openclip.py:
-// BROLM_BIOCLIP_DIR / BROLM_BIOCLIP2_DIR, else the brovisionml-data sibling
-// (../brovisionml-data/bioclip, ../brovisionml-data/bioclip-2). Each model's
+// BROLM_BIOCLIP_DIR / BROLM_BIOCLIP2_DIR / BROLM_BIOCLIP25_DIR, else the
+// brovisionml-data sibling (../brovisionml-data/bioclip, bioclip-2,
+// bioclip-2.5). Each model's
 // section skips (passes) when its weights or fixture are absent.
 //
 // Per model and device: the tokenizer's ids for each prompt; the vision tower
@@ -343,6 +345,7 @@ int main() {
     try {
         run_model("bioclip", "BROLM_BIOCLIP_DIR", "bioclip");
         run_model("bioclip-2", "BROLM_BIOCLIP2_DIR", "bioclip-2");
+        run_model("bioclip-2.5", "BROLM_BIOCLIP25_DIR", "bioclip-2.5");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: exception: %s\n", e.what());
         return 1;
