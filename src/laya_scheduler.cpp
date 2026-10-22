@@ -482,8 +482,12 @@ void Scheduler::shutdown() {
     // device runtime is gone). The config stays readable through model().
     for (auto& w : impl_->workers) {
         const Config cfg = w->model.config();
+        const modernbert::Config enc_cfg = w->model.encoder().config();
+        LayaTokenizer tok = w->model.tokenizer();
         w->model = DecisionModel();
         w->model.mutable_config() = cfg;
+        w->model.mutable_encoder() = modernbert::ModernBertModel(enc_cfg);
+        w->model.mutable_tokenizer() = std::move(tok);
     }
 }
 

@@ -88,6 +88,7 @@ LayaPost layaTrackPromise(Value promise, std::shared_ptr<void> keepalive) {
 }
 
 void layaTrackLoad(Value promise, std::shared_ptr<brolm::laya::Scheduler> sched) {
+    layaRegisterScheduler(sched);
     PendingLoad l;
     l.promise = ev::Persistent(promise);
     l.sched = std::move(sched);
@@ -97,7 +98,10 @@ void layaTrackLoad(Value promise, std::shared_ptr<brolm::laya::Scheduler> sched)
 void layaRegisterScheduler(const std::shared_ptr<brolm::laya::Scheduler>& sched) {
     std::lock_guard<std::mutex> lk(g_live_mu);
     auto& v = liveSchedulers();
-    v.erase(std::remove_if(v.begin(), v.end(), [](const auto& w) { return w.expired(); }), v.end());
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& w) {
+        auto s = w.lock();
+        return !s || s == sched;
+    }), v.end());
     v.push_back(sched);
 }
 
@@ -155,12 +159,6 @@ bool tickLayaAsync() {
 void shutdownLaya() {
     // This thread's unsettled promises and loads are released while the
     // runtime is still alive; the schedulers of every realm stop.
-    t_loads.clear();
-    t_pending.clear();
-    if (t_box) {
-        std::lock_guard<std::mutex> lk(t_box->mu);
-        t_box->ready.clear();
-    }
     std::vector<std::shared_ptr<brolm::laya::Scheduler>> live;
     {
         std::lock_guard<std::mutex> lk(g_live_mu);
@@ -168,6 +166,12 @@ void shutdownLaya() {
             if (auto s = w.lock()) live.push_back(std::move(s));
         }
         liveSchedulers().clear();
+    }
+    t_loads.clear();
+    t_pending.clear();
+    if (t_box) {
+        std::lock_guard<std::mutex> lk(t_box->mu);
+        t_box->ready.clear();
     }
     for (auto& s : live) s->shutdown();
 }

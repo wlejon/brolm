@@ -241,9 +241,11 @@ public:
     const LayaTimings& last_timings() const { return timings_; }
 
     const modernbert::ModernBertModel& encoder() const { return encoder_; }
+    modernbert::ModernBertModel& mutable_encoder() { return encoder_; }
     const Config& config() const { return cfg_; }
     Config& mutable_config() { return cfg_; }
     const LayaTokenizer& tokenizer() const { return tokenizer_; }
+    LayaTokenizer& mutable_tokenizer() { return tokenizer_; }
 
 private:
     // The training-side forward/backward (laya_grad.cpp) reads the weights.

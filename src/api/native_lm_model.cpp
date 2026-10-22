@@ -91,10 +91,16 @@ static void deliverTokens(AsyncJob& job) {
         std::lock_guard<std::mutex> lk(job.core->mu);
         tokens.swap(job.core->pendingTokens);
     }
-    if (!ev::isFunction(job.onToken.get())) return;
+    if (job.core->cancelled() || !ev::isFunction(job.onToken.get())) return;
     for (int32_t tok : tokens) {
+        if (job.core->cancelled()) break;
         const Value arg = ev::fromDouble(tok);
-        ev::call(job.onToken.get(), ev::undefined(), std::span<const Value>(&arg, 1));
+        ev::CallResult r = ev::call(job.onToken.get(), ev::undefined(), std::span<const Value>(&arg, 1));
+        if (r.thrown || (!ev::isUndefined(r.value) && !ev::toBool(r.value))) {
+            job.core->handle->cancelled.store(true, std::memory_order_release);
+            job.core->handle->notify();
+            break;
+        }
     }
 }
 
@@ -697,10 +703,14 @@ Value js_lm_generate(Value, std::span<const Value> a) {
     const Value& optsVal = haveOpts ? a[2] : noOpts;
 
     if (auto* w = hostLMModelOf(a[0])) {
+        if (!w->model || !w->weights_loaded)
+            return ev::throwError("generate: weights not loaded");
         std::vector<int32_t> prompt = readInt32Array(a[1]);
         if (prompt.empty())
             return ev::throwTypeError("generate: promptIds must be non-empty for LMModel");
         brolm::qwen::GenerateOptions opts = parseGenerateOptions(optsVal);
+        if (opts.max_new_tokens <= 0)
+            return ev::throwTypeError("generate: opts.maxNewTokens must be > 0");
         const int eos_id = haveOpts ? eosFor(*w, a[2]) : w->defaultEos;
         // The worker decodes against its own copy of the grammar, taken here
         // on the JS thread, so the JS Grammar object is never read off-thread.
@@ -741,6 +751,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
     };
 
     if (auto* q35 = hostQwen35ModelOf(a[0])) {
+        if (!q35->vlm) return ev::throwError("generate: weights not loaded");
         std::string prompt, err;
         brolm::qwen::GenerateOptions opts;
         std::vector<VlmImage> images;
@@ -753,6 +764,7 @@ Value js_lm_generate(Value, std::span<const Value> a) {
     }
 
     if (auto* qvl = hostQwen3VLModelOf(a[0])) {
+        if (!qvl->vlm) return ev::throwError("generate: weights not loaded");
         std::string prompt, err;
         brolm::qwen::GenerateOptions opts;
         std::vector<VlmImage> images;

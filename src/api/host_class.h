@@ -54,6 +54,8 @@ public:
     struct Slots {
         ev::Persistent* proto = nullptr;
         ev::Persistent* ctor = nullptr;
+        ev::Persistent* realmGlobal = nullptr;
+        std::string name;
     };
 
     void install(const char* name, uint32_t arity, ev::NativeFn body,

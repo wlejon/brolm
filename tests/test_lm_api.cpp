@@ -901,7 +901,13 @@ static void test_laya() {
                 throw new Error("stats: " + JSON.stringify(s));
             if (!Array.isArray(s.recentBatches) || s.recentBatches.length !== s.forwards)
                 throw new Error("stats.recentBatches");
+            const cfgBefore = laya.config();
             laya.dispose();
+            const cfgAfter = laya.config();
+            if (cfgAfter.vocab_size !== cfgBefore.vocab_size || cfgAfter.hidden_size !== cfgBefore.hidden_size ||
+                cfgAfter.num_layers !== cfgBefore.num_layers || cfgAfter.tokenizer !== cfgBefore.tokenizer) {
+                throw new Error("config() changed after dispose: " + JSON.stringify(cfgAfter));
+            }
             let threw = false;
             try { laya.predict("x", { a: { type: "noul", instructions: "?" } }); }
             catch (e) { threw = String(e.message).indexOf("disposed") >= 0; }
@@ -917,9 +923,47 @@ static void test_laya() {
     std::cout << "  async: " << ev::toUtf8(res.value) << std::endl;
 }
 
+static void test_generate_and_cancel() {
+    struct FakeDecoder final : brolm::api::LMDecoder {
+        const char* family() const override { return "fake"; }
+        int vocabSize() const override { return 8; } int hiddenSize() const override { return 8; }
+        int numLayers() const override { return 1; } int maxSeqLen() const override { return 64; }
+        int cacheLen() const override { return 0; } void allocateCache(int) override {} void resetCache() override {}
+        void forward(const int32_t*, int L, brotensor::Tensor& out) override { out = brotensor::Tensor::mat(L, 8); }
+        void forwardLast(const int32_t*, int, brotensor::Tensor& out) override { out = brotensor::Tensor::mat(1, 8); }
+    };
+    ev::Persistent unVal(brolm::api::g_lmModelClass.createInstance(std::make_unique<brolm::api::HostLMModel>()));
+    ev::setGlobalValue("__unloadedLM", unVal.get());
+    auto loaded = std::make_unique<brolm::api::HostLMModel>();
+    loaded->weights_loaded = true; loaded->model = std::make_unique<FakeDecoder>();
+    ev::Persistent ldVal(brolm::api::g_lmModelClass.createInstance(std::move(loaded)));
+    ev::setGlobalValue("__loadedLM", ldVal.get());
+    ev::CallResult r = bronze::eval::evalScript(R"JS(
+        (function() {
+            let err = null;
+            try { bro.lm.generate(__unloadedLM, [1, 2]); } catch (e) { err = e; }
+            if (!err || String(err.message).indexOf("weights not loaded") < 0) throw new Error("unloaded generate");
+            err = null;
+            try { bro.lm.generate(__loadedLM, [1, 2], { maxNewTokens: 0 }); } catch (e) { err = e; }
+            if (!(err instanceof TypeError)) throw new Error("maxNewTokens: 0 must throw TypeError");
+            let count = 0, doneInfo = null;
+            const h = bro.lm.generate(__loadedLM, [1, 2], {
+                maxNewTokens: 6, onToken: () => { count++; return false; }, onDone: (_ids, info) => { doneInfo = info; }
+            });
+            h.wait();
+            if (count !== 1 || !doneInfo || !doneInfo.cancelled) throw new Error("onToken return false failed");
+            return "OK";
+        })()
+    )JS");
+    if (r.thrown) {
+        std::cerr << "test_generate_and_cancel threw: " << errorMessage(r.value) << std::endl;
+        std::exit(1);
+    }
+    TEST_CHECK(ev::toUtf8(r.value) == "OK");
+}
+
 int main() {
     std::cout << "Running brolm API test..." << std::endl;
-
     ev::Realm* realm = ev::createRealm();
     {
         ev::RealmScope scope(realm);
@@ -930,13 +974,22 @@ int main() {
         test_async_handle();
         test_grammar();
         test_gemma_tokenizer_binding();
+        test_generate_and_cancel();
         test_generation_weights();
         test_modernbert();
         test_laya();
         brolm::api::shutdownLM();  // what bro's engine shutdown hook does
     }
     ev::destroyRealm(realm);
-
+    ev::Realm* realm2 = ev::createRealm();
+    {
+        ev::RealmScope scope(realm2);
+        brolm::api::installLM();
+        test_mounts();
+        test_grammar();
+        brolm::api::shutdownLM();
+    }
+    ev::destroyRealm(realm2);
     std::cout << "All brolm API tests passed!" << std::endl;
     return 0;
 }
