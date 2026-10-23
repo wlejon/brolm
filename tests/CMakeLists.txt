@@ -109,6 +109,15 @@ if(BROLM_ENABLE_API AND TARGET brolm_api)
     else()
         target_compile_options(brolm_test_api PRIVATE -Wall -Wextra)
     endif()
+
+    add_executable(brolm_test_verified_validator test_verified_validator.cpp)
+    target_link_libraries(brolm_test_verified_validator PRIVATE brolm_api bronze_runtime_shared)
+    if(MSVC)
+        target_compile_options(brolm_test_verified_validator PRIVATE /W4)
+    else()
+        target_compile_options(brolm_test_verified_validator PRIVATE -Wall -Wextra)
+    endif()
+
     # bronze's shared runtime is built into BRONZE_SHARED_RUNTIME_DIR, not
     # beside this executable, and the PE loader only looks beside the .exe
     # (0xc0000135 + a modal "dll was not found" otherwise). Stage it next to
@@ -132,19 +141,22 @@ if(BROLM_ENABLE_API AND TARGET brolm_api)
         message(STATUS "brolm: brolm_test_api not registered (brass has no code generator for this target)")
     else()
         add_test(NAME brolm_test_api COMMAND brolm_test_api)
+        add_test(NAME brolm_test_verified_validator COMMAND brolm_test_verified_validator)
         # The same binding test under bronze's GC stress oracle: a collection
         # on every allocation, from-space poisoned afterwards, so a Value held
         # across an allocating embed call crashes or reads garbage here
         # instead of passing by luck. `ctest -LE gcstress` skips it.
         add_test(NAME brolm_test_api_gcstress COMMAND brolm_test_api)
         set_tests_properties(brolm_test_api_gcstress PROPERTIES LABELS gcstress)
+        add_test(NAME brolm_test_verified_validator_gcstress COMMAND brolm_test_verified_validator)
+        set_tests_properties(brolm_test_verified_validator_gcstress PROPERTIES LABELS gcstress)
         if(WIN32)
-            set_tests_properties(brolm_test_api PROPERTIES
+            set_tests_properties(brolm_test_api brolm_test_verified_validator PROPERTIES
                 ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brolm_test_api>;$ENV{PATH}")
-            set_tests_properties(brolm_test_api_gcstress PROPERTIES
+            set_tests_properties(brolm_test_api_gcstress brolm_test_verified_validator_gcstress PROPERTIES
                 ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brolm_test_api>;$ENV{PATH}")
         else()
-            set_tests_properties(brolm_test_api_gcstress PROPERTIES
+            set_tests_properties(brolm_test_api_gcstress brolm_test_verified_validator_gcstress PROPERTIES
                 ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1")
         endif()
     endif()

@@ -26,6 +26,7 @@ void installLM() {
     registerLMLayaClasses();
     registerLMGrammarClass();
     registerLMModernBertClass();
+    registerLMVerifiedValidatorClass();
 
     // Every Value below that outlives an allocating call rides in a
     // Persistent (embed.h GC contract): getProperty, createObject and
@@ -74,6 +75,7 @@ void installLM() {
     lmObj.def("loadLayaAsync", 1, js_loadLayaAsync);
     lmObj.def("generate", 2, js_lm_generate);
     lmObj.def("tick", 0, js_lm_tick);
+    lmObj.def("createVerifiedValidator", 2, js_createVerifiedValidator);
 
     lmObj.set("QwenTokenizer", g_qwenTokenizerClass.constructor());
     lmObj.set("MistralTokenizer", g_mistralTokenizerClass.constructor());
@@ -89,6 +91,7 @@ void installLM() {
     lmObj.set("LayaModel", g_layaModelClass.constructor());
     lmObj.set("AsyncHandle", g_asyncHandleClass.constructor());
     lmObj.set("Grammar", g_grammarClass.constructor());
+    lmObj.set("VerifiedValidator", g_verifiedValidatorClass.constructor());
 
     // HostClass::install already put each constructor on globalThis
     // (setGlobalValue), so the namespace entries above are the only mounts.

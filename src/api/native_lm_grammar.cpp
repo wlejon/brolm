@@ -26,11 +26,15 @@ HostGrammar* hostGrammarPtr(Value v) {
     return static_cast<HostGrammar*>(g_grammarClass.unwrap(v));
 }
 
+}  // namespace
+
 Value makeGrammarValue(brolm::Grammar g) {
     auto w = std::make_unique<HostGrammar>();
     w->g = std::move(g);
     return g_grammarClass.createInstance(std::move(w));
 }
+
+namespace {
 
 // A factory taking one string argument.
 template <class F>

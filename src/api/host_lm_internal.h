@@ -275,6 +275,7 @@ extern HostClass g_t5ModelClass;
 extern HostClass g_layaModelClass;
 extern HostClass g_grammarClass;
 extern HostClass g_modernBertModelClass;
+extern HostClass g_verifiedValidatorClass;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Conversions and Helpers
@@ -381,6 +382,7 @@ inline std::vector<std::string> readStringArray(Value arr) {
 }
 
 const brolm::Grammar* hostGrammarOf(Value v);  // native_lm_grammar.cpp
+Value makeGrammarValue(brolm::Grammar g);      // native_lm_grammar.cpp
 
 inline brolm::qwen::GenerateOptions parseGenerateOptions(Value v) {
     brolm::qwen::GenerateOptions o;
@@ -759,12 +761,14 @@ void registerLMClipClasses();
 void registerLMLayaClasses();
 void registerLMGrammarClass();
 void registerLMModernBertClass();
+void registerLMVerifiedValidatorClass();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // bro.lm Namespace Bindings
 // ═══════════════════════════════════════════════════════════════════════════
 
 Value js_init(Value, std::span<const Value>);
+Value js_createVerifiedValidator(Value, std::span<const Value>);
 Value js_loadQwen(Value, std::span<const Value>);
 Value js_loadMistral(Value, std::span<const Value>);
 Value js_loadGemma2(Value, std::span<const Value>);

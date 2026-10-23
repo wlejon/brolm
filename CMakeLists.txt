@@ -92,6 +92,10 @@ target_link_libraries(brolm PUBLIC
 if(TARGET brass)
     target_link_libraries(brolm PUBLIC brass)
     target_compile_definitions(brolm PUBLIC BROLM_HAS_BRASS_JIT=1)
+    get_target_property(_brass_src_dir brass SOURCE_DIR)
+    if(_brass_src_dir)
+        target_include_directories(brolm PUBLIC $<BUILD_INTERFACE:${_brass_src_dir}/src>)
+    endif()
 endif()
 
 if(MSVC)
@@ -105,6 +109,8 @@ endif()
 target_sources(brolm PRIVATE
     src/version.cpp
     src/grammar.cpp
+    src/verified_validator.cpp
+    src/verified_validator_parser.cpp
     src/grammar/dfa_compiler.cpp
     src/grammar/vocab_indexer.cpp
     src/grammar/grammar_jit.cpp
