@@ -225,6 +225,9 @@ private:
         if (!div_guards_) return;
         uint32_t dw = ctx_.width(divisor);
         BVNodeId nz = ctx_.make_binary(BVOp::Ne, divisor, ctx_.make_const(0, dw), 1);
+        if (path_cond_ != 0 && path_cond_ != UINT32_MAX) {
+            nz = ctx_.make_binary(BVOp::Or, ctx_.make_unary(BVOp::Not, path_cond_, 1), nz, 1);
+        }
         if (*div_guards_ == 0 || *div_guards_ == UINT32_MAX) {
             *div_guards_ = nz;
         } else {
@@ -232,19 +235,34 @@ private:
         }
     }
 
+    BVNodeId push_path_cond(BVNodeId extra_cond) {
+        BVNodeId saved = path_cond_;
+        if (extra_cond != 0 && extra_cond != UINT32_MAX) {
+            BVNodeId b = to_bool(extra_cond);
+            if (path_cond_ == 0 || path_cond_ == UINT32_MAX) path_cond_ = b;
+            else path_cond_ = ctx_.make_binary(BVOp::And, path_cond_, b, 1);
+        }
+        return saved;
+    }
+
     BVNodeId parse_ternary() {
         BVNodeId c = parse_logical_or();
         if (c == UINT32_MAX) return UINT32_MAX;
         if (peek().kind == TokKind::Question) {
             get();
+            BVNodeId cb = to_bool(c);
+            BVNodeId saved_t = push_path_cond(cb);
             BVNodeId t = parse_ternary();
+            path_cond_ = saved_t;
             if (t == UINT32_MAX) return UINT32_MAX;
             if (peek().kind != TokKind::Colon) {
                 fail("Expected ':' in ternary expression");
                 return UINT32_MAX;
             }
             get();
+            BVNodeId saved_f = push_path_cond(ctx_.make_unary(BVOp::Not, cb, 1));
             BVNodeId f = parse_ternary();
+            path_cond_ = saved_f;
             if (f == UINT32_MAX) return UINT32_MAX;
             uint32_t wt = ctx_.width(t), wf = ctx_.width(f);
             if (wt != wf) {
@@ -252,7 +270,7 @@ private:
                 t = to_word(t, tw);
                 f = to_word(f, tw);
             }
-            return ctx_.make_ite(to_bool(c), t, f);
+            return ctx_.make_ite(cb, t, f);
         }
         return c;
     }
@@ -261,9 +279,12 @@ private:
         BVNodeId lhs = parse_logical_and();
         while (lhs != UINT32_MAX && peek().kind == TokKind::PipePipe) {
             get();
+            BVNodeId lb = to_bool(lhs);
+            BVNodeId saved = push_path_cond(ctx_.make_unary(BVOp::Not, lb, 1));
             BVNodeId rhs = parse_logical_and();
+            path_cond_ = saved;
             if (rhs == UINT32_MAX) return UINT32_MAX;
-            lhs = ctx_.make_binary(BVOp::Or, to_bool(lhs), to_bool(rhs), 1);
+            lhs = ctx_.make_binary(BVOp::Or, lb, to_bool(rhs), 1);
         }
         return lhs;
     }
@@ -272,9 +293,12 @@ private:
         BVNodeId lhs = parse_bit_or();
         while (lhs != UINT32_MAX && peek().kind == TokKind::AmpAmp) {
             get();
+            BVNodeId lb = to_bool(lhs);
+            BVNodeId saved = push_path_cond(lb);
             BVNodeId rhs = parse_bit_or();
+            path_cond_ = saved;
             if (rhs == UINT32_MAX) return UINT32_MAX;
-            lhs = ctx_.make_binary(BVOp::And, to_bool(lhs), to_bool(rhs), 1);
+            lhs = ctx_.make_binary(BVOp::And, lb, to_bool(rhs), 1);
         }
         return lhs;
     }
@@ -552,6 +576,7 @@ private:
     const std::unordered_map<std::string, BVNodeId>& vars_;
     uint32_t w_ = 32;
     BVNodeId* div_guards_ = nullptr;
+    BVNodeId path_cond_ = 0;
     std::string* err_ = nullptr;
     size_t idx_ = 0;
 };

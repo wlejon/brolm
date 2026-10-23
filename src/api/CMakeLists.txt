@@ -10,6 +10,7 @@ add_library(brolm_api STATIC
     native_lm_grammar.cpp
     native_lm_modernbert.cpp
     native_lm_verified_validator.cpp
+    native_lm_synthesizer.cpp
 )
 
 target_include_directories(brolm_api PUBLIC

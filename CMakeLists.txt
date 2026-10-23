@@ -111,6 +111,7 @@ target_sources(brolm PRIVATE
     src/grammar.cpp
     src/verified_validator.cpp
     src/verified_validator_parser.cpp
+    src/verified_synthesizer.cpp
     src/grammar/dfa_compiler.cpp
     src/grammar/vocab_indexer.cpp
     src/grammar/grammar_jit.cpp

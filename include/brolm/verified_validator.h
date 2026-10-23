@@ -210,4 +210,105 @@ private:
     std::string predicate_label_ = "predicate";
 };
 
+// ─── Neuro-Symbolic Verified Function Synthesizer & Prover (Issue #150) ───────
+
+struct SynthesizeExample {
+    std::vector<int64_t> inputs;
+    int64_t expected_output = 0;
+};
+
+struct CounterexampleRecord {
+    std::vector<int64_t> inputs;
+    FieldMap params;
+    int64_t candidate_output = 0;
+    int64_t expected_output = 0;
+    bool has_expected_output = false;
+    std::string candidate_source;
+    std::string violation;
+};
+
+struct SynthesizeSpec {
+    std::string name = "synthesized";
+    std::vector<std::string> params;
+    std::vector<FieldConstraint> param_domains;
+    int64_t default_min = -4096;
+    int64_t default_max = 4096;
+    uint32_t bit_width = 32;
+
+    std::string precondition;
+    std::string postcondition;
+    std::string reference_expression;
+    std::string output_var = "out";
+
+    std::vector<SynthesizeExample> examples;
+    std::vector<std::string> candidates;
+
+    // Optional callback invoked on each CEGIS iteration with accumulated counterexamples
+    std::function<std::string(const std::vector<CounterexampleRecord>&, uint32_t)> synthesizer;
+
+    // Optional concrete oracle / postcondition checker (inputs, candidate_out) -> valid
+    std::function<bool(const std::vector<int64_t>&, int64_t)> concrete_postcondition;
+    std::function<int64_t(const std::vector<int64_t>&)> concrete_reference;
+
+    uint32_t max_cegis_iterations = 32;
+    uint32_t max_sat_conflicts = 20000;
+};
+
+struct SynthesizeResult {
+    bool verified = false;
+    std::string synthesized_source;
+    std::string expression;
+    std::vector<std::string> params;
+    uint32_t iterations = 0;
+    uint32_t smt_queries = 0;
+    std::vector<CounterexampleRecord> counterexamples_resolved;
+    std::string certificate_hash;
+    std::string error;
+};
+
+struct ProverProblemSpec {
+    VerifiedValidator validator;
+    std::string minimize_expr;
+    std::string maximize_expr;
+    std::vector<FieldMap> candidates;
+    std::function<FieldMap(const std::vector<FieldMap>&,
+                           const std::vector<std::string>&,
+                           uint32_t)> proposer;
+    RepairOptions repair_opts;
+};
+
+struct ProverResult {
+    bool solved = false;
+    bool valid = false;
+    FieldMap solution;
+    int64_t objective_value = 0;
+    bool has_objective = false;
+    uint32_t iterations = 0;
+    uint32_t smt_queries = 0;
+    std::vector<FieldMap> rejected_candidates;
+    std::vector<std::string> violations;
+    std::string certificate_hash;
+};
+
+// Extract the body expression and optional parameter names from a JS arrow/function
+// string (e.g. "(x, min, max) => x < min ? min : (x > max ? max : x)").
+bool extract_js_function_expression(std::string_view js_source,
+                                    std::vector<std::string>* out_params,
+                                    std::string* out_expr);
+
+// Evaluate a parsed symbolic expression on concrete parameter values.
+bool evaluate_bv_expression(std::string_view expr,
+                            const std::vector<std::string>& param_names,
+                            const std::vector<int64_t>& param_values,
+                            int64_t* out_value,
+                            uint32_t width = 32);
+
+// Run the Neuro-Symbolic CEGIS loop to synthesize and formally prove a JS function
+// against a bitvector postcondition, reference specification, and I/O examples.
+SynthesizeResult synthesize_verified_function(const SynthesizeSpec& spec);
+
+// Solve a neuro-symbolic constraint satisfaction / optimization problem using
+// VerifiedValidator + brass::verify::BVContext.
+ProverResult solve_with_prover(const ProverProblemSpec& problem);
+
 }  // namespace brolm

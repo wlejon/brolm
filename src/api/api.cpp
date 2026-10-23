@@ -76,6 +76,8 @@ void installLM() {
     lmObj.def("generate", 2, js_lm_generate);
     lmObj.def("tick", 0, js_lm_tick);
     lmObj.def("createVerifiedValidator", 2, js_createVerifiedValidator);
+    lmObj.def("synthesizeVerifiedFunction", 2, js_synthesizeVerifiedFunction);
+    lmObj.def("solveWithProver", 2, js_solveWithProver);
 
     lmObj.set("QwenTokenizer", g_qwenTokenizerClass.constructor());
     lmObj.set("MistralTokenizer", g_mistralTokenizerClass.constructor());

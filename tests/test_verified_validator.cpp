@@ -371,17 +371,180 @@ static void test_grammar_and_validator_composition() {
     TEST_CHECK(v.validate_json(rep.repaired_json).valid);
 }
 
+// ─── 7. C++ & JS Neuro-Symbolic Function Synthesizer & Prover (Issue #150) ────
+
+static void test_cpp_synthesizer_and_prover() {
+    std::cout << "[7/8] C++ synthesize_verified_function & solve_with_prover (Issue #150)..." << std::endl;
+
+    // Case A: CEGIS synthesis of clamp(x, min, max) with buggy initial candidates
+    brolm::SynthesizeSpec clamp_spec;
+    clamp_spec.name = "clamp";
+    clamp_spec.params = {"x", "min", "max"};
+    clamp_spec.default_min = -500;
+    clamp_spec.default_max = 500;
+    clamp_spec.precondition = "min <= max";
+    clamp_spec.postcondition =
+        "out >= min && out <= max && (x < min ? out == min : (x > max ? out == max : out == x))";
+    clamp_spec.candidates = {
+        "(x, min, max) => x",                                          // fails when x < min or x > max
+        "(x, min, max) => x < min ? min : x",                          // fails when x > max
+        "(x, min, max) => x < min ? min : (x > max ? max : x)"         // verified!
+    };
+
+    brolm::SynthesizeResult clamp_res = brolm::synthesize_verified_function(clamp_spec);
+    TEST_CHECK(clamp_res.verified);
+    TEST_CHECK(clamp_res.iterations == 3);
+    TEST_CHECK(clamp_res.counterexamples_resolved.size() == 2);
+    TEST_CHECK(!clamp_res.certificate_hash.empty());
+
+    // First counterexample should have x < min or x > max
+    const auto& cex0 = clamp_res.counterexamples_resolved[0];
+    TEST_CHECK(cex0.has_expected_output);
+    TEST_CHECK(cex0.candidate_output != cex0.expected_output);
+
+    // Second counterexample (for `x < min ? min : x`) must have x > max
+    const auto& cex1 = clamp_res.counterexamples_resolved[1];
+    TEST_CHECK(cex1.params.at("x") > cex1.params.at("max"));
+    TEST_CHECK(cex1.expected_output == cex1.params.at("max"));
+
+    // Case B: Division-by-zero hazard caught by BVContext div_guard and repaired
+    brolm::SynthesizeSpec div_spec;
+    div_spec.name = "safeDiv";
+    div_spec.params = {"a", "b"};
+    div_spec.default_min = -64;
+    div_spec.default_max = 64;
+    div_spec.postcondition = "b == 0 ? out == 0 : out == a / b";
+    div_spec.candidates = {
+        "(a, b) => a / b",                 // fails with division by zero when b == 0!
+        "(a, b) => b != 0 ? a / b : 0"     // verified!
+    };
+
+    brolm::SynthesizeResult div_res = brolm::synthesize_verified_function(div_spec);
+    TEST_CHECK(div_res.verified);
+    TEST_CHECK(div_res.iterations == 2);
+    TEST_CHECK(div_res.counterexamples_resolved.size() == 1);
+    TEST_CHECK(div_res.counterexamples_resolved[0].params.at("b") == 0);
+
+    // Case C: Prover optimization (minimize a + b subject to constraints)
+    brolm::ProverProblemSpec prob;
+    prob.validator.add_field(brolm::FieldConstraint::integer("a", 10, 100));
+    prob.validator.add_field(brolm::FieldConstraint::integer("b", 10, 100));
+    prob.validator.add_constraint("a < b && (b - a) % 8 == 0");
+    prob.minimize_expr = "a + b";
+    prob.candidates.push_back({{"a", 50}, {"b", 50}}); // invalid: a < b violated
+
+    brolm::ProverResult pres = brolm::solve_with_prover(prob);
+    TEST_CHECK(pres.solved);
+    TEST_CHECK(pres.valid);
+    TEST_CHECK(pres.has_objective);
+    // Minimum a >= 10, b > a with (b - a) % 8 == 0 is a = 10, b = 18 => a + b = 28
+    TEST_CHECK(pres.solution.at("a") == 10);
+    TEST_CHECK(pres.solution.at("b") == 18);
+    TEST_CHECK(pres.objective_value == 28);
+    TEST_CHECK(!pres.certificate_hash.empty());
+}
+
+static void test_js_synthesizer_and_prover_api() {
+    std::cout << "[8/8] Bronze JS API (bro.lm.synthesizeVerifiedFunction & bro.lm.solveWithProver)..." << std::endl;
+
+    run_js_checked("js_synthesize_verified_function_and_prover", R"JS(
+        function assert(cond, msg) {
+            if (!cond) throw new Error("Assertion failed: " + msg);
+        }
+
+        assert(typeof bro.lm.synthesizeVerifiedFunction === "function", "synthesizeVerifiedFunction mounted");
+        assert(typeof bro.lm.solveWithProver === "function", "solveWithProver mounted");
+
+        // 1. Interactive Neuro-Symbolic CEGIS loop with custom synthesizer callback
+        let synthCalls = 0;
+        const absRes = bro.lm.synthesizeVerifiedFunction({
+            name: "verifiedAbs",
+            params: ["x"],
+            min: -1000,
+            max: 1000,
+            postcondition: (x, out) => out >= 0 && (x >= 0 ? out === x : out === -x),
+            synthesizer: (counterexamples, iter) => {
+                synthCalls = synthCalls + 1;
+                if (counterexamples.length === 0) {
+                    // Iteration 0: naive buggy LLM hypothesis
+                    return "(x) => x";
+                }
+                const cex = counterexamples[counterexamples.length - 1];
+                if (cex.params.x < 0 && cex.candidateOutput < 0) {
+                    // Iteration 1: partial fix (still wrong for negative x, returns 0)
+                    return "(x) => x < 0 ? 0 : x";
+                }
+                // Iteration 2: exact fix informed by expectedOutput === -x
+                return "(x) => x < 0 ? -x : x";
+            }
+        });
+
+        assert(absRes.verified === true, "absRes verified");
+        assert(typeof absRes.fn === "function", "absRes.fn is callable");
+        assert(synthCalls === 3, "synthesizer called 3 times");
+        assert(absRes.iterations === 3, "3 CEGIS iterations");
+        assert(absRes.counterexamplesResolved.length === 2, "2 counterexamples resolved");
+        assert(absRes.certificateHash.length === 64, "64-hex certificateHash");
+        assert(absRes.fn(-42) === 42, "absRes.fn(-42) === 42");
+        assert(absRes.fn(0) === 0, "absRes.fn(0) === 0");
+        assert(absRes.fn(99) === 99, "absRes.fn(99) === 99");
+
+        // 2. Automatic template synthesis for 3-arg clamp without custom synthesizer
+        const clampSynth = bro.lm.synthesizeVerifiedFunction({
+            name: "clamp3",
+            params: ["x", "lo", "hi"],
+            min: -256,
+            max: 256,
+            precondition: "lo <= hi",
+            postcondition: "out >= lo && out <= hi && (x < lo ? out === lo : (x > hi ? out === hi : out === x))",
+            candidates: [
+                (x, lo, hi) => x  // buggy seed candidate
+            ]
+        });
+        assert(clampSynth.verified === true, "clampSynth auto-synthesized after rejecting buggy seed");
+        assert(clampSynth.counterexamplesResolved.length >= 1, "buggy seed produced counterexample");
+        assert(clampSynth.fn(-50, 0, 100) === 0, "clamp3(-50, 0, 100) === 0");
+        assert(clampSynth.fn(50, 0, 100) === 50, "clamp3(50, 0, 100) === 50");
+        assert(clampSynth.fn(150, 0, 100) === 100, "clamp3(150, 0, 100) === 100");
+
+        // 3. bro.lm.solveWithProver with candidate repair + objective maximization
+        const proverRes = bro.lm.solveWithProver({
+            fields: {
+                workers: [1, 16],
+                batchSize: { min: 8, max: 64, alignment: 8 }
+            },
+            constraints: [
+                "workers * batchSize <= 128",
+                "workers >= 2"
+            ],
+            maximize: "workers * batchSize",
+            candidate: { workers: 10, batchSize: 32 } // invalid: 10 * 32 = 320 > 128
+        });
+
+        assert(proverRes.solved === true, "proverRes solved");
+        assert(proverRes.valid === true, "proverRes valid");
+        assert(proverRes.counterexamplesResolved.length === 1, "initial invalid candidate recorded");
+        assert(proverRes.solution.workers >= 2, "workers >= 2");
+        assert(proverRes.solution.batchSize % 8 === 0, "batchSize aligned to 8");
+        assert(proverRes.solution.workers * proverRes.solution.batchSize === 128, "maximized product === 128");
+        assert(proverRes.objectiveValue === 128, "objectiveValue === 128");
+        assert(proverRes.certificateHash.length === 64, "prover certificateHash present");
+    )JS");
+}
+
 int main() {
     test_bv_expression_parser();
     test_cpp_smt_repair();
     test_cpp_cegis_and_domain();
     test_cpp_unsat_detection();
+    test_cpp_synthesizer_and_prover();
 
     ev::Realm* realm = ev::createRealm();
     {
         ev::RealmScope scope(realm);
         brolm::api::installLM();
         test_js_verified_validator_api();
+        test_js_synthesizer_and_prover_api();
     }
     brolm::api::shutdownLM();
     ev::destroyRealm(realm);

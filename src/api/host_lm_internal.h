@@ -769,6 +769,8 @@ void registerLMVerifiedValidatorClass();
 
 Value js_init(Value, std::span<const Value>);
 Value js_createVerifiedValidator(Value, std::span<const Value>);
+Value js_synthesizeVerifiedFunction(Value, std::span<const Value>);
+Value js_solveWithProver(Value, std::span<const Value>);
 Value js_loadQwen(Value, std::span<const Value>);
 Value js_loadMistral(Value, std::span<const Value>);
 Value js_loadGemma2(Value, std::span<const Value>);
