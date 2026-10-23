@@ -163,7 +163,7 @@ int main() {
     }
     std::printf("[info] dtype histogram:");
     for (const auto& [d, n] : hist) {
-        std::printf(" %s=%d", dtype_name(d), n);
+        std::printf(" %s=%d", ::dtype_name(d), n);
     }
     std::printf("\n");
     CHECK(all_supported);  // every quant tensor must be Q4_K / Q6_K / Q8_0

@@ -32,6 +32,23 @@ struct CompiledDfa {
     }
 };
 
+// ─── Grammar Kernel Compilation & Disk Cache Statistics ─────────────────────
+
+struct GrammarKernelCacheStats {
+    size_t cache_hits = 0;
+    size_t cache_misses = 0;
+    size_t smt_guards_eliminated = 0;
+    size_t smt_queries_solved = 0;
+    size_t superopt_masks_elided = 0;
+    size_t superopt_extensions_elided = 0;
+    size_t superopt_dags_synthesized = 0;
+    size_t superopt_constants_synthesized = 0;
+    size_t superopt_lir_windows_optimized = 0;
+    size_t mir_functions_verified_equivalent = 0;
+    bool loaded_from_disk_cache = false;
+    std::string cache_file_path;
+};
+
 // ─── JIT Grammar Engine ──────────────────────────────────────────────────────
 
 class JitGrammar {
@@ -71,12 +88,19 @@ public:
     const CompiledDfa& dfa() const noexcept { return dfa_; }
     int32_t current_state() const noexcept { return current_state_; }
     bool is_jit_compiled() const noexcept { return mask_fn != nullptr && scan_fn != nullptr; }
+    bool is_loaded_from_disk_cache() const noexcept { return loaded_from_disk_cache_; }
+    brass::codegen::DfaFilterTokensFn filter_fn() const noexcept { return filter_fn_; }
 
     // Optional precomputation of token validity masks across all states
     void precompute_vocab(const std::vector<std::string>& vocab_tokens);
 
     // Direct access to internal VocabIndexer (for testing/introspection)
     VocabIndexer* vocab_indexer() const noexcept { return vocab_indexer_.get(); }
+
+    // Persistent on-disk AOT kernel cache introspection and test hooks
+    static GrammarKernelCacheStats kernel_cache_stats();
+    static std::string kernel_cache_path();
+    static void reset_kernel_cache_for_testing();
 
 private:
     CompiledDfa dfa_;
@@ -86,7 +110,9 @@ private:
     brass::codegen::KernelFunction mask_kfn_;
     brass::codegen::KernelFunction scan_kfn_;
     brass::codegen::KernelFunction filter_kfn_;
+    std::shared_ptr<void> aot_lib_;
     brass::codegen::DfaFilterTokensFn filter_fn_ = nullptr;
+    bool loaded_from_disk_cache_ = false;
 
     void compile_kernels();
 };

@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <limits>
 #include <random>
 #include <string>
@@ -461,6 +463,161 @@ void test_vocab_cache_keyed_on_content() {
     CHECK(!idx.same_vocab(va_short));
 }
 
+// ─── 6. Superoptimization, Equivalence Verification & On-Disk AOT Cache ──────
+
+static void set_env_var(const char* name, const std::string& val) {
+#if defined(_WIN32)
+    _putenv_s(name, val.c_str());
+#else
+    setenv(name, val.c_str(), 1);
+#endif
+}
+
+void test_superopt_and_disk_cache() {
+    std::printf("Running test_superopt_and_disk_cache...\n");
+
+    std::error_code ec;
+    std::filesystem::path tmp_cache_dir =
+        std::filesystem::temp_directory_path(ec) /
+        ("brolm_test_kernel_cache_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::remove_all(tmp_cache_dir, ec);
+    std::filesystem::create_directories(tmp_cache_dir, ec);
+
+    set_env_var("BRO_LM_CACHE_DIR", tmp_cache_dir.string());
+    JitGrammar::reset_kernel_cache_for_testing();
+
+    GrammarGraph graph;
+    int rule_id = graph.add_rule("root");
+    graph.root_rule_id = rule_id;
+    RegexCompiler compiler("[a-zA-Z_][a-zA-Z0-9_]*", graph, rule_id);
+    auto [entry, exit] = compiler.compile();
+    graph.rules[rule_id].entry_state = entry;
+    graph.rules[rule_id].exit_state = exit;
+    CompiledDfa dfa = DfaCompiler::compile(graph);
+    CHECK(dfa.is_valid());
+
+    // 1. Cold launch (cache miss): builds MIR, runs SMT guard elim + superopt,
+    //    verifies equivalence, and writes AOT shared library to disk cache.
+    auto t_cold0 = std::chrono::high_resolution_clock::now();
+    JitGrammar cold_jit(dfa);
+    auto t_cold1 = std::chrono::high_resolution_clock::now();
+    double cold_ms = std::chrono::duration<double, std::milli>(t_cold1 - t_cold0).count();
+
+    CHECK(cold_jit.is_jit_compiled());
+    CHECK(cold_jit.mask_fn != nullptr);
+    CHECK(cold_jit.scan_fn != nullptr);
+    CHECK(cold_jit.filter_fn() != nullptr);
+    CHECK(!cold_jit.is_loaded_from_disk_cache());
+
+    GrammarKernelCacheStats cold_stats = JitGrammar::kernel_cache_stats();
+    CHECK_EQ(cold_stats.cache_misses, size_t{1});
+    CHECK_EQ(cold_stats.cache_hits, size_t{0});
+    CHECK(!cold_stats.loaded_from_disk_cache);
+    CHECK(!cold_stats.cache_file_path.empty());
+    CHECK(std::filesystem::exists(cold_stats.cache_file_path, ec));
+    // Verify all 3 grammar kernels were formally proven equivalent by SMT QF_BV
+    CHECK_EQ(cold_stats.mir_functions_verified_equivalent, size_t{3});
+    // Verify superoptimizer rewrote redundant bitmasks and power-of-two umod DAGs
+    CHECK(cold_stats.superopt_masks_elided + cold_stats.superopt_dags_synthesized > 0);
+
+    // 2. Warm launch (cache hit): reset in-memory state and reload from disk cache
+    JitGrammar::reset_kernel_cache_for_testing();
+
+    auto t_warm0 = std::chrono::high_resolution_clock::now();
+    JitGrammar warm_jit(dfa);
+    auto t_warm1 = std::chrono::high_resolution_clock::now();
+    double warm_ms = std::chrono::duration<double, std::milli>(t_warm1 - t_warm0).count();
+
+    std::printf("  [CACHE] Cold superopt+AOT build: %.2f ms | Warm disk-cache load: %.3f ms\n",
+                cold_ms, warm_ms);
+
+    CHECK(warm_jit.is_jit_compiled());
+    CHECK(warm_jit.mask_fn != nullptr);
+    CHECK(warm_jit.scan_fn != nullptr);
+    CHECK(warm_jit.filter_fn() != nullptr);
+    CHECK(warm_jit.is_loaded_from_disk_cache());
+
+    GrammarKernelCacheStats warm_stats = JitGrammar::kernel_cache_stats();
+    CHECK_EQ(warm_stats.cache_hits, size_t{1});
+    CHECK_EQ(warm_stats.cache_misses, size_t{0});
+    CHECK(warm_stats.loaded_from_disk_cache);
+    CHECK_EQ(warm_stats.cache_file_path, cold_stats.cache_file_path);
+
+    // 3. Verify bit-exact numerical identity of all 3 kernels (cold JIT vs warm AOT .so):
+    // 3a. brolm_dfa_scan across varied string inputs (including unrolled + tail lengths)
+    const std::vector<std::string> scan_inputs = {
+        "", "a", "ab", "abc", "abcd", "abcde", "abcdefghi",
+        "_ident_1234567890", "9invalid", "valid_then_!bad", "x_0_1_2_3_4_5"
+    };
+    for (const auto& s : scan_inputs) {
+        for (int32_t st = -1; st < dfa.num_states; ++st) {
+            int32_t r_cold = cold_jit.scan_fn(
+                dfa.transition_table.data(), st,
+                reinterpret_cast<const uint8_t*>(s.data()), s.size());
+            int32_t r_warm = warm_jit.scan_fn(
+                dfa.transition_table.data(), st,
+                reinterpret_cast<const uint8_t*>(s.data()), s.size());
+            CHECK_EQ(r_cold, r_warm);
+        }
+    }
+
+    // 3b. brolm_dfa_filter across packed token batches
+    std::vector<std::string> vocab = {
+        "alpha", "beta_2", "123bad", "_ok", "!no", "gamma3", "delta_4",
+        "99", "x", "y_", "z12345", "$bad", "ident_long_token_name"
+    };
+    while (vocab.size() < 263) {
+        vocab.push_back((vocab.size() % 3 == 0) ? ("tok_" + std::to_string(vocab.size()))
+                                                : ("#" + std::to_string(vocab.size())));
+    }
+    VocabIndexer indexer(vocab);
+    size_t mask_words = (vocab.size() + 63) / 64;
+    std::vector<uint64_t> filter_cold(mask_words, 0);
+    std::vector<uint64_t> filter_warm(mask_words, 0);
+
+    for (int32_t st = -1; st < dfa.num_states; ++st) {
+        cold_jit.filter_fn()(
+            dfa.transition_table.data(), st,
+            indexer.token_offsets().data(),
+            reinterpret_cast<const uint8_t*>(indexer.token_bytes().data()),
+            vocab.size(), filter_cold.data());
+        warm_jit.filter_fn()(
+            dfa.transition_table.data(), st,
+            indexer.token_offsets().data(),
+            reinterpret_cast<const uint8_t*>(indexer.token_bytes().data()),
+            vocab.size(), filter_warm.data());
+        CHECK(filter_cold == filter_warm);
+    }
+
+    // 3c. brolm_logit_mask across all-valid (0xFF), all-invalid (0x00), mixed, and scalar tail
+    constexpr size_t kTestVocab = 263;
+    std::mt19937 rng(1337);
+    std::uniform_real_distribution<float> fdist(-20.0f, 20.0f);
+    std::vector<float> base_logits(kTestVocab);
+    for (size_t i = 0; i < kTestVocab; ++i) base_logits[i] = fdist(rng);
+
+    std::vector<uint64_t> bitmask((kTestVocab + 63) / 64);
+    bitmask[0] = 0xFFFFFFFFFFFFFFFFULL; // all-valid 0xFF chunks
+    bitmask[1] = 0x0000000000000000ULL; // all-invalid 0x00 chunks
+    bitmask[2] = 0xAA55F00F12345678ULL; // mixed chunks
+    bitmask[3] = 0x00FF817E3C5AA5C3ULL; // mixed + zero + full chunks
+    bitmask[4] = 0x55ULL;               // scalar tail (263 % 8 == 7)
+
+    std::vector<float> logits_cold = base_logits;
+    std::vector<float> logits_warm = base_logits;
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    cold_jit.mask_fn(logits_cold.data(), bitmask.data(), kTestVocab, neg_inf);
+    warm_jit.mask_fn(logits_warm.data(), bitmask.data(), kTestVocab, neg_inf);
+
+    for (size_t i = 0; i < kTestVocab; ++i) {
+        CHECK_EQ(std::memcmp(&logits_cold[i], &logits_warm[i], sizeof(float)), 0);
+    }
+
+    std::filesystem::remove_all(tmp_cache_dir, ec);
+}
+
 // ─── Main Driver ─────────────────────────────────────────────────────────────
 
 int main() {
@@ -472,6 +629,7 @@ int main() {
     test_jit_grammar_lifecycle();
     test_logit_masking_correctness();
     test_vocab_cache_keyed_on_content();
+    test_superopt_and_disk_cache();
     test_latency_benchmark();
 
     if (g_failures > 0) {
