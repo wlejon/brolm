@@ -332,7 +332,9 @@ inline bool propNumber(Value obj, std::string_view key, double& out) {
     if (!ev::isObject(obj)) return false;
     Value v = ev::getProperty(obj, key);
     if (!ev::isNumber(v)) return false;
-    out = ev::toDouble(v);
+    const double d = ev::toDouble(v);
+    if (!std::isfinite(d)) return false;
+    out = d;
     return true;
 }
 

@@ -74,7 +74,9 @@ bool numProp(Value obj, const char* camel, const char* snake, double& out) {
     Value v = ev::getProperty(o.get(), camel);
     if (!ev::isNumber(v) && snake) v = ev::getProperty(o.get(), snake);
     if (!ev::isNumber(v)) return false;
-    out = ev::toDouble(v);
+    const double d = ev::toDouble(v);
+    if (!std::isfinite(d)) return false;
+    out = d;
     return true;
 }
 
