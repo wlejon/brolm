@@ -1,6 +1,5 @@
 add_library(brolm_api STATIC
     api.cpp
-    host_class.cpp
     native_lm_tokenizer.cpp
     native_lm_model.cpp
     native_lm_vl.cpp
