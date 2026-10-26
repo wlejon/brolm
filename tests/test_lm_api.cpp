@@ -962,6 +962,8 @@ static void test_generate_and_cancel() {
     TEST_CHECK(ev::toUtf8(r.value) == "OK");
 }
 
+void runAccessGateTests();  // test_lm_api_gate.cpp
+
 int main() {
     std::cout << "Running brolm API test..." << std::endl;
     ev::Realm* realm = ev::createRealm();
@@ -978,6 +980,7 @@ int main() {
         test_generation_weights();
         test_modernbert();
         test_laya();
+        runAccessGateTests();
         brolm::api::shutdownLM();  // what bro's engine shutdown hook does
     }
     ev::destroyRealm(realm);

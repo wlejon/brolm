@@ -352,6 +352,7 @@ Value js_loadTokenizer(Value, std::span<const Value> a) {
     try {
         if (ev::isString(a[0])) {
             std::string p = resolvePath(ev::toUtf8(a[0]));
+            if (PathRefusal r = checkReadAccess({p})) return throwRefusal(r);
             auto tok = std::make_unique<brolm::qwen::Tokenizer>(
                 brolm::qwen::Tokenizer::from_tokenizer_json(p));
             return makeQwenTokenizerValue(std::move(tok));
@@ -360,14 +361,19 @@ Value js_loadTokenizer(Value, std::span<const Value> a) {
         // a[0] is a rooted argument slot, current across each read.
         std::string vocab, merges, tokJson;
         if (propString(a[0], "vocabPath", vocab) && propString(a[0], "mergesPath", merges)) {
+            vocab = resolvePath(vocab);
+            merges = resolvePath(merges);
+            if (PathRefusal r = checkReadAccess({vocab, merges})) return throwRefusal(r);
             auto tok = std::make_unique<brolm::qwen::Tokenizer>(
-                brolm::qwen::Tokenizer::load(resolvePath(vocab), resolvePath(merges)));
+                brolm::qwen::Tokenizer::load(vocab, merges));
             return makeQwenTokenizerValue(std::move(tok));
         }
 
         if (propString(a[0], "tokenizerPath", tokJson)) {
+            tokJson = resolvePath(tokJson);
+            if (PathRefusal r = checkReadAccess({tokJson})) return throwRefusal(r);
             auto tok = std::make_unique<brolm::qwen::Tokenizer>(
-                brolm::qwen::Tokenizer::from_tokenizer_json(resolvePath(tokJson)));
+                brolm::qwen::Tokenizer::from_tokenizer_json(tokJson));
             return makeQwenTokenizerValue(std::move(tok));
         }
 
@@ -390,6 +396,7 @@ Value js_loadLlama3Tokenizer(Value, std::span<const Value> a) {
     if (path.empty())
         return ev::throwTypeError("loadLlama3Tokenizer: tokenizerPath required");
     path = resolvePath(path);
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
 
     try {
         auto tok = std::make_unique<brolm::llama3::Tokenizer>(

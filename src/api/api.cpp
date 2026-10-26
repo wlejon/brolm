@@ -1,6 +1,11 @@
 #include "api.h"
 #include "host_lm_internal.h"
 #include "object_builder.h"
+#include "embed/embed_access.h"
+
+#include <filesystem>
+#include <string_view>
+#include <system_error>
 
 namespace brolm::api {
 
@@ -16,6 +21,54 @@ void setPathResolver(std::function<std::string(const std::string&)> resolver) {
 std::string resolvePath(const std::string& path) {
     auto& r = pathResolverSlot();
     return r ? r(path) : path;
+}
+
+namespace {
+
+std::string gatePath(std::string_view resolved) {
+    std::filesystem::path p(std::u8string(resolved.begin(), resolved.end()));
+    std::error_code ec;
+    std::filesystem::path abs = std::filesystem::absolute(p, ec);
+    if (ec) abs = p;
+    const std::u8string u = abs.lexically_normal().u8string();
+    return std::string(u.begin(), u.end());
+}
+
+PathRefusal checkOne(std::string_view resolved) {
+    PathRefusal r;
+    if (resolved.empty()) return r;
+    r.path = gatePath(resolved);
+    r.message = ev::checkAccess(ev::AccessKind::Read, r.path);
+    return r;
+}
+
+} // namespace
+
+PathRefusal checkReadAccess(std::initializer_list<std::string_view> paths) {
+    if (!ev::accessGateActive()) return {};
+    for (std::string_view p : paths) {
+        if (PathRefusal r = checkOne(p)) return r;
+    }
+    return {};
+}
+
+PathRefusal checkReadAccess(const std::vector<std::string>& paths) {
+    if (!ev::accessGateActive()) return {};
+    for (const std::string& p : paths) {
+        if (PathRefusal r = checkOne(p)) return r;
+    }
+    return {};
+}
+
+Value throwRefusal(const PathRefusal& refusal) {
+    return ev::throwAccessError(refusal.message, "EACCES", refusal.path);
+}
+
+Value rejectWithRefusal(Value promise, const PathRefusal& refusal) {
+    ev::Persistent p(promise);
+    ev::Persistent err(ev::newAccessError(refusal.message, "EACCES", refusal.path));
+    ev::rejectPromise(p.get(), err.get());
+    return p.get();
 }
 
 void installLM() {

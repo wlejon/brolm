@@ -224,6 +224,7 @@ static Value loadVlm(std::span<const Value> a, const char* what,
     if (a.empty() || !ev::isString(a[0]))
         return ev::throwTypeError(std::string(what) + "(checkpointDir, opts?): dir string required");
     const std::string dir = resolvePath(ev::toUtf8(a[0]));
+    if (PathRefusal r = checkReadAccess({dir})) return throwRefusal(r);
 
     brotensor::init();
     brotensor::Device dev = autoDevice();

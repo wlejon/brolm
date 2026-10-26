@@ -100,7 +100,9 @@ target_compile_definitions(brolm_test_laya_parity PRIVATE
 # a nonexistent path with a throw, tokenizer construction from a missing
 # file. No weights, no CUDA.
 if(BROLM_ENABLE_API AND TARGET brolm_api)
-    add_executable(brolm_test_api test_lm_api.cpp)
+    # test_lm_api_gate.cpp: every loader under a refusing access gate
+    # (embed/embed_access.h), run from test_lm_api.cpp's main.
+    add_executable(brolm_test_api test_lm_api.cpp test_lm_api_gate.cpp)
     target_link_libraries(brolm_test_api PRIVATE brolm_api bronze_runtime_shared)
     # Weights-gated sections look under <repo>/weights and skip when absent.
     target_compile_definitions(brolm_test_api PRIVATE BROLM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

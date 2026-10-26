@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -749,6 +750,23 @@ void shutdownLaya();
 // Path resolution for file loaders (api.h setPathResolver).
 void setPathResolver(std::function<std::string(const std::string&)> resolver);
 std::string resolvePath(const std::string& path);
+
+// The host's access gate (embed/embed_access.h; api.h, "Access"). A loader
+// asks about every path the app named, once resolved, before anything is
+// opened or stat'ed: Read for what it reads (a directory covers what is in
+// it). The gate is handed the path absolute and lexically normal, in UTF-8;
+// empty paths are skipped. A set PathRefusal carries the gate's sentence and
+// that path.
+struct PathRefusal {
+    std::string message, path;
+    explicit operator bool() const { return !message.empty(); }
+};
+PathRefusal checkReadAccess(std::initializer_list<std::string_view> paths);
+PathRefusal checkReadAccess(const std::vector<std::string>& paths);
+// The refusal thrown into the running program (Error, code EACCES, path).
+Value throwRefusal(const PathRefusal& refusal);
+// `promise` rejected with that Error.
+Value rejectWithRefusal(Value promise, const PathRefusal& refusal);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Registration Functions

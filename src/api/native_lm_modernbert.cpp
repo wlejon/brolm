@@ -240,6 +240,7 @@ Value js_loadModernBert(Value, std::span<const Value> a) {
             maxLength = static_cast<int>(d);
         }
     }
+    if (PathRefusal r = checkReadAccess({dir.string(), configPath, tokPath, weightsPath})) return throwRefusal(r);
     // The HF layout first, then a Laya checkpoint's encoder.
     if (configPath.empty()) configPath = firstExisting({dir / "config.json", dir / "encoder" / "config.json"});
     if (tokPath.empty()) tokPath = firstExisting({dir / "tokenizer.json", dir / "tokenizer" / "tokenizer.json"});

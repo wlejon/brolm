@@ -553,6 +553,7 @@ Value js_loadQwen(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isString(a[0]))
         return ev::throwTypeError("loadQwen(ggufPath, opts?): path string required");
     const std::string path = resolvePath(ev::toUtf8(a[0]));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
 
     brotensor::init();
     brotensor::Device dev = autoDevice();
@@ -589,9 +590,12 @@ Value js_loadMistral(Value, std::span<const Value> a) {
 
     if (!tokPath.empty()) {
         tokPath = resolvePath(tokPath);
+        if (PathRefusal r = checkReadAccess({path, tokPath})) return throwRefusal(r);
     } else {
+        if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
+        // The tekken.json beside the weights, when the gate allows reading it.
         std::filesystem::path tekken = std::filesystem::path(path).parent_path() / "tekken.json";
-        if (std::filesystem::exists(tekken)) tokPath = tekken.string();
+        if (!checkReadAccess({tekken.string()}) && std::filesystem::exists(tekken)) tokPath = tekken.string();
     }
     if (tokPath.empty())
         return ev::throwTypeError("loadMistral: opts.tokenizerPath (tekken.json) required");
@@ -606,6 +610,7 @@ Value js_loadGemma2(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isString(a[0]))
         return ev::throwTypeError("loadGemma2(modelDir, opts?): dir string required");
     const std::string dir = resolvePath(ev::toUtf8(a[0]));
+    if (PathRefusal r = checkReadAccess({dir})) return throwRefusal(r);
 
     brotensor::init();
     brotensor::Device dev = autoDevice();

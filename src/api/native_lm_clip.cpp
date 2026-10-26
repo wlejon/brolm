@@ -577,14 +577,17 @@ Value js_loadClip(Value, std::span<const Value> a) {
     std::string configPath;
     if (propString(opts, "configPath", configPath) || propString(opts, "config", configPath))
         configPath = resolvePath(configPath);
+    if (PathRefusal r = checkReadAccess({vocab, merges, weights, textPath, imagePath, projPath, configPath}))
+        return throwRefusal(r);
 
     if (configPath.empty()) {
+        // A config.json beside the weights, when the gate allows reading it.
         std::vector<std::string> probeCandidates = { weights, textPath, vocab };
         for (const auto& p : probeCandidates) {
             if (!p.empty()) {
                 std::filesystem::path parent = std::filesystem::path(p).parent_path();
                 std::filesystem::path cand = parent / "config.json";
-                if (std::filesystem::exists(cand)) {
+                if (!checkReadAccess({cand.string()}) && std::filesystem::exists(cand)) {
                     configPath = cand.string();
                     break;
                 }
@@ -652,6 +655,7 @@ Value js_loadNllb(Value, std::span<const Value> a) {
     if (a.empty() || !ev::isString(a[0]))
         return ev::throwTypeError("loadNllb(checkpointDir, opts?): dir string required");
     const std::string dir = resolvePath(ev::toUtf8(a[0]));
+    if (PathRefusal r = checkReadAccess({dir})) return throwRefusal(r);
 
     brotensor::init();
     brotensor::Device dev = autoDevice();
@@ -690,6 +694,8 @@ Value js_loadT5(Value, std::span<const Value> a) {
 
     if (gguf.empty() && weights.empty() && shards.empty())
         return ev::throwTypeError("loadT5: opts.ggufPath, opts.weightsPath, or opts.shards required");
+    if (PathRefusal r = checkReadAccess({tokPath, gguf, weights})) return throwRefusal(r);
+    if (PathRefusal r = checkReadAccess(shards)) return throwRefusal(r);
 
     std::string prefix = "";
     propString(opts, "prefix", prefix);

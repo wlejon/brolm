@@ -479,8 +479,10 @@ void decorateLayaModel(ObjectBuilder& b) {
 // on the first argument or come second:
 //   devices: "all" | number[] | number   (default: the default device)
 //   maxBatchTokens, targetForwardMs, deadlineMs, prewarm, maxLen, headMaxLen
+// A false return with `refused` set: the access gate refused the checkpoint
+// directory, before anything there was looked at.
 bool readLoadArgs(std::span<const Value> a, const char* what, std::string& path, laya::SchedulerOptions& so,
-                  std::string& err) {
+                  std::string& err, PathRefusal& refused) {
     if (a.empty()) {
         err = std::string(what) + ": path string required";
         return false;
@@ -527,6 +529,7 @@ bool readLoadArgs(std::span<const Value> a, const char* what, std::string& path,
         }
     }
     const std::string resolved = resolvePath(path);
+    if ((refused = checkReadAccess({resolved}))) return false;
     if (!std::filesystem::exists(resolved + "/model.safetensors")) {
         err = std::string(what) + ": no Laya checkpoint (model.safetensors) at " + resolved;
         return false;
@@ -548,7 +551,9 @@ Value makeLayaModelValue(std::shared_ptr<laya::Scheduler> sched) {
 Value js_loadLaya(Value, std::span<const Value> a) {
     std::string path, err;
     laya::SchedulerOptions so;
-    if (!readLoadArgs(a, "loadLaya", path, so, err)) {
+    PathRefusal refused;
+    if (!readLoadArgs(a, "loadLaya", path, so, err, refused)) {
+        if (refused) return throwRefusal(refused);
         return err.find("path string") != std::string::npos ? ev::throwTypeError(err) : ev::throwError(err);
     }
     try {
@@ -565,7 +570,9 @@ Value js_loadLayaAsync(Value, std::span<const Value> a) {
     ev::Persistent promise(ev::createPromise());
     std::string path, err;
     laya::SchedulerOptions so;
-    if (!readLoadArgs(a, "loadLayaAsync", path, so, err)) return layaRejectWith(promise.get(), err);
+    PathRefusal refused;
+    if (!readLoadArgs(a, "loadLayaAsync", path, so, err, refused))
+        return refused ? rejectWithRefusal(promise.get(), refused) : layaRejectWith(promise.get(), err);
     try {
         layaTrackLoad(promise.get(), std::make_shared<laya::Scheduler>(path, so));
     } catch (const std::exception& e) {
