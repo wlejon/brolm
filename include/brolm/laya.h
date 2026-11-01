@@ -198,8 +198,8 @@ public:
                                 const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& marker_pos);
 
-    // Enable / disable graph replay on a GPU with graph capture (default on; env
-    // BROLM_LAYA_GRAPHS=0 turns it off). Graphs are never used while profiling.
+    // Enable / disable graph replay on a GPU with graph capture (default on).
+    // Graphs are never used while profiling.
     void set_graphs_enabled(bool on);
     bool graphs_enabled() const;
     std::size_t cached_graphs() const;

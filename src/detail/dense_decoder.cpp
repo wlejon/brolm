@@ -376,28 +376,17 @@ bool DenseDecoder::try_graph_step_(int32_t token, bt::Tensor& logits_out) {
     if (!bt::graph_capture_available(bt::default_device())) return false;
     // Vulkan replays this step correctly (greedy ids identical to eager) but
     // gains nothing: its eager path already records into a command buffer and
-    // submits in batches (brotensor's BROTENSOR_VK_BATCH), so the graph only
+    // submits in batches of 128 commands, so the graph only
     // skips the host-side recording, and the capturable step trades the eager
     // decode's valid_len attention for flash_attention_decode_masked over the
     // whole cache capacity, which grows with max_seq_len. Qwen3-0.6B Q8_0 on
     // a Radeon 8060S: 5.02 vs 5.07 ms/token (64-token prompt), 5.93 vs 6.00
-    // (2048), 5.12 vs 4.92 (16) — noise. Anything but CUDA stays eager unless
-    // BROLM_DECODE_GRAPH=1.
-    if (bt::default_device().type != bt::DeviceType::CUDA) {
-        static const bool opt_in = [] {
-            const char* v = std::getenv("BROLM_DECODE_GRAPH");
-            return v != nullptr && v[0] == '1';
-        }();
-        if (!opt_in) return false;
-    }
+    // (2048), 5.12 vs 4.92 (16) — noise. Anything but CUDA stays eager.
+    if (bt::default_device().type != bt::DeviceType::CUDA) return false;
     // BROLM_PROFILE brackets every op in sync pairs — capturing those scopes
     // is illegal and pointless (profiling wants per-stage attribution, which
-    // a single graph launch hides). BROLM_NO_GRAPH is the explicit opt-out.
-    static const bool disabled = [] {
-        const char* v = std::getenv("BROLM_NO_GRAPH");
-        return v != nullptr && *v != '\0' && !(v[0] == '0' && v[1] == '\0');
-    }();
-    if (disabled || profile::enabled()) return false;
+    // a single graph launch hides).
+    if (profile::enabled()) return false;
     if (token < 0 || token >= cfg_.vocab_size) {
         fail("forward_last: token id out of range");
     }

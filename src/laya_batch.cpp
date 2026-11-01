@@ -89,11 +89,6 @@ int bucket_rows(int n) {
     return (n + step - 1) / step * step;
 }
 
-bool env_graphs_enabled() {
-    const char* e = std::getenv("BROLM_LAYA_GRAPHS");
-    return !(e && e[0] == '0');
-}
-
 // Pre-warm captures every token bucket up to the scheduler's budget (64 up to
 // 2048 rows, 80 up to 4096), so the cache must hold that many plus the odd
 // live shape whose item / marker counts overflow their floors.
@@ -119,7 +114,7 @@ struct DecisionModel::Arena {
 };
 
 struct DecisionModel::Batch {
-    bool graphs_on = env_graphs_enabled();
+    bool graphs_on = true;
     bool graphs_broken = false;
 
     std::shared_ptr<Arena> cur;  // where new work and new captures go
@@ -167,9 +162,8 @@ DecisionModel::Batch& DecisionModel::batch() {
         batch_ = std::make_unique<Batch>();
         // FP16 linears use brotensor's hybrid accumulation (16-term FP16
         // steps folded into FP32): ~5-8 % end to end, parity well inside
-        // tolerance. BROLM_LAYA_FAST_ACCUM=0 restores pure FP32 accumulation.
-        const char* e = std::getenv("BROLM_LAYA_FAST_ACCUM");
-        encoder_.set_fast_accum(!(e && e[0] == '0'));
+        // tolerance.
+        encoder_.set_fast_accum(true);
     }
     return *batch_;
 }
@@ -181,7 +175,7 @@ void DecisionModel::set_graphs_enabled(bool on) {
 }
 
 bool DecisionModel::graphs_enabled() const {
-    return batch_ ? (batch_->graphs_on && !batch_->graphs_broken) : env_graphs_enabled();
+    return batch_ ? (batch_->graphs_on && !batch_->graphs_broken) : true;
 }
 
 std::size_t DecisionModel::cached_graphs() const {

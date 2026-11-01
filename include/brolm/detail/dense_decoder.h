@@ -205,11 +205,10 @@ private:
     // lm_head). h_ holds the L-row residual stream on entry.
     void run_layers_encode_(int L, brotensor::Tensor& hidden_out);
 
-    // Graph-captured single-token decode (CUDA; Vulkan opt-in).
+    // Graph-captured single-token decode (CUDA).
     // try_graph_step_ runs one forward_last(ids, 1, ...) step through the
     // captured session and returns true, or returns false (no graph capture on
-    // the device, Vulkan without BROLM_DECODE_GRAPH=1, BROLM_NO_GRAPH,
-    // BROLM_PROFILE) so the caller falls back to the eager path. invalidate_graph_ drops the session whenever weights or
+    // the device, not CUDA, BROLM_PROFILE) so the caller falls back to the eager path. invalidate_graph_ drops the session whenever weights or
     // cache storage are replaced.
     bool try_graph_step_(int32_t token, brotensor::Tensor& logits_out);
     void invalidate_graph_();

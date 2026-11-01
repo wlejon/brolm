@@ -102,9 +102,6 @@ std::filesystem::path resolve_cache_directory() {
     if (const char* env_dir = std::getenv("BRO_LM_CACHE_DIR"); env_dir && env_dir[0] != '\0') {
         return std::filesystem::path(env_dir);
     }
-    if (const char* env_dir2 = std::getenv("BROLM_CACHE_DIR"); env_dir2 && env_dir2[0] != '\0') {
-        return std::filesystem::path(env_dir2);
-    }
 #if defined(_WIN32)
     if (const char* local_app = std::getenv("LOCALAPPDATA"); local_app && local_app[0] != '\0') {
         return std::filesystem::path(local_app) / "brolm" / "kernels";
