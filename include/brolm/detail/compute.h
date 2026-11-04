@@ -50,7 +50,7 @@ inline brotensor::Tensor upload_host(const float* src, int rows, int cols) {
 // linear as a separate WMMA op; the plain op is the FP32 path. Dispatch on
 // the weight dtype so one call site serves CPU and GPU. Quantized weight
 // dtypes (Q4_K / Q6_K / Q8_0) route through brotensor's fused-dequant
-// matmuls — GPU-only today.
+// matmuls on both CPU (FP16 or FP32 activations) and GPU (FP16 activations).
 inline void linear_batched(const brotensor::Tensor& W,
                            const brotensor::Tensor* bias,
                            const brotensor::Tensor& X,
@@ -83,6 +83,35 @@ inline void linear_batched(const brotensor::Tensor& W,
     brotensor::Tensor zero =
         brotensor::Tensor::zeros_on(W.device, W.rows, 1, W.dtype);
     brotensor::linear_forward_batched(W, zero, X, Y);
+}
+
+// Single-vector linear (GEMV): y(out, 1) = W(out, in) @ x(in, 1) + bias.
+// Quantized weight dtypes (Q4_K / Q6_K / Q8_0) route through brotensor's
+// GEMV ops on both CPU (FP16 or FP32 activations) and GPU (FP16 activations).
+inline void linear_vec(const brotensor::Tensor& W,
+                       const brotensor::Tensor* bias,
+                       const brotensor::Tensor& x,
+                       brotensor::Tensor& y) {
+    switch (W.dtype) {
+        case brotensor::Dtype::Q4_K:
+            brotensor::linear_forward_q4k_fp16(W, bias, x, y);
+            return;
+        case brotensor::Dtype::Q6_K:
+            brotensor::linear_forward_q6k_fp16(W, bias, x, y);
+            return;
+        case brotensor::Dtype::Q8_0:
+            brotensor::linear_forward_q8_0_fp16(W, bias, x, y);
+            return;
+        default:
+            break;
+    }
+    if (bias != nullptr) {
+        brotensor::linear_forward(W, *bias, x, y);
+        return;
+    }
+    brotensor::Tensor zero =
+        brotensor::Tensor::zeros_on(W.device, W.rows, 1, W.dtype);
+    brotensor::linear_forward(W, zero, x, y);
 }
 
 inline void linear_batched_accumulate(const brotensor::Tensor& W,

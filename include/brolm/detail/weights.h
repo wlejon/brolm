@@ -17,9 +17,8 @@
 //     for tensors whose downstream op has a quant-aware path (matmuls).
 //   - upload_compute_dequant: for tensors whose downstream op is dense-only
 //     (embedding lookup, RMSNorm gamma). Dense source: identical to
-//     upload_compute_checked. Quant gguf source: dequant_*_to_fp16 into a
-//     compute-dtype FP16 tensor. Quant with FP32 compute (CPU) is rejected
-//     with a clear error — the GPU is the only path that has dequant ops.
+//     upload_compute_checked. Quant gguf source: dequant_*_to_fp16 into FP16
+//     (or dequanted to FP16 and cast to FP32 when compute_dtype() is FP32 on CPU).
 //   - upload_compute_rope_permuted: same as upload_compute_checked, but
 //     applies the HF → interleaved-pair RoPE row permutation within each
 //     head's head_dim block. Dense path goes through an FP32 host roundtrip
@@ -68,10 +67,8 @@ public:
     // Like upload_compute_checked, but for tensors whose downstream op has
     // no quant kernel (embedding lookup, RMSNorm gamma). Dense source uploads
     // identically to upload_compute_checked. Quant gguf source is dequanted
-    // on-device into a FP16 tensor at the pipeline compute dtype. Throws a
-    // clear runtime_error if the source is a quant dtype but compute_dtype()
-    // is FP32 — brotensor's dequant ops are GPU-only today and the matmul
-    // path would already fail in that configuration.
+    // into a tensor at the pipeline compute dtype (FP16 directly on GPU, or
+    // dequanted to FP16 and cast to FP32 on CPU).
     virtual void upload_compute_dequant(const std::string& name,
                                         int rows, int cols,
                                         brotensor::Tensor& dst,
@@ -317,30 +314,30 @@ public:
             upload_dense_(info, rows, cols, dst, label);
             return;
         }
-        // Quant source. Dequant ops emit FP16 and are GPU-only.
-        if (brolm::compute_dtype() != brotensor::Dtype::FP16) {
-            throw std::runtime_error(
-                label + " ('" + info.name +
-                "'): quant source requires FP16 compute (GPU); "
-                "brotensor's dequant ops are not registered on CPU");
-        }
+        const brotensor::Dtype out_dt = brolm::compute_dtype();
         brotensor::Tensor raw;
         brotensor::gguf::upload_raw(info, rows, cols, raw);
+        brotensor::Tensor tmp_fp16;
+        brotensor::Tensor& fp16_dst =
+            (out_dt == brotensor::Dtype::FP16) ? dst : tmp_fp16;
         switch (info.dtype) {
             case brotensor::Dtype::Q8_0:
-                brotensor::dequant_q8_0_to_fp16(raw, dst);
-                return;
+                brotensor::dequant_q8_0_to_fp16(raw, fp16_dst);
+                break;
             case brotensor::Dtype::Q4_K:
-                brotensor::dequant_q4k_to_fp16(raw, dst);
-                return;
+                brotensor::dequant_q4k_to_fp16(raw, fp16_dst);
+                break;
             case brotensor::Dtype::Q6_K:
-                brotensor::dequant_q6k_to_fp16(raw, dst);
-                return;
+                brotensor::dequant_q6k_to_fp16(raw, fp16_dst);
+                break;
             default:
                 throw std::runtime_error(
                     label + " ('" + info.name +
                     "'): unsupported quant dtype for upload_compute_dequant "
                     "(expected Q4_K / Q6_K / Q8_0)");
+        }
+        if (out_dt != brotensor::Dtype::FP16) {
+            brotensor::cast(fp16_dst, dst, out_dt);
         }
     }
 

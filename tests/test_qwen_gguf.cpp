@@ -145,24 +145,9 @@ int main() {
         ++g_failures;
     }
 
-    // If any tensor was quantized and we're on the CPU backend, the forward
-    // would throw at the first matmul (no CPU quant kernels). In that case
-    // skip the forward checks but keep the config/tokenizer/load assertions.
-    bool any_quant = false;
-    for (const auto& info : f.tensors()) {
-        if (bt::dtype_is_quant(info.dtype)) { any_quant = true; break; }
-    }
-    const bool can_forward = weight_load_ok && (!any_quant ||
-                                                bt::default_device() != bt::Device::CPU);
-    if (!can_forward) {
-        std::printf("[skip] forward — quant tensors present and CPU backend "
-                    "has no quant matmul kernels yet\n");
-        if (g_failures) {
-            std::fprintf(stderr, "FAILED: %d check(s)\n", g_failures);
-            return 1;
-        }
-        std::printf("OK (load-only)\n");
-        return 0;
+    if (!weight_load_ok) {
+        std::fprintf(stderr, "FAILED: %d check(s)\n", g_failures);
+        return 1;
     }
 
     // ── Forward ───────────────────────────────────────────────────────────

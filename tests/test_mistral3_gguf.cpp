@@ -154,11 +154,9 @@ int main() {
 
     // ── Tensor-dtype histogram + support check ────────────────────────────
     std::map<bt::Dtype, int> hist;
-    bool any_quant = false;
     bool all_supported = true;
     for (const auto& info : f.tensors()) {
         ++hist[info.dtype];
-        if (bt::dtype_is_quant(info.dtype)) any_quant = true;
         if (!brolm_supports(info.dtype)) all_supported = false;
     }
     std::printf("[info] dtype histogram:");
@@ -172,14 +170,8 @@ int main() {
                              "dispatch — pick a Q4_K_M / Q6_K / Q8_0 quant\n");
     }
 
-    // The quant path (dequant for the embedding, quant matmuls) is GPU-only.
-    const bool can_run = !any_quant || bt::default_device() != bt::Device::CPU;
-    if (!can_run) {
-        std::printf("[skip] load/forward — quant tensors present and the CPU "
-                    "backend has no quant kernels (build with "
-                    "-DBROTENSOR_WITH_CUDA=ON to run the real load)\n");
+    if (!all_supported) {
         if (g_failures) { std::fprintf(stderr, "FAILED: %d\n", g_failures); return 1; }
-        std::printf("OK (config-only)\n");
         return 0;
     }
 
