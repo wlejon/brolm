@@ -102,7 +102,7 @@ jobs:
         run: cmake --build build --config Release --parallel 4
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure --parallel 4
+        run: ctest --test-dir build -C Release --output-on-failure
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
@@ -133,7 +133,7 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --parallel 4
+        run: ctest --test-dir build --output-on-failure
 
       # pipefail: piping gcovr into tee otherwise hands the step tee's exit
       # status, so a gcovr crash produces no report and the job still goes green.
