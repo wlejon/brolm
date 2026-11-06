@@ -567,14 +567,17 @@ struct CompiledKernels {
     }
 };
 
-static CompiledKernels g_kernels;
+static CompiledKernels& kernels() {
+    static auto* k = new CompiledKernels();
+    return *k;
+}
 #endif
 
 }  // namespace
 
 GrammarKernelCacheStats JitGrammar::kernel_cache_stats() {
 #if BROLM_HAS_BRASS_JIT
-    return g_kernels.get_stats();
+    return kernels().get_stats();
 #else
     return GrammarKernelCacheStats{};
 #endif
@@ -590,21 +593,22 @@ std::string JitGrammar::kernel_cache_path() {
 
 void JitGrammar::reset_kernel_cache_for_testing() {
 #if BROLM_HAS_BRASS_JIT
-    g_kernels.reset_for_testing();
+    kernels().reset_for_testing();
 #endif
 }
 
 void JitGrammar::compile_kernels() {
 #if BROLM_HAS_BRASS_JIT
-    g_kernels.ensure_initialized();
-    mask_kfn_ = g_kernels.mask_kfn;
-    scan_kfn_ = g_kernels.scan_kfn;
-    filter_kfn_ = g_kernels.filter_kfn;
-    aot_lib_ = g_kernels.aot_lib;
-    mask_fn = g_kernels.mask_fn;
-    scan_fn = g_kernels.scan_fn;
-    filter_fn_ = g_kernels.filter_fn;
-    loaded_from_disk_cache_ = g_kernels.stats.loaded_from_disk_cache;
+    auto& k = kernels();
+    k.ensure_initialized();
+    mask_kfn_ = k.mask_kfn;
+    scan_kfn_ = k.scan_kfn;
+    filter_kfn_ = k.filter_kfn;
+    aot_lib_ = k.aot_lib;
+    mask_fn = k.mask_fn;
+    scan_fn = k.scan_fn;
+    filter_fn_ = k.filter_fn;
+    loaded_from_disk_cache_ = k.stats.loaded_from_disk_cache;
 #endif
 }
 

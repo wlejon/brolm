@@ -10,6 +10,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  SCCACHE_GHA_ENABLED: "true"
+
 # Every job builds a plain clone, checked out under brolm/ with the build tree
 # beside it. Its dependencies — bromath, brotensor, broimage, and bronze (the
 # JavaScript runtime brolm_api binds, with brass, its code generator) — come
@@ -57,6 +62,16 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
+      - name: MSVC dev environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: ccache
         if: runner.os != 'Windows'
         uses: hendrikmuhs/ccache-action@v1.2
@@ -70,10 +85,15 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -S brolm -B build -DCMAKE_BUILD_TYPE=Release
+            cmake -S brolm -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           else
             cmake -S brolm -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           fi
         shell: bash
@@ -82,7 +102,7 @@ jobs:
         run: cmake --build build --config Release --parallel 4
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 4
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
@@ -113,7 +133,7 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --parallel 4
 
       # pipefail: piping gcovr into tee otherwise hands the step tee's exit
       # status, so a gcovr crash produces no report and the job still goes green.

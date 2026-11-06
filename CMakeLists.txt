@@ -11,17 +11,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Coverage. Scoped to a top-level build: a consumer that add_subdirectory()s
 # brolm has no business having its own build instrumented from in here.
 option(BROLM_COVERAGE "Instrument the build for gcov coverage (GCC/Clang)" OFF)
-if(BROLM_COVERAGE AND PROJECT_IS_TOP_LEVEL)
-    if(MSVC)
-        message(FATAL_ERROR
-            "BROLM_COVERAGE requires GCC or Clang (gcov instrumentation); MSVC is unsupported.")
-    endif()
-    add_compile_options(--coverage -O0 -g)
-    add_link_options(--coverage)
-    # Lets tests drop wall-clock bounds that instrumentation cannot meet.
-    add_compile_definitions(BROLM_COVERAGE_BUILD=1)
-    message(STATUS "brolm: coverage instrumentation ON (-O0)")
-endif()
 
 if(MSVC)
     add_compile_options(
@@ -67,6 +56,20 @@ bro_dependency(bronze GITHUB wlejon/bronze TARGET bronze_runtime_shared
 
 bro_dependency(brotensor GITHUB wlejon/brotensor)
 bro_dependency(broimage GITHUB wlejon/broimage)
+
+# Apply coverage instrumentation after dependencies so brass, bronze,
+# brotensor, and broimage compile uninstrumented.
+if(BROLM_COVERAGE AND PROJECT_IS_TOP_LEVEL)
+    if(MSVC)
+        message(FATAL_ERROR
+            "BROLM_COVERAGE requires GCC or Clang (gcov instrumentation); MSVC is unsupported.")
+    endif()
+    add_compile_options(--coverage -O0 -g)
+    add_link_options(--coverage)
+    # Lets tests drop wall-clock bounds that instrumentation cannot meet.
+    add_compile_definitions(BROLM_COVERAGE_BUILD=1)
+    message(STATUS "brolm: coverage instrumentation ON (-O0)")
+endif()
 
 
 # --- brolm library ---
