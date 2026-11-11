@@ -9,8 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  group: codeql-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 # brolm parses untrusted files for a living: safetensors and GGUF checkpoints
 # pulled from a hub, tokenizer vocab/merges JSON, model config JSON. Every one

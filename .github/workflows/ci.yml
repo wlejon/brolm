@@ -68,9 +68,24 @@ jobs:
         with:
           arch: x64
 
+      - name: Seed sccache tool cache (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARCH="x64"; ASSET="sccache-v0.19.0-x86_64-pc-windows-msvc.tar.gz"
+          DEST="$RUNNER_TOOL_CACHE/sccache/0.19.0/$ARCH"
+          mkdir -p "$DEST"
+          if (cd "$DEST" && gh release download v0.19.0 -R mozilla/sccache -p "$ASSET" -O "$ASSET" && tar -xzf "$ASSET" --strip-components=1 && rm -f "$ASSET"); then
+            touch "${DEST}.complete"
+          fi
+
       - name: sccache (Windows)
         if: runner.os == 'Windows'
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.19.0"
 
       - name: ccache
         if: runner.os != 'Windows'
@@ -160,18 +175,20 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          {
-            echo '## Coverage — `src/` + `include/brolm/`'
-            echo
-            echo 'The model tests skip without `weights/` (86 GB, gitignored), so this'
-            echo 'measures the self-contained tests only — the tokenizers, configs,'
-            echo 'samplers, and the loaders driven by synthetic safetensors fixtures.'
-            echo 'It understates the loading and generation paths accordingly.'
-            echo
-            echo '```'
-            cat coverage-summary.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f coverage-summary.txt ]; then
+            {
+              echo '## Coverage — `src/` + `include/brolm/`'
+              echo
+              echo 'The model tests skip without `weights/` (86 GB, gitignored), so this'
+              echo 'measures the self-contained tests only — the tokenizers, configs,'
+              echo 'samplers, and the loaders driven by synthetic safetensors fixtures.'
+              echo 'It understates the loading and generation paths accordingly.'
+              echo
+              echo '```'
+              cat coverage-summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload HTML report
         if: always()
