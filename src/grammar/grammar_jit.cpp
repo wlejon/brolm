@@ -1,6 +1,8 @@
 #include "brolm/grammar_jit.h"
 #include "grammar/vocab_indexer.h"
 
+#include <brass/cache/artifact_cache.hpp>
+#include <brass/cache/native_module_cache.hpp>
 #include <brass/codegen/grammar_builder.hpp>
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/codegen/linear_scan.hpp>
@@ -11,39 +13,19 @@
 #include <brass/mir/smt_guard_elim.hpp>
 #include <brass/mir/superopt.hpp>
 #include <brass/object/object_writer.hpp>
-#include <brass/target/aot_linker.hpp>
-#include <brass/target/dynamic_library.hpp>
 #include <brass/target/target.hpp>
 #include <brass/target/x64/x64_isel.hpp>
 #include <brass/verify/smt_equiv.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <process.h>
-#if defined(_M_X64) || defined(__x86_64__)
-#include <intrin.h>
-#endif
-#else
-#include <unistd.h>
-#if defined(__x86_64__)
-#include <cpuid.h>
-#endif
-#endif
 
 namespace brolm {
 
@@ -51,50 +33,8 @@ namespace {
 
 #if BROLM_HAS_BRASS_JIT
 
-constexpr uint32_t kGrammarKernelSchemaVersion = 2;
-
-uint32_t query_cpu_simd_mask() noexcept {
-    uint32_t mask = 0;
-#if defined(__x86_64__) && !defined(_WIN32)
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-        if (ecx & (1u << 20)) mask |= (1u << 0); // SSE4.2
-        if (ecx & (1u << 28)) mask |= (1u << 1); // AVX
-        if (ecx & (1u << 12)) mask |= (1u << 2); // FMA
-    }
-    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        if (ebx & (1u << 5))  mask |= (1u << 3); // AVX2
-        if (ebx & (1u << 16)) mask |= (1u << 4); // AVX512F
-    }
-#elif defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
-    int info[4] = {0, 0, 0, 0};
-    __cpuid(info, 1);
-    if (info[2] & (1 << 20)) mask |= (1u << 0); // SSE4.2
-    if (info[2] & (1 << 28)) mask |= (1u << 1); // AVX
-    if (info[2] & (1 << 12)) mask |= (1u << 2); // FMA
-    __cpuidex(info, 7, 0);
-    if (info[1] & (1 << 5))  mask |= (1u << 3); // AVX2
-    if (info[1] & (1 << 16)) mask |= (1u << 4); // AVX512F
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    mask |= (1u << 0); // ASIMD / NEON baseline
-#endif
-    return mask;
-}
-
-uint64_t fnv1a_update(uint64_t h, const void* data, size_t len) noexcept {
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < len; ++i) {
-        h ^= static_cast<uint64_t>(bytes[i]);
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-std::string host_shared_lib_extension(const brass::Target& t) {
-    if (t.is_windows()) return ".dll";
-    if (t.is_macos()) return ".dylib";
-    return ".so";
-}
+constexpr uint32_t kGrammarKernelSchemaVersion = 3;
+constexpr uint64_t kGrammarCacheMaxBytes = 64ULL * 1024 * 1024;
 
 std::filesystem::path resolve_cache_directory() {
     if (const char* env_dir = std::getenv("BRO_LM_CACHE_DIR"); env_dir && env_dir[0] != '\0') {
@@ -123,81 +63,34 @@ std::filesystem::path resolve_cache_directory() {
     return std::filesystem::path(".cache") / "brolm" / "kernels";
 }
 
-std::filesystem::path resolve_kernel_cache_path() {
-    const brass::Target host = brass::Target::host();
-    const uint32_t simd_mask = query_cpu_simd_mask();
-    const uint32_t abi_stamp = static_cast<uint32_t>(sizeof(brass::codegen::KernelOptions)) ^
-                               (static_cast<uint32_t>(sizeof(brass::object::CompiledFunctionInfo)) << 8) ^
-                               (static_cast<uint32_t>(host.pointer_size()) << 16) ^
-                               (static_cast<uint32_t>(host.stack_alignment()) << 24);
-
-    uint64_t hash = 14695981039346656037ULL;
-    const auto arch_val = static_cast<uint8_t>(host.arch());
-    const auto os_val = static_cast<uint8_t>(host.os());
-    const auto fmt_val = static_cast<uint8_t>(host.object_format());
-    hash = fnv1a_update(hash, &arch_val, sizeof(arch_val));
-    hash = fnv1a_update(hash, &os_val, sizeof(os_val));
-    hash = fnv1a_update(hash, &fmt_val, sizeof(fmt_val));
-    hash = fnv1a_update(hash, &simd_mask, sizeof(simd_mask));
-    hash = fnv1a_update(hash, &abi_stamp, sizeof(abi_stamp));
-    hash = fnv1a_update(hash, &kGrammarKernelSchemaVersion, sizeof(kGrammarKernelSchemaVersion));
+brass::cache::CacheKey build_grammar_client_key() {
     static constexpr std::string_view kSchemaSig =
-        "brolm_logit_mask:f32x8:v2;brolm_dfa_scan:u4:v2;brolm_dfa_filter:v2";
-    hash = fnv1a_update(hash, kSchemaSig.data(), kSchemaSig.size());
+        "brolm_logit_mask:f32x8:v3;brolm_dfa_scan:u4:v3;brolm_dfa_filter:v3";
+    return brass::cache::KeyBuilder("brolm.grammar_kernels/3")
+        .add_u64("schema_version", kGrammarKernelSchemaVersion)
+        .add("schema", kSchemaSig)
+        .finish();
+}
 
-    char fname[160];
-    std::snprintf(fname, sizeof(fname),
-                  "brolm_grammar_kernels_%.*s_%.*s_simd%02x_v%u_%016llx%s",
-                  static_cast<int>(brass::to_string(host.arch()).size()),
-                  brass::to_string(host.arch()).data(),
-                  static_cast<int>(brass::to_string(host.os()).size()),
-                  brass::to_string(host.os()).data(),
-                  simd_mask,
-                  kGrammarKernelSchemaVersion,
-                  static_cast<unsigned long long>(hash),
-                  host_shared_lib_extension(host).c_str());
-
-    return resolve_cache_directory() / fname;
+std::filesystem::path resolve_kernel_cache_path() {
+    brass::cache::ArtifactCache store(resolve_cache_directory(), kGrammarCacheMaxBytes);
+    brass::cache::NativeModuleCache cache(store);
+    const brass::cache::NativeOptions native_opts;
+    return store.path_for(cache.storage_key(build_grammar_client_key(), native_opts));
 }
 
 // Prepares a verification clone of a MIR function for fast, bit-exact QF_BV
 // equivalence checking:
-// 1. Expands `vstore(f32x8, ptr, off, vbroadcast(f32x8, scalar))` into scalar stores.
-// 2. Lowers each `load` / `load_indexed` site to a site-tagged uninterpreted call
-//    so the QF_BV equivalence checker proves index/address equivalence directly
-//    (`idx_before == idx_after`) without O(N^2) cross-array byte aliasing or 64x64
-//    multiplier bit-blasting on `scale = 4` / `scale = 8`.
+// Lowers power-of-two `umod` to bitwise mask and each `load` / `load_indexed`
+// site to a site-tagged uninterpreted call so the QF_BV equivalence checker
+// proves index/address/store equivalence directly without O(N^2) cross-array
+// byte aliasing or 64x64 multiplier bit-blasting on `scale = 4` / `scale = 8`.
 void prepare_function_for_smt_verification(brass::Function& fn, brass::Module& mod) {
     size_t load_site_id = 0;
     for (brass::BasicBlock* bb : fn.blocks()) {
         if (!bb) continue;
-        std::vector<brass::Instruction*> to_remove;
         for (brass::Instruction* inst = bb->head(); inst != nullptr; inst = inst->next()) {
-            if (inst->opcode() == brass::Opcode::vstore && inst->operand_count() >= 2) {
-                brass::Value* ptr = inst->operand(0);
-                brass::Value* vec_val = inst->operand(1);
-                if (vec_val && vec_val->is_instruction() &&
-                    vec_val->defining_instruction() &&
-                    vec_val->defining_instruction()->opcode() == brass::Opcode::vbroadcast &&
-                    vec_val->defining_instruction()->operand_count() >= 1) {
-                    brass::Value* scalar_val = vec_val->defining_instruction()->operand(0);
-                    brass::Type elem_t = scalar_val->type();
-                    size_t elem_bytes = elem_t.size_in_bytes();
-                    size_t vec_bytes = inst->memory_type().size_in_bytes();
-                    size_t lanes = (elem_bytes > 0) ? (vec_bytes / elem_bytes) : 0;
-                    int32_t base_off = inst->offset();
-                    for (size_t lane = 0; lane < lanes; ++lane) {
-                        auto* st = mod.arena().make<brass::Instruction>(
-                            brass::Opcode::store, brass::Type::void_type());
-                        st->set_memory_type(elem_t);
-                        st->set_offset(base_off + static_cast<int32_t>(lane * elem_bytes));
-                        st->add_operand(ptr);
-                        st->add_operand(scalar_val);
-                        bb->insert_before(st, inst);
-                    }
-                    to_remove.push_back(inst);
-                }
-            } else if (inst->opcode() == brass::Opcode::umod && inst->operand_count() >= 2) {
+            if (inst->opcode() == brass::Opcode::umod && inst->operand_count() >= 2) {
                 brass::Value* rhs = inst->operand(1);
                 if (rhs && rhs->is_instruction() && rhs->defining_instruction() &&
                     (rhs->defining_instruction()->opcode() == brass::Opcode::iconst_i64 ||
@@ -224,96 +117,19 @@ void prepare_function_for_smt_verification(brass::Function& fn, brass::Module& m
                 inst->set_symbol(sym);
             }
         }
-        for (brass::Instruction* inst : to_remove) {
-            bb->remove_instruction(inst);
-        }
-        std::vector<brass::Instruction*> dead_bcast;
-        for (brass::Instruction* inst = bb->head(); inst != nullptr; inst = inst->next()) {
-            if (inst->opcode() == brass::Opcode::vbroadcast) {
-                dead_bcast.push_back(inst);
-            }
-        }
-        for (brass::Instruction* inst : dead_bcast) {
-            bb->remove_instruction(inst);
-        }
     }
-}
-
-bool write_shared_library_atomically(const brass::object::ObjectFile& obj,
-                                     const std::filesystem::path& cache_path) {
-    std::error_code ec;
-    if (cache_path.has_parent_path()) {
-        std::filesystem::create_directories(cache_path.parent_path(), ec);
-        if (ec) return false;
-    }
-
-    brass::target::LinkerOptions linker_opts;
-    linker_opts.format = brass::target::OutputFormat::Auto;
-    linker_opts.module_name = cache_path.filename().string();
-    linker_opts.soname = cache_path.filename().string();
-    linker_opts.export_all_functions = true;
-
-    std::string link_err;
-    std::vector<uint8_t> image_bytes = brass::target::AotLinker::link(obj, linker_opts, &link_err);
-    if (image_bytes.empty()) {
-        return false;
-    }
-
-    static std::atomic<uint64_t> s_temp_nonce{0};
-#if defined(_WIN32)
-    const int pid = _getpid();
-#else
-    const int pid = static_cast<int>(getpid());
-#endif
-    const uint64_t nonce = ++s_temp_nonce;
-    std::filesystem::path tmp_path = cache_path;
-    tmp_path += ".tmp." + std::to_string(pid) + "_" + std::to_string(nonce);
-
-    {
-        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!ofs.is_open()) return false;
-        ofs.write(reinterpret_cast<const char*>(image_bytes.data()),
-                  static_cast<std::streamsize>(image_bytes.size()));
-        ofs.flush();
-        if (!ofs.good()) {
-            ofs.close();
-            std::filesystem::remove(tmp_path, ec);
-            return false;
-        }
-    }
-
-    std::filesystem::permissions(
-        tmp_path,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
-            std::filesystem::perms::owner_exec | std::filesystem::perms::group_read |
-            std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
-            std::filesystem::perms::others_exec,
-        std::filesystem::perm_options::replace, ec);
-
-#if defined(__APPLE__)
-    if (obj.target.is_macos()) {
-        std::string cmd = "codesign -s - -f \"" + tmp_path.string() + "\" > /dev/null 2>&1";
-        int res = std::system(cmd.c_str());
-        (void)res;
-    }
-#endif
-
-    std::filesystem::rename(tmp_path, cache_path, ec);
-    if (ec) {
-        std::filesystem::remove(tmp_path, ec);
-        return false;
-    }
-    return true;
 }
 
 struct CompiledKernels {
     brass::codegen::KernelFunction mask_kfn;
     brass::codegen::KernelFunction scan_kfn;
     brass::codegen::KernelFunction filter_kfn;
-    std::shared_ptr<brass::target::DynamicLibrary> aot_lib;
+    std::shared_ptr<void> aot_lib;
+    std::unique_ptr<brass::cache::ArtifactCache> disk_store;
+    std::unique_ptr<brass::cache::NativeModuleCache> native_cache;
     // Keep retired libraries/engines alive across test cache resets so any
     // previously constructed JitGrammar instances never hold dangling pointers.
-    std::vector<std::shared_ptr<brass::target::DynamicLibrary>> retired_libs;
+    std::vector<std::shared_ptr<void>> retired_libs;
     std::vector<brass::codegen::KernelFunction> retired_kfns;
 
     brass::codegen::LogitMaskFn mask_fn = nullptr;
@@ -330,6 +146,8 @@ struct CompiledKernels {
         if (mask_kfn.is_valid()) retired_kfns.push_back(std::move(mask_kfn));
         if (scan_kfn.is_valid()) retired_kfns.push_back(std::move(scan_kfn));
         if (filter_kfn.is_valid()) retired_kfns.push_back(std::move(filter_kfn));
+        native_cache.reset();
+        disk_store.reset();
         mask_fn = nullptr;
         scan_fn = nullptr;
         filter_fn = nullptr;
@@ -342,29 +160,147 @@ struct CompiledKernels {
         return stats;
     }
 
-    bool try_load_from_disk_cache(const std::filesystem::path& cache_path) {
-        std::error_code ec;
-        if (!std::filesystem::exists(cache_path, ec) || ec) {
-            return false;
+    bool build_grammar_module(const brass::Target& host,
+                              brass::Module& mod,
+                              brass::object::ObjectFile* out_obj) {
+        {
+            brass::codegen::GrammarBuilder gb(mod);
+            gb.build_logit_mask_function("brolm_logit_mask");
+            gb.build_dfa_scan_string_function("brolm_dfa_scan", 4);
+            gb.build_dfa_filter_tokens_function("brolm_dfa_filter");
         }
-        std::string err;
-        auto lib = brass::target::DynamicLibrary::open(cache_path.string(), &err);
-        if (!lib || !lib->is_valid()) {
-            return false;
+
+        // Clone unoptimized module for SMT formal equivalence verification
+        std::unique_ptr<brass::Module> unopt_mod = brass::clone_module(mod);
+
+        for (brass::Function* fn : mod.functions()) {
+            if (!fn || fn->blocks().empty()) continue;
+
+            // 2a. SMT relational guard & bounds-check elimination
+            brass::SmtGuardElimStats guard_stats;
+            brass::SmtGuardElimOptions guard_opts;
+            guard_opts.max_sat_conflicts = 1000;
+            guard_opts.stats = &guard_stats;
+            brass::run_smt_guard_elimination(*fn, mod, guard_opts);
+            stats.smt_guards_eliminated +=
+                guard_stats.guards_proven_eliminated +
+                guard_stats.comparisons_proven_true +
+                guard_stats.comparisons_proven_false +
+                guard_stats.branches_folded;
+            stats.smt_queries_solved += guard_stats.queries_solved;
+
+            // 2b. Solver-verified MIR superoptimization (mask elision, ext elision, DAG synthesis)
+            brass::SuperoptStats sopt_stats;
+            brass::SuperoptOptions sopt_opts;
+            sopt_opts.max_sat_conflicts = 1000;
+            sopt_opts.stats = &sopt_stats;
+            brass::run_mir_superopt(*fn, mod, sopt_opts);
+            stats.superopt_masks_elided += sopt_stats.masks_elided;
+            stats.superopt_extensions_elided += sopt_stats.extensions_elided;
+            stats.superopt_dags_synthesized += sopt_stats.dags_synthesized;
+            stats.superopt_constants_synthesized += sopt_stats.constants_synthesized;
         }
-        auto m_fn = lib->get_function<brass::codegen::LogitMaskFn>("brolm_logit_mask");
-        auto s_fn = lib->get_function<brass::codegen::DfaScanStringFn>("brolm_dfa_scan");
-        auto f_fn = lib->get_function<brass::codegen::DfaFilterTokensFn>("brolm_dfa_filter");
-        if (!m_fn || !s_fn || !f_fn) {
-            return false;
+
+        // 2c. Formal equivalence verification: Unopt MIR == Superopt MIR (with native SIMD & memory checks)
+        if (unopt_mod) {
+            for (const brass::Function* opt_fn : mod.functions()) {
+                if (!opt_fn || opt_fn->blocks().empty()) continue;
+                const brass::Function* unopt_fn = unopt_mod->get_function(opt_fn->name());
+                if (!unopt_fn) continue;
+
+                brass::Module v_before_mod("verify_before");
+                brass::Module v_after_mod("verify_after");
+                brass::Function* vb = brass::clone_function(*unopt_fn, v_before_mod);
+                brass::Function* va = brass::clone_function(*opt_fn, v_after_mod);
+                prepare_function_for_smt_verification(*vb, v_before_mod);
+                prepare_function_for_smt_verification(*va, v_after_mod);
+
+                brass::verify::EquivOptions fn_eq_opts;
+                fn_eq_opts.loop_unroll_bound = 1;
+                fn_eq_opts.max_paths = 16;
+                fn_eq_opts.max_sat_conflicts = 4000;
+                // prepare_function_for_smt_verification replaces read-only table loads with synthetic __verify_load_* calls.
+                fn_eq_opts.assume_calls_pure = true;
+                fn_eq_opts.check_memory = true;
+
+                brass::verify::EquivResult eq =
+                    brass::verify::verify_mir_equivalence(*vb, *va, fn_eq_opts);
+
+                if (eq.is_counterexample()) {
+                    throw std::runtime_error(
+                        "Grammar kernel MIR equivalence counterexample in " +
+                        std::string(opt_fn->name()) + ": " + eq.diagnostic);
+                }
+                if (eq.is_equivalent()) {
+                    stats.mir_functions_verified_equivalent++;
+                }
+            }
         }
-        aot_lib = std::shared_ptr<brass::target::DynamicLibrary>(std::move(lib));
-        mask_fn = m_fn;
-        scan_fn = s_fn;
-        filter_fn = f_fn;
-        stats.cache_hits++;
-        stats.loaded_from_disk_cache = true;
-        stats.cache_file_path = cache_path.string();
+
+        // 2d. Standard MIR scalar & loop optimizations (GVN, SCCP, LICM, IVSR, DCE) + verification
+        for (brass::Function* fn : mod.functions()) {
+            if (!fn || fn->blocks().empty()) continue;
+            brass::cfg_simplify_function(*fn);
+            fn->rebuild_cfg_predecessors();
+        }
+        brass::codegen::KernelOptions kopts;
+        kopts.opt_level = 2;
+        kopts.enable_optimizations = true;
+        kopts.enable_sroa = true;
+        kopts.enable_bce = true;
+        kopts.enable_smt_guard_elim = false; // already run with stats in Stage 2a
+        kopts.enable_superopt = false;       // already run with stats in Stage 2b
+        kopts.enable_avx2 = true;
+        kopts.enable_fma = true;
+        kopts.enable_fp_reassociation = false;
+        kopts.enable_vectorize = false; // GrammarBuilder already emits f32x8 vector loop
+        kopts.enable_slp = false;
+        kopts.enable_unroll = false;    // GrammarBuilder already unrolls scan 4x
+        kopts.enable_parallel = false;
+        brass::codegen::KernelJit::prepare_module(mod, kopts);
+        for (brass::Function* fn : mod.functions()) {
+            if (!fn || fn->blocks().empty()) continue;
+            fn->sort_blocks_rpo();
+            fn->rebuild_cfg_predecessors();
+        }
+
+        // 2e. x64 LIR peephole & window superoptimization verification
+        if (host.is_x64()) {
+            brass::CallingConvention cc = brass::CallingConvention::for_target(host);
+            for (const brass::Function* fn : mod.functions()) {
+                if (!fn || fn->blocks().empty()) continue;
+                brass::x64::X64ISel isel(host, cc);
+                isel.set_callee_module(&mod);
+                auto lir = isel.lower(*fn);
+                if (!lir) continue;
+                lir->sort_blocks_rpo();
+                brass::codegen::LivenessAnalysis liveness(*lir);
+                liveness.run();
+                brass::codegen::LinearScanAllocator regalloc(*lir, liveness, cc);
+                regalloc.allocate();
+                brass::codegen::run_lir_peephole_optimizations(*lir);
+
+                brass::SuperoptStats lir_stats;
+                brass::SuperoptOptions lir_opts;
+                lir_opts.max_sat_conflicts = 250;
+                lir_opts.stats = &lir_stats;
+                for (auto& blk : lir->blocks) {
+                    if (blk && blk->instructions.size() <= 16) {
+                        brass::run_x64_lir_superopt(*blk, lir_opts);
+                    }
+                }
+                stats.superopt_lir_windows_optimized += lir_stats.lir_windows_optimized;
+            }
+        }
+
+        mod.set_has_loop_optimizations(true);
+        if (out_obj) {
+            brass::object::ModuleCompiler compiler(host);
+            compiler.set_enable_mir_opts(false);
+            compiler.set_emit_stack_map_symbol(false);
+            compiler.set_x64_avx(host.is_x64() && brass::Target::host_has_avx());
+            *out_obj = compiler.compile(mod);
+        }
         return true;
     }
 
@@ -378,165 +314,70 @@ struct CompiledKernels {
             return;
         }
 
-        const std::filesystem::path cache_path = resolve_kernel_cache_path();
-        stats.cache_file_path = cache_path.string();
-
-        // 1. Fast warm start: load pre-superoptimized shared library from disk cache
-        if (try_load_from_disk_cache(cache_path)) {
-            initialized = true;
-            return;
+        const std::filesystem::path cache_dir = resolve_cache_directory();
+        if (!disk_store || disk_store->dir() != cache_dir) {
+            native_cache.reset();
+            disk_store = std::make_unique<brass::cache::ArtifactCache>(cache_dir, kGrammarCacheMaxBytes);
+            native_cache = std::make_unique<brass::cache::NativeModuleCache>(*disk_store);
         }
 
-        // 2. Cold start: build MIR, superoptimize, formally verify equivalence, JIT & disk-cache
-        stats.cache_misses++;
-        stats.loaded_from_disk_cache = false;
+        const brass::cache::CacheKey client_key = build_grammar_client_key();
+        const brass::cache::NativeOptions native_opts;
+        stats.cache_file_path =
+            disk_store->path_for(native_cache->storage_key(client_key, native_opts)).string();
 
         try {
-            brass::Module mod("brolm_grammar_kernels_mod");
-            {
-                brass::codegen::GrammarBuilder gb(mod);
-                gb.build_logit_mask_function("brolm_logit_mask");
-                gb.build_dfa_scan_string_function("brolm_dfa_scan", 4);
-                gb.build_dfa_filter_tokens_function("brolm_dfa_filter");
-            }
-
-            // Clone unoptimized module for SMT formal equivalence verification
-            std::unique_ptr<brass::Module> unopt_mod = brass::clone_module(mod);
-
-            for (brass::Function* fn : mod.functions()) {
-                if (!fn || fn->blocks().empty()) continue;
-
-                // 2a. SMT relational guard & bounds-check elimination
-                brass::SmtGuardElimStats guard_stats;
-                brass::SmtGuardElimOptions guard_opts;
-                guard_opts.max_sat_conflicts = 1000;
-                guard_opts.stats = &guard_stats;
-                brass::run_smt_guard_elimination(*fn, mod, guard_opts);
-                stats.smt_guards_eliminated +=
-                    guard_stats.guards_proven_eliminated +
-                    guard_stats.comparisons_proven_true +
-                    guard_stats.comparisons_proven_false +
-                    guard_stats.branches_folded;
-                stats.smt_queries_solved += guard_stats.queries_solved;
-
-                // 2b. Solver-verified MIR superoptimization (mask elision, ext elision, DAG synthesis)
-                brass::SuperoptStats sopt_stats;
-                brass::SuperoptOptions sopt_opts;
-                sopt_opts.max_sat_conflicts = 1000;
-                sopt_opts.stats = &sopt_stats;
-                brass::run_mir_superopt(*fn, mod, sopt_opts);
-                stats.superopt_masks_elided += sopt_stats.masks_elided;
-                stats.superopt_extensions_elided += sopt_stats.extensions_elided;
-                stats.superopt_dags_synthesized += sopt_stats.dags_synthesized;
-                stats.superopt_constants_synthesized += sopt_stats.constants_synthesized;
-            }
-
-            // 2c. Formal equivalence verification: Unopt MIR == Superopt MIR
-            if (unopt_mod) {
-                for (const brass::Function* opt_fn : mod.functions()) {
-                    if (!opt_fn || opt_fn->blocks().empty()) continue;
-                    const brass::Function* unopt_fn = unopt_mod->get_function(opt_fn->name());
-                    if (!unopt_fn) continue;
-
-                    brass::Module v_before_mod("verify_before");
-                    brass::Module v_after_mod("verify_after");
-                    brass::Function* vb = brass::clone_function(*unopt_fn, v_before_mod);
-                    brass::Function* va = brass::clone_function(*opt_fn, v_after_mod);
-                    prepare_function_for_smt_verification(*vb, v_before_mod);
-                    prepare_function_for_smt_verification(*va, v_after_mod);
-
-                    brass::verify::EquivOptions fn_eq_opts;
-                    fn_eq_opts.loop_unroll_bound = 1;
-                    fn_eq_opts.max_paths = 16;
-                    fn_eq_opts.max_sat_conflicts = 2000;
-                    // prepare_function_for_smt_verification replaces read-only table loads with synthetic __verify_load_* calls.
-                    fn_eq_opts.assume_calls_pure = true;
-                    if (opt_fn->return_type().is_void()) {
-                        fn_eq_opts.check_memory = false;
-                    }
-
-                    brass::verify::EquivResult eq =
-                        brass::verify::verify_mir_equivalence(*vb, *va, fn_eq_opts);
-
-                    if (eq.is_counterexample()) {
-                        throw std::runtime_error(
-                            "Grammar kernel MIR equivalence counterexample in " +
-                            std::string(opt_fn->name()) + ": " + eq.diagnostic);
-                    }
-                    if (eq.is_equivalent()) {
-                        stats.mir_functions_verified_equivalent++;
-                    }
-                }
-            }
-
-            // 2d. Standard MIR scalar & loop optimizations (GVN, SCCP, LICM, IVSR, DCE) + verification
-            for (brass::Function* fn : mod.functions()) {
-                if (!fn || fn->blocks().empty()) continue;
-                brass::cfg_simplify_function(*fn);
-                fn->rebuild_cfg_predecessors();
-            }
-            brass::codegen::KernelOptions kopts;
-            kopts.opt_level = 2;
-            kopts.enable_optimizations = true;
-            kopts.enable_sroa = true;
-            kopts.enable_bce = true;
-            kopts.enable_smt_guard_elim = false; // already run with stats in Stage 2a
-            kopts.enable_superopt = false;       // already run with stats in Stage 2b
-            kopts.enable_avx2 = true;
-            kopts.enable_fma = true;
-            kopts.enable_fp_reassociation = false;
-            kopts.enable_vectorize = false; // GrammarBuilder already emits f32x8 vector loop
-            kopts.enable_slp = false;
-            kopts.enable_unroll = false;    // GrammarBuilder already unrolls scan 4x
-            kopts.enable_parallel = false;
-            brass::codegen::KernelJit::prepare_module(mod, kopts);
-            for (brass::Function* fn : mod.functions()) {
-                if (!fn || fn->blocks().empty()) continue;
-                fn->sort_blocks_rpo();
-                fn->rebuild_cfg_predecessors();
-            }
-
-            // 2e. x64 LIR peephole & window superoptimization verification
-            if (host.is_x64()) {
-                brass::CallingConvention cc = brass::CallingConvention::for_target(host);
-                for (const brass::Function* fn : mod.functions()) {
-                    if (!fn || fn->blocks().empty()) continue;
-                    brass::x64::X64ISel isel(host, cc);
-                    isel.set_callee_module(&mod);
-                    auto lir = isel.lower(*fn);
-                    if (!lir) continue;
-                    lir->sort_blocks_rpo();
-                    brass::codegen::LivenessAnalysis liveness(*lir);
-                    liveness.run();
-                    brass::codegen::LinearScanAllocator regalloc(*lir, liveness, cc);
-                    regalloc.allocate();
-                    brass::codegen::run_lir_peephole_optimizations(*lir);
-
-                    brass::SuperoptStats lir_stats;
-                    brass::SuperoptOptions lir_opts;
-                    lir_opts.max_sat_conflicts = 250;
-                    lir_opts.stats = &lir_stats;
-                    for (auto& blk : lir->blocks) {
-                        if (blk && blk->instructions.size() <= 16) {
-                            brass::run_x64_lir_superopt(*blk, lir_opts);
+            std::string cache_err;
+            std::shared_ptr<const brass::cache::NativeModule> native_mod =
+                native_cache->get_or_build_object(
+                    client_key,
+                    [&](brass::object::ObjectFile& obj, std::string& err) -> bool {
+                        brass::Module mod("brolm_grammar_kernels_mod");
+                        if (!build_grammar_module(host, mod, &obj)) {
+                            err = "Grammar kernel build failed";
+                            return false;
                         }
+                        return true;
+                    },
+                    native_opts,
+                    &cache_err);
+
+            if (native_mod) {
+                auto m_fn = native_mod->function<brass::codegen::LogitMaskFn>("brolm_logit_mask");
+                auto s_fn = native_mod->function<brass::codegen::DfaScanStringFn>("brolm_dfa_scan");
+                auto f_fn = native_mod->function<brass::codegen::DfaFilterTokensFn>("brolm_dfa_filter");
+                if (m_fn && s_fn && f_fn) {
+                    aot_lib = std::const_pointer_cast<void>(
+                        std::static_pointer_cast<const void>(native_mod));
+                    mask_kfn = brass::codegen::KernelFunction::from_owner(
+                        "brolm_logit_mask", reinterpret_cast<void*>(m_fn), 0, native_mod);
+                    scan_kfn = brass::codegen::KernelFunction::from_owner(
+                        "brolm_dfa_scan", reinterpret_cast<void*>(s_fn), 0, native_mod);
+                    filter_kfn = brass::codegen::KernelFunction::from_owner(
+                        "brolm_dfa_filter", reinterpret_cast<void*>(f_fn), 0, native_mod);
+                    mask_fn = m_fn;
+                    scan_fn = s_fn;
+                    filter_fn = f_fn;
+                    if (native_mod->from_cache()) {
+                        stats.cache_hits++;
+                        stats.loaded_from_disk_cache = true;
+                    } else {
+                        stats.cache_misses++;
+                        stats.loaded_from_disk_cache = false;
                     }
-                    stats.superopt_lir_windows_optimized += lir_stats.lir_windows_optimized;
+                    stats.cache_file_path = disk_store->path_for(native_mod->storage_key()).string();
+                    initialized = true;
+                    return;
                 }
             }
 
-            // Mark loop optimizations complete so ModuleCompiler lowers our verified MIR directly
-            mod.set_has_loop_optimizations(true);
+            // Fallback to in-process JIT execution engine if disk cache/AOT link failed
+            stats.cache_misses++;
+            stats.loaded_from_disk_cache = false;
+            brass::Module mod("brolm_grammar_kernels_mod");
+            brass::object::ObjectFile obj;
+            build_grammar_module(host, mod, &obj);
 
-            brass::object::ModuleCompiler compiler(host);
-            compiler.set_enable_mir_opts(false);
-            compiler.set_emit_stack_map_symbol(false);
-            brass::object::ObjectFile obj = compiler.compile(mod);
-
-            // Persist AOT shared library to disk cache atomically
-            write_shared_library_atomically(obj, cache_path);
-
-            // Load compiled object into in-process JIT execution engine
             auto engine = std::make_shared<brass::codegen::JitExecutionEngine>(host);
             if (!engine->load_object(obj)) {
                 throw std::runtime_error("Grammar kernel JIT load_object failed");
