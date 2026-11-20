@@ -6,12 +6,10 @@
 #include <brass/codegen/linear_scan.hpp>
 #include <brass/codegen/live_range.hpp>
 #include <brass/codegen/peephole.hpp>
-#include <brass/core/diagnostics.hpp>
 #include <brass/mir/cfg_simplify.hpp>
 #include <brass/mir/loop_opt.hpp>
 #include <brass/mir/smt_guard_elim.hpp>
 #include <brass/mir/superopt.hpp>
-#include <brass/mir/verifier.hpp>
 #include <brass/object/object_writer.hpp>
 #include <brass/target/aot_linker.hpp>
 #include <brass/target/dynamic_library.hpp>
@@ -451,6 +449,8 @@ struct CompiledKernels {
                     fn_eq_opts.loop_unroll_bound = 1;
                     fn_eq_opts.max_paths = 16;
                     fn_eq_opts.max_sat_conflicts = 2000;
+                    // prepare_function_for_smt_verification replaces read-only table loads with synthetic __verify_load_* calls.
+                    fn_eq_opts.assume_calls_pure = true;
                     if (opt_fn->return_type().is_void()) {
                         fn_eq_opts.check_memory = false;
                     }
@@ -469,30 +469,31 @@ struct CompiledKernels {
                 }
             }
 
-            // 2d. Standard MIR scalar & loop optimizations (GVN, SCCP, LICM, IVSR, DCE)
-            brass::LoopOptOptions loop_opts;
-            loop_opts.enable_avx2 = true;
-            loop_opts.enable_fma = true;
-            loop_opts.enable_fp_reassociation = false;
-            loop_opts.enable_vectorize = false; // GrammarBuilder already emits f32x8 vector loop
-            loop_opts.enable_slp = false;
-            loop_opts.enable_unroll = false;    // GrammarBuilder already unrolls scan 4x
-            loop_opts.enable_f64_demote = false;
-            loop_opts.enable_parallel_loops = false;
-
+            // 2d. Standard MIR scalar & loop optimizations (GVN, SCCP, LICM, IVSR, DCE) + verification
             for (brass::Function* fn : mod.functions()) {
                 if (!fn || fn->blocks().empty()) continue;
                 brass::cfg_simplify_function(*fn);
                 fn->rebuild_cfg_predecessors();
-                brass::optimize_function(*fn, loop_opts);
-                fn->rebuild_cfg_predecessors();
+            }
+            brass::codegen::KernelOptions kopts;
+            kopts.opt_level = 2;
+            kopts.enable_optimizations = true;
+            kopts.enable_sroa = true;
+            kopts.enable_bce = true;
+            kopts.enable_smt_guard_elim = false; // already run with stats in Stage 2a
+            kopts.enable_superopt = false;       // already run with stats in Stage 2b
+            kopts.enable_avx2 = true;
+            kopts.enable_fma = true;
+            kopts.enable_fp_reassociation = false;
+            kopts.enable_vectorize = false; // GrammarBuilder already emits f32x8 vector loop
+            kopts.enable_slp = false;
+            kopts.enable_unroll = false;    // GrammarBuilder already unrolls scan 4x
+            kopts.enable_parallel = false;
+            brass::codegen::KernelJit::prepare_module(mod, kopts);
+            for (brass::Function* fn : mod.functions()) {
+                if (!fn || fn->blocks().empty()) continue;
                 fn->sort_blocks_rpo();
                 fn->rebuild_cfg_predecessors();
-            }
-
-            brass::DiagnosticReporter diag;
-            if (!brass::verify_module(mod, &diag)) {
-                throw std::runtime_error("Grammar kernel MIR verification failed: " + diag.format_all());
             }
 
             // 2e. x64 LIR peephole & window superoptimization verification
