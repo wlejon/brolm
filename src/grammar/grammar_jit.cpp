@@ -19,7 +19,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -37,30 +36,7 @@ constexpr uint32_t kGrammarKernelSchemaVersion = 3;
 constexpr uint64_t kGrammarCacheMaxBytes = 64ULL * 1024 * 1024;
 
 std::filesystem::path resolve_cache_directory() {
-    if (const char* env_dir = std::getenv("BRO_LM_CACHE_DIR"); env_dir && env_dir[0] != '\0') {
-        return std::filesystem::path(env_dir);
-    }
-#if defined(_WIN32)
-    if (const char* local_app = std::getenv("LOCALAPPDATA"); local_app && local_app[0] != '\0') {
-        return std::filesystem::path(local_app) / "brolm" / "kernels";
-    }
-    if (const char* user_prof = std::getenv("USERPROFILE"); user_prof && user_prof[0] != '\0') {
-        return std::filesystem::path(user_prof) / ".cache" / "brolm" / "kernels";
-    }
-#else
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0] != '\0') {
-        return std::filesystem::path(xdg) / "brolm" / "kernels";
-    }
-    if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
-        return std::filesystem::path(home) / ".cache" / "brolm" / "kernels";
-    }
-#endif
-    std::error_code ec;
-    auto tmp = std::filesystem::temp_directory_path(ec);
-    if (!ec && !tmp.empty()) {
-        return tmp / "brolm" / "kernels";
-    }
-    return std::filesystem::path(".cache") / "brolm" / "kernels";
+    return brass::cache::default_cache_dir("brolm", "kernels", "BRO_LM_CACHE_DIR");
 }
 
 brass::cache::CacheKey build_grammar_client_key() {
